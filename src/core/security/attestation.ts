@@ -176,14 +176,19 @@ export async function verifyReport(
   const signature = hexToBytes(report.signature);
   if (!signature) return false;
 
-  const key = await resolvePublicKey(publicKey);
-  if (!key) return false;
+  try {
+    const key = await resolvePublicKey(publicKey);
+    if (!key) return false;
 
-  const data = new TextEncoder().encode(canonicalize(report));
-  return subtle().verify(
-    { name: 'ECDSA', hash: 'SHA-256' },
-    key,
-    signature as BufferSource,
-    data as BufferSource,
-  );
+    const data = new TextEncoder().encode(canonicalize(report));
+    return await subtle().verify(
+      { name: 'ECDSA', hash: 'SHA-256' },
+      key,
+      signature as BufferSource,
+      data as BufferSource,
+    );
+  } catch {
+    // A malformed JWK or signature must fail closed, never throw.
+    return false;
+  }
 }

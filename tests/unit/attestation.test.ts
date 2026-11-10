@@ -126,6 +126,22 @@ describe('signReport / verifyReport', () => {
     await expect(verifyReport(report, publicKey)).resolves.toBe(false);
   });
 
+  it('returns false for a malformed JWK instead of throwing', async () => {
+    const report = await buildReport(config, egress);
+    const { privateKey } = await generateAttestationKey();
+    const signature = await signReport(report, privateKey);
+
+    await expect(
+      verifyReport({ ...report, signature }, { kty: 'oct', k: 'AAAA', alg: 'HS256' }),
+    ).resolves.toBe(false);
+  });
+
+  it('returns false for a signature that is not hex', async () => {
+    const report = await buildReport(config, egress);
+    const { publicKey } = await generateAttestationKey();
+    await expect(verifyReport({ ...report, signature: 'not-hex' }, publicKey)).resolves.toBe(false);
+  });
+
   it('rejects a report signed by a different key', async () => {
     const report = await buildReport(config, egress);
     const { publicKey } = await generateAttestationKey();
