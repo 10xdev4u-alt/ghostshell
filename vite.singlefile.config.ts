@@ -18,7 +18,7 @@ export default defineConfig({
   plugins: [viteSingleFile({ removeViteModuleLoader: true })],
   build: {
     target: 'es2022',
-    outDir: 'dist',
+    outDir: 'dist/single',
     assetsInlineLimit: 100_000_000,
     chunkSizeWarningLimit: 100_000_000,
     cssCodeSplit: false,

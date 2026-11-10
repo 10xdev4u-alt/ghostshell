@@ -55,4 +55,4 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ghostshell-single-file
-          path: dist/index.html
+          path: dist/single/index.html
