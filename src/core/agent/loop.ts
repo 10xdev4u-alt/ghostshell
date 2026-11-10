@@ -1,6 +1,7 @@
 import type {
   AgentConfig,
   Conversation,
+  GenerateRequest,
   Message,
   ToolCall,
   ToolContext,
@@ -8,6 +9,11 @@ import type {
   ToolResult,
 } from '@/types/index.js';
 import { uuid } from '@/lib/utils.js';
+import { SerialQueue } from '@/lib/queue.js';
+import { buildToolCallGrammar } from '@/core/llm/grammar.js';
+import { retryWithCorrection } from './parser.js';
+import type { GenerateOutcome } from './parser.js';
+import { compactMessages, tokenBudget } from './compaction.js';
 
 export interface AgentStep {
   iteration: number;
@@ -24,6 +30,25 @@ export interface AgentRunResult {
   error?: string | undefined;
 }
 
+/** Per-turn generation cap (see ENGINEERING_PLAN §3.3). */
+const MAX_TOKENS_PER_TURN = 2048;
+/** Leave room for the next response (CONTEXT_BUDGET = 0.8 × ctx_len). */
+const CONTEXT_BUDGET_RATIO = 0.8;
+const SUMMARY_MAX_TOKENS = 300;
+
+const SUMMARY_SYSTEM_PROMPT = `You are a conversation summarizer. Compress the excerpt below into a concise summary of at most 200 words. Preserve file paths, shell commands, error messages, and conclusions. Do not answer the user's request; only summarize what has happened so far.`;
+
+class ToolTimeoutError extends Error {
+  constructor(toolName: string, timeoutMs: number) {
+    super(`Tool "${toolName}" timed out after ${timeoutMs}ms`);
+    this.name = 'ToolTimeoutError';
+  }
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 /**
  * The agent reasoning loop.
  *
@@ -36,10 +61,15 @@ export interface AgentRunResult {
  *  - Every step is emitted via `onStep` so the UI can stream progress.
  */
 export class AgentLoop {
+  private readonly queue: SerialQueue;
+
   constructor(
     private readonly tools: Map<string, ToolDefinition>,
     private readonly config: AgentConfig,
-  ) {}
+    queue?: SerialQueue,
+  ) {
+    this.queue = queue ?? new SerialQueue();
+  }
 
   async run(
     conversation: Conversation,
@@ -49,25 +79,254 @@ export class AgentLoop {
   ): Promise<AgentRunResult> {
     const messages: Message[] = [...conversation.messages];
     const steps: AgentStep[] = [];
+    this.ensureSystemMessage(messages);
 
-    for (let iteration = 0; iteration < this.config.maxIterations; iteration += 1) {
-      if (signal.aborted) {
-        return this.finish(messages, steps, iteration, 'aborted');
+    let iterations = 0;
+    try {
+      for (iterations = 0; iterations < this.config.maxIterations; iterations += 1) {
+        if (signal.aborted) {
+          return this.finish(messages, steps, iterations, 'aborted');
+        }
+
+        await this.compactIfNeeded(messages, ctx, signal);
+
+        const outcome = await retryWithCorrection(
+          (requestMessages) => this.generate(requestMessages, ctx, signal),
+          messages,
+          this.config.maxRetries,
+        );
+
+        if (outcome.aborted || signal.aborted) {
+          return this.finish(messages, steps, iterations, 'aborted');
+        }
+
+        // Keep any corrective messages the retry helper appended.
+        messages.splice(0, messages.length, ...outcome.messages);
+
+        if (outcome.finalAnswer !== undefined) {
+          const message = this.assistantMessage(outcome.finalAnswer, []);
+          messages.push(message);
+          const step: AgentStep = { iteration: iterations, message, toolCalls: [], results: [] };
+          steps.push(step);
+          onStep(step);
+          return this.finish(messages, steps, iterations + 1, 'stop');
+        }
+
+        if (outcome.parse.toolCalls.length === 0) {
+          const error =
+            'The model did not produce a valid tool call or final answer after several attempts.';
+          const message = this.assistantMessage(
+            'I could not continue: my last response was not a valid tool call. Please try again.',
+            [],
+          );
+          messages.push(message);
+          const step: AgentStep = { iteration: iterations, message, toolCalls: [], results: [] };
+          steps.push(step);
+          onStep(step);
+          return this.finish(messages, steps, iterations + 1, 'error', error);
+        }
+
+        const calls = outcome.parse.toolCalls;
+        const results: ToolResult[] = [];
+        for (const call of calls) {
+          if (signal.aborted) {
+            return this.finish(messages, steps, iterations, 'aborted');
+          }
+          results.push(await this.executeTool(call, ctx, signal));
+        }
+
+        const message = this.assistantMessage(outcome.parse.text, calls, results);
+        messages.push(message);
+        const step: AgentStep = { iteration: iterations, message, toolCalls: calls, results };
+        steps.push(step);
+        onStep(step);
       }
 
-      // TODO: build the request (system prompt + compacted messages + grammar)
-      // TODO: call ctx.llm.generate(...)
-      // TODO: parse tool calls from the result (grammar-constrained first)
-      // TODO: if no tool calls -> emit assistant message, stop
-      // TODO: else execute each tool via the serial queue, append results, loop
+      const note =
+        `I reached the iteration limit (${this.config.maxIterations}) before finishing. ` +
+        'Here is where things stand; send another message to continue.';
+      const message = this.assistantMessage(note, []);
+      messages.push(message);
+      const step: AgentStep = { iteration: iterations, message, toolCalls: [], results: [] };
+      steps.push(step);
+      onStep(step);
+      return this.finish(messages, steps, iterations, 'max-iterations');
+    } catch (err) {
+      if (signal.aborted) {
+        return this.finish(messages, steps, iterations, 'aborted');
+      }
+      return this.finish(messages, steps, iterations, 'error', errorMessage(err));
+    }
+  }
 
-      throw new Error(
-        `AgentLoop.run not implemented (iteration ${iteration}). ` +
-          'See issue #12 for the implementation contract.',
+  /** Prepend the configured system prompt when the conversation lacks one. */
+  private ensureSystemMessage(messages: Message[]): void {
+    if (!this.config.systemPrompt.trim()) return;
+    const first = messages[0];
+    if (first?.role === 'system') return;
+    messages.unshift(makeSystemMessage(this.config.systemPrompt));
+  }
+
+  private buildRequest(messages: Message[]): GenerateRequest {
+    const grammar = this.buildGrammar();
+    return {
+      messages,
+      temperature: this.config.temperature,
+      maxTokens: MAX_TOKENS_PER_TURN,
+      ...(grammar ? { grammar } : {}),
+    };
+  }
+
+  /**
+   * Grammar-constrained decoding is provided by the LLM module (issue #18).
+   * Until that lands, the loop runs unconstrained and relies on the parser's
+   * fallback chain plus corrective retries.
+   */
+  private buildGrammar(): string | undefined {
+    try {
+      return buildToolCallGrammar(
+        [...this.tools.values()].map((tool) => ({
+          name: tool.name,
+          parameters: tool.parameters,
+        })),
       );
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async generate(
+    messages: Message[],
+    ctx: ToolContext,
+    signal: AbortSignal,
+  ): Promise<GenerateOutcome> {
+    try {
+      const result = await ctx.llm.generate(this.buildRequest(messages), () => undefined, signal);
+      const toolCalls = result.toolCalls ? { toolCalls: result.toolCalls } : {};
+      if (result.finishReason === 'aborted') {
+        return { text: result.text, ...toolCalls, aborted: true };
+      }
+      return { text: result.text, ...toolCalls };
+    } catch (err) {
+      if (signal.aborted) return { text: '', aborted: true };
+      throw err;
+    }
+  }
+
+  private async compactIfNeeded(
+    messages: Message[],
+    ctx: ToolContext,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const budget = Math.floor(this.config.contextWindow * CONTEXT_BUDGET_RATIO);
+    if (tokenBudget(messages) <= budget) return;
+
+    const result = await compactMessages(messages, budget, (dropped) =>
+      this.summarize(dropped, ctx, signal),
+    );
+    if (result.compacted) {
+      messages.splice(0, messages.length, ...result.messages);
+    }
+  }
+
+  private async summarize(
+    messages: Message[],
+    ctx: ToolContext,
+    signal: AbortSignal,
+  ): Promise<string> {
+    const excerpt = messages
+      .map((message) => {
+        const parts = [`[${message.role}] ${message.content}`];
+        for (const result of message.toolResults ?? []) {
+          parts.push(`[tool result] ${result.content}`);
+        }
+        return parts.join('\n');
+      })
+      .join('\n');
+
+    const result = await ctx.llm.generate(
+      {
+        messages: [
+          makeSystemMessage(SUMMARY_SYSTEM_PROMPT),
+          {
+            id: uuid(),
+            role: 'user',
+            content: `Summarize this conversation excerpt:\n\n${excerpt}`,
+            timestamp: Date.now(),
+          },
+        ],
+        temperature: 0.2,
+        maxTokens: SUMMARY_MAX_TOKENS,
+      },
+      () => undefined,
+      signal,
+    );
+    return result.text.trim() || 'Earlier conversation omitted.';
+  }
+
+  private async executeTool(
+    call: ToolCall,
+    ctx: ToolContext,
+    signal: AbortSignal,
+  ): Promise<ToolResult> {
+    const definition = this.tools.get(call.name);
+    if (!definition) {
+      return {
+        ok: false,
+        content: `Unknown tool "${call.name}". Available tools: ${[...this.tools.keys()].join(', ')}.`,
+      };
     }
 
-    return this.finish(messages, steps, this.config.maxIterations, 'max-iterations');
+    const toolCtx: ToolContext = { ...ctx, signal };
+    try {
+      return await this.queue.add(() =>
+        this.withTimeout(
+          definition.execute(toolCtx, call.arguments),
+          this.config.toolTimeoutMs,
+          call.name,
+        ),
+      );
+    } catch (err) {
+      if (err instanceof ToolTimeoutError) {
+        return { ok: false, content: err.message };
+      }
+      return { ok: false, content: `Tool "${call.name}" failed: ${errorMessage(err)}` };
+    }
+  }
+
+  private withTimeout<T>(promise: Promise<T>, timeoutMs: number, toolName: string): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new ToolTimeoutError(toolName, timeoutMs)),
+        Math.max(1, timeoutMs),
+      );
+      promise.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (err: unknown) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+      );
+    });
+  }
+
+  private assistantMessage(
+    content: string,
+    toolCalls: ToolCall[],
+    toolResults?: ToolResult[],
+  ): Message {
+    return {
+      id: uuid(),
+      role: 'assistant',
+      content,
+      timestamp: Date.now(),
+      model: this.config.modelId,
+      ...(toolCalls.length > 0 ? { toolCalls } : {}),
+      ...(toolResults && toolResults.length > 0 ? { toolResults } : {}),
+    };
   }
 
   private finish(
