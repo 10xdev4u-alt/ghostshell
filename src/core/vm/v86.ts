@@ -16,7 +16,7 @@ import { ALPINE_BOOT } from '@/core/vm/image.js';
  *  - events: emulator-ready, emulator-started, emulator-stopped,
  *    download-progress, serial0-output-byte, 9p-*
  *  - `filesystem: { basefs, baseurl, handle9p, proxy_url }`
- *  - `net_device: { backend, url, id, ... }`
+ *  - `net_device: { relay_url, id?, router_mac?, router_ip?, ... }`
  *
  * v86 constraints: 32-bit (ia32), single-core, Pentium-4 class. The official
  * Alpine image is i386/alpine:3.21. Pre-bake everything.
@@ -32,6 +32,7 @@ export interface V86Deps {
   vgaBios?: V86Image | undefined;
   cdrom?: V86Image | undefined;
   hda?: V86Image | undefined;
+  /** Built by `buildNetDevice` (src/core/vm/network.ts); omit for airplane mode. */
   netDevice?: V86Options['net_device'] | undefined;
   filesystem?: V86Options['filesystem'] | undefined;
   initial_state?: V86Image | undefined;

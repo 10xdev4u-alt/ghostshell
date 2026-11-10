@@ -1,4 +1,6 @@
 import type { AgentConfig, ModelSpec } from '@/types/index.js';
+import type { AttestationConfig } from '@/core/security/attestation.js';
+import pkg from '../package.json';
 
 /**
  * Central configuration. Everything here is overridable at runtime from the
@@ -89,4 +91,42 @@ export const FLAGS = {
   hostBridge: false,
   multiVm: false,
   voice: false,
+};
+
+/**
+ * SPDX licenses for the runtime dependencies declared in package.json. The
+ * privacy report records what the app actually ships; a new dependency must
+ * add its license here.
+ */
+const DEPENDENCY_LICENSES: Record<string, string> = {
+  '@huggingface/transformers': 'Apache-2.0',
+  '@mlc-ai/web-llm': 'Apache-2.0',
+  '@xterm/addon-fit': 'MIT',
+  '@xterm/xterm': 'MIT',
+  dompurify: 'MPL-2.0 OR Apache-2.0',
+  fflate: 'MIT',
+  idb: 'ISC',
+  jsdiff: 'ISC',
+  v86: 'BSD-2-Clause',
+  zod: 'MIT',
+};
+
+/**
+ * Attestation inputs for the privacy report (mounted by `App.init`).
+ *
+ * The three hashes are provenance metadata that only exist once the
+ * artifacts do: `htmlSha256` after the single-file build, `modelSha256`
+ * after the first weight download, and `vmImageSha256` after
+ * `scripts/build-image.sh` produces the rootfs. They start empty so the
+ * report never claims a hash it does not have.
+ */
+export const ATTESTATION_CONFIG: AttestationConfig = {
+  htmlSha256: '',
+  modelSha256: '',
+  vmImageSha256: '',
+  dependencies: Object.entries(pkg.dependencies).map(([name, version]) => ({
+    name,
+    version,
+    license: DEPENDENCY_LICENSES[name] ?? 'unknown',
+  })),
 };

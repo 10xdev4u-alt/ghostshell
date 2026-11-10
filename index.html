@@ -2,6 +2,49 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <!--
+      Lockdown CSP — defense-in-depth, not the enforcement layer.
+
+      Runtime lockdown is enforced by the egress interceptor
+      (src/core/security/egress.ts), which patches fetch, WebSocket,
+      XMLHttpRequest, EventSource, and sendBeacon and logs or blocks every
+      call. This CSP is the second layer for what that interceptor cannot
+      see: subresource loads, workers, frames, and WebAssembly.
+
+      Why the CSP is not sufficient on its own:
+      - A blob: worker is allowed by worker-src, and CSP alone cannot
+        police every network call made from inside a worker; the
+        interceptor's patched globals are what audit them.
+      - Dynamic import() of a same-origin module is allowed by
+        script-src 'self'; the module's own fetches go through the
+        interceptor.
+      - The policy is static and cannot be tightened at runtime. Vite's
+        dev-server HMR websocket is blocked too, so edit code without HMR.
+
+      Why the policy is permissive in the places it is:
+      - script-src needs 'wasm-unsafe-eval' or v86's WASM and the WASM LLM
+        fail with a CompileError. It needs 'unsafe-inline' because the
+        artifact iframe uses srcdoc with an inline script, which inherits
+        this policy; the single-file release also inlines the module
+        script. Remote scripts stay blocked and dynamic HTML is sanitized
+        with DOMPurify.
+      - connect-src must allow the model download (huggingface.co and the
+        jsDelivr ONNX runtime) and the v86 BIOS fetch (copy.sh). Hugging
+        Face resolve URLs 302 to HF's Xet CDN
+        (https://us.aws.cdn.hf.co/...), so the wildcard *.hf.co covers the
+        regional CDN hosts that vary by request.
+      - img-src needs blob: for artifact images rendered from object URLs.
+      - worker-src needs blob: for the ONNX/transformers worker pools.
+
+      frame-src 'none' does NOT block the artifact iframe: it is created
+      with srcdoc, which is an inline document governed by this policy
+      rather than a nested browse context. The iframe's sandbox attribute
+      ("allow-scripts", without "allow-same-origin") is what isolates it.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' https://huggingface.co https://*.hf.co https://cdn.jsdelivr.net https://copy.sh; frame-src 'none'; worker-src 'self' blob:; object-src 'none'; form-action 'none'; base-uri 'none'"
+    />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
@@ -76,6 +119,7 @@
                   <option value="wisp">WISP relay (self-hosted)</option>
                 </select>
               </label>
+              <div id="gs-privacy-report" class="gs-privacy-report"></div>
             </div>
           </div>
         </section>
