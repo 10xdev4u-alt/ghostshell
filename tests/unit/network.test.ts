@@ -7,17 +7,25 @@ describe('buildNetDevice', () => {
   });
 
   it('builds the inbrowser backend (no server, no external net)', () => {
-    expect(buildNetDevice({ mode: 'inbrowser' })).toEqual({ backend: 'inbrowser' });
+    expect(buildNetDevice({ mode: 'inbrowser' })).toEqual({ relay_url: 'inbrowser' });
   });
 
   it('builds the fetch backend', () => {
-    expect(buildNetDevice({ mode: 'fetch' })).toEqual({ backend: 'fetch' });
+    expect(buildNetDevice({ mode: 'fetch' })).toEqual({ relay_url: 'fetch' });
   });
 
-  it('builds the wisp backend with a proxy URL', () => {
+  it('builds the wisp backend with a wisp(s):// relay URL', () => {
+    expect(buildNetDevice({ mode: 'wisp', wispUrl: 'wisps://relay.example.com' })).toEqual({
+      relay_url: 'wisps://relay.example.com',
+    });
+  });
+
+  it('normalizes ws:// and wss:// wisp URLs to the scheme v86 expects', () => {
+    expect(buildNetDevice({ mode: 'wisp', wispUrl: 'ws://relay.example.com' })).toEqual({
+      relay_url: 'wisp://relay.example.com',
+    });
     expect(buildNetDevice({ mode: 'wisp', wispUrl: 'wss://relay.example.com' })).toEqual({
-      backend: 'wisp',
-      url: 'wss://relay.example.com',
+      relay_url: 'wisps://relay.example.com',
     });
   });
 
@@ -25,18 +33,29 @@ describe('buildNetDevice', () => {
     expect(() => buildNetDevice({ mode: 'wisp' })).toThrow('wisp');
   });
 
-  it('builds the wsproxy backend with a proxy URL', () => {
+  it('rejects a non-ws wisp URL', () => {
+    expect(() => buildNetDevice({ mode: 'wisp', wispUrl: 'https://relay.example.com' })).toThrow(
+      'ws://',
+    );
+  });
+
+  it('builds the wsproxy backend as a raw ws:// relay', () => {
     expect(buildNetDevice({ mode: 'wsproxy', proxyUrl: 'wss://proxy.example.com' })).toEqual({
-      backend: 'wsproxy',
-      url: 'wss://proxy.example.com',
+      relay_url: 'wss://proxy.example.com',
     });
   });
 
-  it('requires a wsproxy proxy URL', () => {
+  it('requires a wsproxy relay URL', () => {
     expect(() => buildNetDevice({ mode: 'wsproxy' })).toThrow('wsproxy');
   });
 
-  it('passes id and peer hints through to the device', () => {
+  it('rejects a non-ws wsproxy relay URL', () => {
+    expect(() => buildNetDevice({ mode: 'wsproxy', proxyUrl: 'https://proxy.example.com' })).toThrow(
+      'ws://',
+    );
+  });
+
+  it('passes id and peer hints through as router_mac/router_ip', () => {
     expect(
       buildNetDevice({
         mode: 'wisp',
@@ -46,20 +65,30 @@ describe('buildNetDevice', () => {
         peerIp: '192.168.86.1',
       }),
     ).toEqual({
-      backend: 'wisp',
-      url: 'wss://relay.example.com',
+      relay_url: 'wisps://relay.example.com',
       id: 3,
-      peer_mac: '52:54:00:01:02:03',
-      peer_ip: '192.168.86.1',
+      router_mac: '52:54:00:01:02:03',
+      router_ip: '192.168.86.1',
     });
   });
 
   it('leaves optional fields off when they are not configured', () => {
     const device = buildNetDevice({ mode: 'fetch' });
-    expect(device).not.toHaveProperty('url');
     expect(device).not.toHaveProperty('id');
-    expect(device).not.toHaveProperty('peer_mac');
-    expect(device).not.toHaveProperty('peer_ip');
+    expect(device).not.toHaveProperty('router_mac');
+    expect(device).not.toHaveProperty('router_ip');
+  });
+
+  it('emits a relay_url v86 recognizes for every non-off mode', () => {
+    const devices = [
+      buildNetDevice({ mode: 'inbrowser' }),
+      buildNetDevice({ mode: 'fetch' }),
+      buildNetDevice({ mode: 'wisp', wispUrl: 'wss://relay.example.com' }),
+      buildNetDevice({ mode: 'wsproxy', proxyUrl: 'wss://proxy.example.com' }),
+    ];
+    for (const device of devices) {
+      expect(device?.relay_url).toMatch(/^(fetch|inbrowser|wisp:\/\/|wisps:\/\/|ws:\/\/|wss:\/\/)/);
+    }
   });
 });
 
