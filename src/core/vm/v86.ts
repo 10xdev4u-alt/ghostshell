@@ -46,7 +46,12 @@ export interface V86Deps {
 const DEFAULT_MEMORY_BYTES = 512 * 1024 * 1024;
 const DEFAULT_VGA_MEMORY_BYTES = 8 * 1024 * 1024;
 const DEFAULT_READY_TIMEOUT_MS = 60_000;
-const LIST_TAB = '\t';
+/**
+ * Field separator for `stat -c`. A literal tab is unsafe: BusyBox ash's line
+ * editor treats it as completion. `|` is inert inside the single-quoted
+ * format string.
+ */
+const LIST_SEP = '|';
 
 export class V86VMHandle implements VMHandle {
   readonly id = 'v86';
@@ -170,7 +175,7 @@ export class V86VMHandle implements VMHandle {
       const cmd =
         `if [ -d ${shellQuote(path)} ]; then ` +
         `(cd ${shellQuote(path)} && ls -A -1 | while IFS= read -r f; do ` +
-        `stat -c '%F${LIST_TAB}%s${LIST_TAB}%Y${LIST_TAB}%n' "$f"; done); ` +
+        `stat -c '%F${LIST_SEP}%s${LIST_SEP}%Y${LIST_SEP}%n' "$f"; done); ` +
         `else echo "list: not a directory: ${path}"; false; fi`;
       const res = await this.runner.run(cmd);
       if (res.exitCode !== 0) {
@@ -180,9 +185,9 @@ export class V86VMHandle implements VMHandle {
         .split('\n')
         .filter((line) => line.length > 0)
         .map((line): DirEntry => {
-          const [type, size, mtime, ...rest] = line.split(LIST_TAB);
+          const [type, size, mtime, ...rest] = line.split(LIST_SEP);
           return {
-            name: rest.join(LIST_TAB),
+            name: rest.join(LIST_SEP),
             kind: type === 'directory' ? 'dir' : type === 'symbolic link' ? 'symlink' : 'file',
             size: Number(size ?? 0),
             mtime: Math.floor(Number(mtime ?? 0) * 1000),

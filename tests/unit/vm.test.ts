@@ -108,7 +108,7 @@ vi.mock('v86', () => {
         const prompt = `__GS_PROMPT_${id}__`;
         let body = 'hello\n';
         if (data.includes('ls -A -1')) {
-          body = 'regular file\t5\t1700000000\ta.txt\ndirectory\t0\t1700000000\tsub\n';
+          body = 'regular file|5|1700000000|a.txt\ndirectory|0|1700000000|sub\n';
         }
         return (
           `localhost:~# ${data}__GS_BEGIN_${id}__\n` +
@@ -314,6 +314,16 @@ describe('V86VMHandle', () => {
       { name: 'a.txt', kind: 'file', size: 5, mtime: 1_700_000_000_000 },
       { name: 'sub', kind: 'dir', size: 0, mtime: 1_700_000_000_000 },
     ]);
+  });
+
+  it('list uses a shell-safe field separator', async () => {
+    const vm = new V86VMHandle();
+    await vm.start(DEFAULT_IMAGE);
+    const emu = instances[0]!;
+
+    await vm.list('/root/workspace');
+    expect(emu.sent[0]).toContain("stat -c '%F|%s|%Y|%n'");
+    expect(emu.sent[0]).not.toContain('\t');
   });
 
   it('list throws on a non-zero exit', async () => {
