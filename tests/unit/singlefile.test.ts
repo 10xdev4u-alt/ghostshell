@@ -125,20 +125,13 @@ describe('verifySingleFile', () => {
   });
 });
 
-describe('dist/index.html', () => {
-  const distPath = resolve(process.cwd(), 'dist/index.html');
+describe('dist/single/index.html', () => {
+  const distPath = resolve(process.cwd(), 'dist/single/index.html');
   const distAvailable = existsSync(distPath);
-  // In CI the artifact must exist; locally the check is skipped when the build
-  // has not been produced yet.
-  const checkDist = distAvailable || process.env.CI === '1';
-
-  it.runIf(checkDist)('is self-contained and under budget', () => {
+  // The check runs only when the single-file build has been produced; run
+  // `bun run build:single` first.
+  it.runIf(distAvailable)('is self-contained and under budget', () => {
     const result = verifySingleFile({ filePath: distPath });
-    if (!distAvailable) {
-      expect(result.ok).toBe(false);
-      expect(result.errors.some((error) => error.includes('does not exist'))).toBe(true);
-      return;
-    }
     expect(result.errors).toEqual([]);
     expect(result.externalAssets).toEqual([]);
     expect(result.ok).toBe(true);

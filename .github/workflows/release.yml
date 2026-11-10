@@ -23,5 +23,5 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/index.html
+          files: dist/single/index.html
           generate_release_notes: true

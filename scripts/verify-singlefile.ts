@@ -2,7 +2,7 @@
 /**
  * Verify that the single-file build is self-contained.
  *
- * Checks `dist/index.html` (or a path passed as the first argument):
+ * Checks `dist/single/index.html` (or a path passed as the first argument):
  *   1. the file exists and is not empty;
  *   2. it references no external files via `<script src=...>` or
  *      `<link href=...>` (inline `data:` / `blob:` / fragment URLs are fine);
@@ -22,7 +22,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 export const DEFAULT_MAX_BYTES = 100 * 1024 * 1024; // 100 MB
-export const DEFAULT_FILE = 'dist/index.html';
+export const DEFAULT_FILE = 'dist/single/index.html';
 
 export interface VerifyOptions {
   /** Path to the built HTML file. */
@@ -176,7 +176,7 @@ Options:
   -h, --help        Show this help
 
 Environment:
-  SINGLEFILE_FILE       File to verify (default dist/index.html)
+  SINGLEFILE_FILE       File to verify (default dist/single/index.html)
   SINGLEFILE_MAX_BYTES  Default size budget in bytes
 
 The file must exist, be non-empty, reference no external <script src> or

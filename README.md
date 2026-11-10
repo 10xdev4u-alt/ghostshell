@@ -40,7 +40,7 @@ bun run dev          # http://localhost:5173
 Build the single file:
 
 ```bash
-bun run build:single # dist/index.html (~45–85 MB with inlined assets)
+bun run build:single # dist/single/index.html (~45–85 MB with inlined assets)
 ```
 
 Host it anywhere static (Netlify, Cloudflare Pages, GitHub Pages). For threaded
