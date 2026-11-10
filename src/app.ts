@@ -18,7 +18,11 @@ import { createFileTree } from '@/ui/filetree.js';
 import { createDiffView } from '@/ui/diff.js';
 import { createArtifactPanel } from '@/ui/artifact.js';
 import { createPrivacyReportSection, createSettings } from '@/ui/settings.js';
-import { installEgressInterceptor, InMemoryEgressLog } from '@/core/security/egress.js';
+import {
+  BOOT_EGRESS_ALLOWLIST,
+  installEgressInterceptor,
+  InMemoryEgressLog,
+} from '@/core/security/egress.js';
 import { V86_WASM_URL } from '@/core/vm/wasm.js';
 import type { AppEventMap } from '@/types/index.js';
 
@@ -71,7 +75,11 @@ export class App {
 
   async init(): Promise<void> {
     await this.db.open();
-    this.restoreEgress = installEgressInterceptor(this.egress, DEFAULT_AGENT_CONFIG.networkMode === 'off');
+    this.restoreEgress = installEgressInterceptor(
+      this.egress,
+      DEFAULT_AGENT_CONFIG.networkMode === 'off',
+      BOOT_EGRESS_ALLOWLIST,
+    );
 
     this.chat = createChat(document.getElementById('gs-chat')!);
     this.terminal = createTerminal(document.getElementById('gs-terminal')!);
