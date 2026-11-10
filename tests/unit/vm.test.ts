@@ -3,13 +3,17 @@ import type { V86Options } from 'v86';
 import { DEFAULT_IMAGE } from '@/core/vm/image.js';
 import { V86VMHandle } from '@/core/vm/v86.js';
 
-const { instances } = vi.hoisted(() => ({ instances: [] as any[] }));
+const { instances, neverReady } = vi.hoisted(() => ({
+  instances: [] as any[],
+  neverReady: { value: false },
+}));
 
 vi.mock('v86', () => {
   return {
     V86: class {
       options: V86Options;
       running = false;
+      ready = false;
       sent: string[] = [];
       files = new Map<string, Uint8Array>();
       dirs = new Set<string>();
@@ -20,9 +24,19 @@ vi.mock('v86', () => {
       constructor(options: V86Options) {
         this.options = options;
         instances.push(this);
+        // v86 0.5.473 assigns `this.v86` asynchronously, inside the WASM
+        // load promise's `.then()`. Model that delay.
+        queueMicrotask(() => {
+          if (neverReady.value) return;
+          this.ready = true;
+          this.emit('emulator-ready', undefined);
+        });
       }
 
       async run(): Promise<void> {
+        if (!this.ready) {
+          throw new TypeError("Cannot read properties of undefined (reading 'run')");
+        }
         this.running = true;
         this.emit('emulator-started', undefined);
       }
@@ -116,6 +130,7 @@ function sentinelId(data: string): string {
 describe('V86VMHandle', () => {
   beforeEach(() => {
     instances.length = 0;
+    neverReady.value = false;
   });
 
   it('boots Alpine with the expected v86 options', async () => {
@@ -139,6 +154,24 @@ describe('V86VMHandle', () => {
     expect(emu.options.cmdline).toContain('root=host9p');
     expect(vm.running).toBe(true);
     expect(vm.currentImage?.id).toBe(DEFAULT_IMAGE.id);
+  });
+
+  it('waits for the emulator to initialize before running', async () => {
+    const vm = new V86VMHandle();
+    const pending = vm.start(DEFAULT_IMAGE);
+
+    // v86 assigns its internal emulator asynchronously; run() before that
+    // point is the bug this guards against.
+    expect(instances[0]!.ready).toBe(false);
+    await pending;
+    expect(instances[0]!.ready).toBe(true);
+    expect(instances[0]!.running).toBe(true);
+  });
+
+  it('rejects when the emulator never becomes ready', async () => {
+    neverReady.value = true;
+    const vm = new V86VMHandle({ readyTimeoutMs: 20 });
+    await expect(vm.start(DEFAULT_IMAGE)).rejects.toThrow(/Timed out/);
   });
 
   it('allows overriding the boot options', async () => {

@@ -39,10 +39,13 @@ export interface V86Deps {
   vgaMemorySizeBytes?: number | undefined;
   cmdline?: string | undefined;
   bzimageInitrdFromFilesystem?: boolean | undefined;
+  /** How long to wait for the v86 WASM/emulator init before failing. */
+  readyTimeoutMs?: number | undefined;
 }
 
 const DEFAULT_MEMORY_BYTES = 512 * 1024 * 1024;
 const DEFAULT_VGA_MEMORY_BYTES = 8 * 1024 * 1024;
+const DEFAULT_READY_TIMEOUT_MS = 60_000;
 const LIST_TAB = '\t';
 
 export class V86VMHandle implements VMHandle {
@@ -82,7 +85,44 @@ export class V86VMHandle implements VMHandle {
       const ch = this.decoder.decode(new Uint8Array([byte]), { stream: true });
       if (ch) for (const fn of this.serialListeners) fn(ch);
     });
+    await this.waitForReady(emu);
     await emu.run();
+  }
+
+  /**
+   * Wait until v86 has assigned its internal emulator.
+   *
+   * v86 0.5.473 assigns `this.v86` asynchronously inside the WASM load
+   * promise's `.then()`. Calling `run()` before that resolves hits
+   * `this.v86.run()` with `this.v86 === undefined` and rejects with a
+   * `TypeError`. `emulator-ready` is emitted from `v86.init()` once the
+   * emulator exists; `emulator-loaded` is emitted immediately after, so
+   * either is a safe gate.
+   */
+  private waitForReady(emu: V86): Promise<void> {
+    const timeoutMs = this.deps.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
+    return new Promise<void>((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const cleanup = (): void => {
+        if (timer !== undefined) clearTimeout(timer);
+        emu.remove_listener('emulator-ready', onReady);
+        emu.remove_listener('emulator-loaded', onReady);
+      };
+      const onReady = (): void => {
+        cleanup();
+        resolve();
+      };
+      timer = setTimeout(() => {
+        cleanup();
+        reject(
+          new Error(
+            `Timed out waiting for the v86 emulator to initialize (${timeoutMs}ms)`,
+          ),
+        );
+      }, timeoutMs);
+      emu.add_listener('emulator-ready', onReady);
+      emu.add_listener('emulator-loaded', onReady);
+    });
   }
 
   async stop(): Promise<void> {
