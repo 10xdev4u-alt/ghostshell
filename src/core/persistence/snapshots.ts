@@ -39,7 +39,6 @@ export interface SnapshotBlobStore {
 export interface SnapshotDatabase extends Database {
   putSnapshotMeta?(s: VMSnapshot): Promise<void>;
   getSnapshotMeta?(id: string): Promise<VMSnapshot | undefined>;
-  deleteSnapshot?(id: string): Promise<void>;
   listSnapshotsByConversation?(conversationId: string): Promise<VMSnapshot[]>;
   listSnapshots?(): Promise<VMSnapshot[]>;
   putSnapshotData?(id: string, data: Uint8Array): Promise<void>;
@@ -338,7 +337,9 @@ export class SnapshotManager {
 
   /** Delete a snapshot's metadata and blob. */
   async delete(id: string): Promise<void> {
-    if (this.db.deleteSnapshot) await this.db.deleteSnapshot(id);
+    // `deleteSnapshot` is part of the base Database contract: it removes the
+    // metadata row and (for a plain Database) the embedded blob.
+    await this.db.deleteSnapshot(id);
     await this.blobs?.remove(id);
     this.unindexSnapshot(id);
   }

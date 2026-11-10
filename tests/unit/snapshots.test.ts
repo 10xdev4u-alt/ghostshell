@@ -192,6 +192,10 @@ function makePlainDb(): Database {
       const data = blobs.get(id);
       return data ? { meta, data } : undefined;
     },
+    async deleteSnapshot(id) {
+      snapshots.delete(id);
+      blobs.delete(id);
+    },
     async setSetting() {},
     async getSetting() {
       return undefined;
@@ -376,6 +380,17 @@ describe('SnapshotManager', () => {
 
     const list = await manager.listForConversation('c1');
     expect(list.map((s) => s.id)).toEqual([snap.id]);
+  });
+
+  it('deletes the snapshot row for a plain Database', async () => {
+    const db = makePlainDb();
+    const manager = new SnapshotManager(db);
+    const snap = await manager.capture('c1', text.encode('plain'));
+
+    await manager.delete(snap.id);
+
+    expect(await manager.load(snap.id)).toBeUndefined();
+    expect(await manager.listForConversation('c1')).toEqual([]);
   });
 });
 
