@@ -394,10 +394,7 @@ export class TransformersEngine implements LLMEngine {
   }
 
   private applyChatTemplate(messages: Message[], tokenizer: PreTrainedTokenizer): string {
-    const chat = messages.map((message) => ({
-      role: message.role,
-      content: message.content,
-    }));
+    const chat = toChatMessages(messages);
 
     try {
       const templated = tokenizer.apply_chat_template(chat, {
@@ -434,8 +431,50 @@ export class TransformersEngine implements LLMEngine {
   }
 }
 
+/** One turn as a chat template expects it. */
+interface ChatMessage {
+  role: string;
+  content: string;
+  tool_calls?: ChatToolCall[];
+}
+
+interface ChatToolCall {
+  function: { name: string; arguments: Record<string, unknown> };
+}
+
+/**
+ * Convert GhostShell messages into chat-template turns.
+ *
+ * Chat templates (Qwen2.5 included) expect tool output in a `tool` role turn
+ * and the assistant's calls as `tool_calls`. The agent loop emits `tool`
+ * messages; an assistant message that still carries `toolResults` (the legacy
+ * shape) is split so the output reaches the model either way.
+ */
+function toChatMessages(messages: Message[]): ChatMessage[] {
+  const chat: ChatMessage[] = [];
+  for (const message of messages) {
+    if (message.role === 'tool') {
+      chat.push({ role: 'tool', content: message.content });
+      continue;
+    }
+
+    const entry: ChatMessage = { role: message.role, content: message.content };
+    if (message.role === 'assistant' && message.toolCalls?.length) {
+      entry.tool_calls = message.toolCalls.map((call) => ({
+        function: { name: call.name, arguments: call.arguments },
+      }));
+    }
+    chat.push(entry);
+
+    for (const result of message.toolResults ?? []) {
+      chat.push({ role: 'tool', content: result.content });
+    }
+  }
+  return chat;
+}
+
 /** ChatML fallback for tokenizers without a chat template. */
-function fallbackChatTemplate(messages: { role: string; content: string }[]): string {
+function fallbackChatTemplate(messages: ChatMessage[]): string {
   const parts = messages.map(
     (message) => `<|im_start|>${message.role}\n${message.content}\n<|im_end|>`,
   );

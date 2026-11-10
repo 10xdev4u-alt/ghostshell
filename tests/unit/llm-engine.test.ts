@@ -88,9 +88,15 @@ interface GeneratorOptions {
   [key: string]: unknown;
 }
 
+interface ChatMessageLike {
+  role: string;
+  content: string;
+  tool_calls?: unknown;
+}
+
 function makeTokenizer() {
   return {
-    apply_chat_template: vi.fn(() => '<|im_start|>assistant\n'),
+    apply_chat_template: vi.fn((_chat: ChatMessageLike[]) => '<|im_start|>assistant\n'),
     encode: vi.fn(() => [1, 2, 3]),
   };
 }
@@ -242,6 +248,67 @@ describe('TransformersEngine', () => {
     await expect(engine.generate({ messages: [] }, () => {}, controller.signal)).rejects.toThrow(
       /not loaded/,
     );
+  });
+
+  it('passes tool calls and tool messages through to the chat template', async () => {
+    const generator = makeGenerator();
+    pipelineMock.mockResolvedValue(generator);
+    const engine = new TransformersEngine({ device: 'wasm', cache: 'browser' });
+    await engine.load(getModel('qwen2.5-1.5b'), () => {});
+
+    await engine.generate(
+      {
+        messages: [
+          { id: 'm1', role: 'user', content: 'list files', timestamp: 0 },
+          {
+            id: 'm2',
+            role: 'assistant',
+            content: '',
+            timestamp: 0,
+            toolCalls: [{ id: 'c1', name: 'list_dir', arguments: { path: '/' }, raw: '' }],
+          },
+          { id: 'm3', role: 'tool', content: 'a.txt\nb.txt', timestamp: 0 },
+        ],
+      },
+      () => {},
+      new AbortController().signal,
+    );
+
+    const chat = generator.tokenizer.apply_chat_template.mock.calls[0]![0] as ChatMessageLike[];
+    expect(chat[1]).toEqual({
+      role: 'assistant',
+      content: '',
+      tool_calls: [{ function: { name: 'list_dir', arguments: { path: '/' } } }],
+    });
+    expect(chat[2]).toEqual({ role: 'tool', content: 'a.txt\nb.txt' });
+  });
+
+  it('splits legacy toolResults into tool turns', async () => {
+    const generator = makeGenerator();
+    pipelineMock.mockResolvedValue(generator);
+    const engine = new TransformersEngine({ device: 'wasm', cache: 'browser' });
+    await engine.load(getModel('qwen2.5-1.5b'), () => {});
+
+    await engine.generate(
+      {
+        messages: [
+          { id: 'm1', role: 'user', content: 'list files', timestamp: 0 },
+          {
+            id: 'm2',
+            role: 'assistant',
+            content: '',
+            timestamp: 0,
+            toolCalls: [{ id: 'c1', name: 'list_dir', arguments: { path: '/' }, raw: '' }],
+            toolResults: [{ ok: true, content: 'a.txt\nb.txt' }],
+          },
+        ],
+      },
+      () => {},
+      new AbortController().signal,
+    );
+
+    const chat = generator.tokenizer.apply_chat_template.mock.calls[0]![0] as ChatMessageLike[];
+    expect(chat[2]).toEqual({ role: 'tool', content: 'a.txt\nb.txt' });
   });
 });
 
