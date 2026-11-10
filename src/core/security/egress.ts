@@ -32,8 +32,9 @@ export class InMemoryEgressLog implements EgressLog {
 }
 
 /**
- * The full egress surface GhostShell intercepts. Everything here can carry
- * bytes off the machine, so everything is logged — allowed or blocked.
+ * The egress surface GhostShell intercepts at the app layer. Everything here
+ * can carry bytes off the machine, so everything is logged — allowed or
+ * blocked.
  *
  *  - `fetch`                    : `globalThis.fetch`
  *  - `WebSocket`                : `globalThis.WebSocket`
@@ -41,6 +42,18 @@ export class InMemoryEgressLog implements EgressLog {
  *  - `EventSource`              : `globalThis.EventSource`
  *  - `navigator.sendBeacon`     : `Navigator.prototype.sendBeacon`
  *  - `sendBeacon` (global)      : `globalThis.sendBeacon`, when present
+ *
+ * Not intercepted here — this is not a complete lockdown on its own:
+ *  - `new Worker()` / `SharedWorker` / `ServiceWorker` / `importScripts()`
+ *  - dynamic `import('https://…')`
+ *  - subresource loads: `<script src>`, `<link href>`, `<img src>`/`srcset`,
+ *    `<iframe src>`, `<source>`/`<video>`/`<audio>`/`<track>`, `<embed>`,
+ *    `<object data>`, `<form action>`, and CSS `@import`/`url()`.
+ *
+ * The CSP in index.html is the second layer that blocks those vectors
+ * (`connect-src 'none'`, `frame-src 'none'`, `worker-src 'none'`,
+ * `object-src 'none'`, `form-action 'none'`). This interceptor remains the
+ * audit log for the APIs it covers.
  */
 interface NetworkGlobals {
   fetch?: typeof fetch;
