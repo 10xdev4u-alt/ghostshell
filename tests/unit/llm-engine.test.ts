@@ -67,7 +67,14 @@ vi.mock('@huggingface/transformers', () => ({
 import type { LoadProgress } from '@/types/index.js';
 import { TransformersEngine } from '@/core/llm/transformers.js';
 import { createEngine, detectBackend, supportsBackend } from '@/core/llm/engine.js';
-import { getModel, listModels, recommendModel, resolveModelRepo } from '@/core/llm/models.js';
+import {
+  getModel,
+  listModels,
+  ONNX_TARGETS,
+  recommendModel,
+  resolveModelDtype,
+  resolveModelRepo,
+} from '@/core/llm/models.js';
 
 interface StreamerLike {
   put(value: bigint[][]): void;
@@ -118,10 +125,21 @@ describe('TransformersEngine', () => {
     expect(task).toBe('text-generation');
     expect(repo).toBe('onnx-community/Qwen2.5-1.5B-Instruct');
     expect(options['device']).toBe('wasm');
+    expect(options['dtype']).toBe('q8');
     expect(options['progress_callback']).toBeTypeOf('function');
     expect(engine.isLoaded()).toBe(true);
     expect(progress.length).toBeGreaterThan(0);
     expect(progress[0]!.phase).toBe('downloading');
+  });
+
+  it('requests the dtype declared by the model ONNX conversion', async () => {
+    pipelineMock.mockResolvedValue(makeGenerator());
+    const engine = new TransformersEngine({ device: 'wasm', cache: 'browser' });
+    await engine.load(getModel('qwen2.5-3b'), () => {});
+
+    const [, repo, options] = pipelineMock.mock.calls[0]!;
+    expect(repo).toBe('opalitestudios/Qwen2.5-3B-Instruct-ONNX');
+    expect(options['dtype']).toBe('q4f16');
   });
 
   it('streams tokens and returns the generated text', async () => {
@@ -263,6 +281,39 @@ describe('models', () => {
     const spec = getModel('qwen2.5-1.5b');
     expect(resolveModelRepo(spec, 'transformers')).toBe('onnx-community/Qwen2.5-1.5B-Instruct');
     expect(resolveModelRepo(spec, 'webllm')).toBe(spec.repo);
+  });
+
+  it('maps every registry model to a verified ONNX target', () => {
+    // Verified against the live HF API (HTTP 200) on 2026-11-10. The 3B entry
+    // is the community ONNX conversion of Qwen2.5-3B-Instruct; onnx-community
+    // has no plain 3B-Instruct conversion.
+    expect(ONNX_TARGETS['qwen2.5-1.5b']).toEqual({
+      repo: 'onnx-community/Qwen2.5-1.5B-Instruct',
+      dtype: 'q8',
+    });
+    expect(ONNX_TARGETS['qwen2.5-3b']).toEqual({
+      repo: 'opalitestudios/Qwen2.5-3B-Instruct-ONNX',
+      dtype: 'q4f16',
+    });
+
+    for (const spec of listModels()) {
+      const target = ONNX_TARGETS[spec.id];
+      expect(target, `missing ONNX target for ${spec.id}`).toBeDefined();
+      expect(resolveModelRepo(spec, 'transformers')).toBe(target!.repo);
+      expect(resolveModelDtype(spec)).toBe(target!.dtype);
+    }
+  });
+
+  it('resolves the recommended 3B model to a loadable ONNX repo', () => {
+    const spec = recommendModel(true, 24);
+    expect(spec.id).toBe('qwen2.5-3b');
+    expect(resolveModelRepo(spec, 'transformers')).toBe('opalitestudios/Qwen2.5-3B-Instruct-ONNX');
+    expect(resolveModelDtype(spec)).toBe('q4f16');
+  });
+
+  it('throws a clear error for a model with no ONNX conversion', () => {
+    const spec = { ...getModel('qwen2.5-1.5b'), id: 'not-in-registry' };
+    expect(() => resolveModelRepo(spec, 'transformers')).toThrow(/No ONNX conversion/);
   });
 
   it('recommends 3B only with a GPU and enough memory', () => {

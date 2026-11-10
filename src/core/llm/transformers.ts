@@ -14,7 +14,7 @@ import type {
   Message,
   ModelSpec,
 } from '@/types/index.js';
-import { resolveModelRepo } from './models.js';
+import { resolveModelDtype, resolveModelRepo } from './models.js';
 
 /**
  * Transformers.js engine (default for v0.1).
@@ -34,7 +34,10 @@ export type CacheBackend = 'indexeddb' | 'opfs' | 'browser';
 export interface TransformersEngineOptions {
   /** ONNX runtime device. Defaults to `'wasm'`. */
   device?: BackendKind;
-  /** Weight quantization. Defaults to `'q8'` (the WASM sweet spot). */
+  /**
+   * Weight quantization. Defaults to the dtype declared by the model's ONNX
+   * conversion (see `resolveModelDtype`).
+   */
   dtype?: DataType;
   /** Persistent weight cache. Defaults to `'indexeddb'`. */
   cache?: CacheBackend;
@@ -236,7 +239,7 @@ export class TransformersEngine implements LLMEngine {
   readonly id = 'transformers';
   readonly kind: BackendKind;
 
-  private readonly dtype: DataType;
+  private readonly dtype: DataType | undefined;
   private readonly cache: CacheBackend;
   private readonly revision: string | undefined;
   private generator: TextGenerationPipelineType | null = null;
@@ -244,7 +247,7 @@ export class TransformersEngine implements LLMEngine {
 
   constructor(options: TransformersEngineOptions = {}) {
     this.kind = options.device ?? 'wasm';
-    this.dtype = options.dtype ?? 'q8';
+    this.dtype = options.dtype;
     this.cache = options.cache ?? 'indexeddb';
     this.revision = options.revision;
   }
@@ -257,6 +260,7 @@ export class TransformersEngine implements LLMEngine {
     this.configureCache();
 
     const repo = resolveModelRepo(spec, 'transformers');
+    const dtype = this.dtype ?? resolveModelDtype(spec);
     onProgress({
       phase: 'downloading',
       loaded: 0,
@@ -266,7 +270,7 @@ export class TransformersEngine implements LLMEngine {
 
     const generator = (await pipeline<'text-generation'>('text-generation', repo, {
       device: this.kind,
-      dtype: this.dtype,
+      dtype,
       ...(this.revision ? { revision: this.revision } : {}),
       progress_callback: (info: ProgressInfo) => onProgress(toLoadProgress(info, spec)),
     })) as unknown as TextGenerationPipelineType;
