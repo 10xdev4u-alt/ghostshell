@@ -38,10 +38,11 @@
  * `<qidPath>.bin` blob per file. When OPFS is unavailable the tree stays in
  * memory and every load/persist is skipped with a log message.
  *
- * A manifest that exists but cannot be parsed, or whose nodes are not valid,
- * is a corruption signal: {@link loadTree} throws {@link ManifestError} and
- * the handler refuses to persist, so a corrupt manifest is never overwritten
- * with an empty tree. A missing manifest is not an error (fresh storage).
+ * A manifest that exists but cannot be parsed, whose nodes are not valid, or
+ * whose bytes cannot be read is a corruption signal: {@link loadTree} throws
+ * {@link ManifestError} (or propagates the storage error) and the handler
+ * refuses to persist, so a corrupt manifest is never overwritten with an empty
+ * tree. A missing manifest is not an error (fresh storage).
  */
 
 import type { V86Options } from 'v86';
@@ -595,11 +596,31 @@ interface Manifest {
   root: ManifestNode;
 }
 
-async function opfsRoot(deps: Fs9pDeps): Promise<FileSystemDirectoryHandle> {
+/**
+ * OPFS signals a missing entry with a `DOMException` named `NotFoundError`.
+ * That is the only error that means "nothing is stored here"; every other
+ * error (transient I/O failure, `SecurityError`, quota, ...) is a real
+ * storage failure and must propagate so the caller cannot mistake it for an
+ * empty tree.
+ */
+function isNotFoundError(err: unknown): boolean {
+  return (
+    typeof err === 'object' &&
+    err !== null &&
+    (err as { name?: unknown }).name === 'NotFoundError'
+  );
+}
+
+/**
+ * Resolve the OPFS root, or undefined when the platform has no OPFS at all.
+ * A `getDirectory()` rejection is not "unavailable" and is allowed to
+ * propagate: it means storage exists but cannot be reached.
+ */
+async function opfsRoot(deps: Fs9pDeps): Promise<FileSystemDirectoryHandle | undefined> {
   if (deps.storage) return deps.storage;
   const navigator = (globalThis as { navigator?: Navigator }).navigator;
   if (!navigator?.storage || typeof navigator.storage.getDirectory !== 'function') {
-    throw new Error('OPFS is not available');
+    return undefined;
   }
   return navigator.storage.getDirectory();
 }
@@ -616,16 +637,29 @@ async function ensureDir(
   return dir;
 }
 
+/**
+ * Read a file from OPFS. Returns undefined only when the file is genuinely
+ * absent (`NotFoundError`); any other failure propagates. Treating a read
+ * failure as "missing" would let a transient I/O error masquerade as a fresh
+ * tree, and the next persist would overwrite the real manifest.
+ */
 async function readOpfsFile(
   dir: FileSystemDirectoryHandle,
   name: string,
 ): Promise<Uint8Array | undefined> {
+  let handle: FileSystemFileHandle;
   try {
-    const handle = await dir.getFileHandle(name);
+    handle = await dir.getFileHandle(name);
+  } catch (err) {
+    if (isNotFoundError(err)) return undefined;
+    throw err;
+  }
+  try {
     const file = await handle.getFile();
     return new Uint8Array(await file.arrayBuffer());
-  } catch {
-    return undefined;
+  } catch (err) {
+    if (isNotFoundError(err)) return undefined;
+    throw err;
   }
 }
 
@@ -707,6 +741,7 @@ export async function persistTree(
   nextQidPath = 0n,
 ): Promise<void> {
   const storage = await opfsRoot(deps);
+  if (!storage) throw new Error('OPFS is not available');
   const dir = await ensureDir(storage, prefix, true);
 
   let maxQid = 0n;
@@ -746,17 +781,14 @@ export async function loadTree(
   deps: Fs9pDeps,
   prefix = DEFAULT_FS_PREFIX,
 ): Promise<P9Node | undefined> {
-  let storage: FileSystemDirectoryHandle;
-  try {
-    storage = await opfsRoot(deps);
-  } catch {
-    return undefined;
-  }
+  const storage = await opfsRoot(deps);
+  if (!storage) return undefined;
   let dir: FileSystemDirectoryHandle;
   try {
     dir = await ensureDir(storage, prefix, false);
-  } catch {
-    return undefined;
+  } catch (err) {
+    if (isNotFoundError(err)) return undefined;
+    throw err;
   }
   const manifest = await readManifest(dir);
   if (!manifest) return undefined;

@@ -21,8 +21,15 @@ import {
 // Fake OPFS
 // ---------------------------------------------------------------------------
 
+/** Model OPFS's `DOMException(msg, 'NotFoundError')` for a missing entry. */
+function notFoundError(name: string): Error {
+  return Object.assign(new Error(`not found: ${name}`), { name: 'NotFoundError' });
+}
+
 class FakeFileHandle {
   data = new Uint8Array();
+  /** Injected read failure: `getFile()` rejects with this error. */
+  readError?: Error;
 
   constructor(
     private readonly dir: FakeDirHandle,
@@ -41,6 +48,7 @@ class FakeFileHandle {
   }
 
   async getFile() {
+    if (this.readError) throw this.readError;
     const data = this.data;
     return {
       async arrayBuffer() {
@@ -59,7 +67,7 @@ class FakeDirHandle {
   async getDirectoryHandle(name: string, options?: { create?: boolean }) {
     const existing = this.dirs.get(name);
     if (existing) return existing;
-    if (!options?.create) throw new Error(`not found: ${name}`);
+    if (!options?.create) throw notFoundError(name);
     const dir = new FakeDirHandle(name);
     this.dirs.set(name, dir);
     return dir;
@@ -68,7 +76,7 @@ class FakeDirHandle {
   async getFileHandle(name: string, options?: { create?: boolean }) {
     const existing = this.files.get(name);
     if (existing) return existing;
-    if (!options?.create) throw new Error(`not found: ${name}`);
+    if (!options?.create) throw notFoundError(name);
     const handle = new FakeFileHandle(this, name);
     this.files.set(name, handle);
     return handle;
@@ -730,6 +738,44 @@ describe('fs9p handler', () => {
     expect(Array.from(await readOpfsFile(root, 'test', 'manifest.json'))).toEqual(
       Array.from(raw),
     );
+  });
+
+  it('propagates a non-NotFound manifest read error instead of resetting the tree', async () => {
+    const { deps, root } = makeDeps();
+    const original = text.encode(manifestJson('1'));
+    await writeOpfsFile(root, 'test', 'manifest.json', original);
+
+    const dir = await root.getDirectoryHandle('test');
+    const manifestHandle = await dir.getFileHandle('manifest.json');
+    (manifestHandle as FakeFileHandle).readError = Object.assign(
+      new Error('transient I/O failure'),
+      { name: 'SecurityError' },
+    );
+
+    await expect(loadTree(deps, 'test')).rejects.toMatchObject({ name: 'SecurityError' });
+
+    const handle = create9pHandler(deps, { autoPersist: false });
+    await expect(handle.ready()).rejects.toMatchObject({ name: 'SecurityError' });
+    // The failed read must not be mistaken for "nothing stored": a persist
+    // attempt must leave the real manifest in place.
+    await handle.persist().catch(() => {});
+
+    // Read the fake's stored bytes directly so the injected read error does
+    // not interfere with the assertion.
+    expect(Array.from((manifestHandle as FakeFileHandle).data)).toEqual(
+      Array.from(original),
+    );
+  });
+
+  it('propagates a non-NotFound directory lookup error', async () => {
+    const { deps } = makeDeps();
+    const root = deps.storage as unknown as FakeDirHandle;
+    // Force getDirectoryHandle to fail for the prefix without a NotFound signal.
+    root.getDirectoryHandle = async () => {
+      throw Object.assign(new Error('storage unreachable'), { name: 'UnknownError' });
+    };
+
+    await expect(loadTree(deps, 'test')).rejects.toMatchObject({ name: 'UnknownError' });
   });
 });
 
