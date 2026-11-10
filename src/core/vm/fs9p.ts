@@ -36,7 +36,8 @@
  *
  * Persistence: the tree is written to OPFS as `manifest.json` plus one
  * `<qidPath>.bin` blob per file. When OPFS is unavailable the tree stays in
- * memory and every load/persist is skipped with a log message.
+ * memory; loads return undefined and persists reject so the host can see the
+ * failure instead of silently dropping writes.
  *
  * A manifest that exists but cannot be parsed, whose nodes are not valid, or
  * whose bytes cannot be read is a corruption signal: {@link loadTree} throws
@@ -106,7 +107,10 @@ export interface Fs9pHandle {
   ready(): Promise<void>;
   /** Flush any pending automatic persistence and persist immediately. */
   flush(): Promise<void>;
-  /** Persist the current tree now. */
+  /**
+   * Persist the current tree now. Rejects when the stored manifest could not
+   * be loaded or the write failed; `onLog` carries the diagnostic.
+   */
   persist(): Promise<void>;
 }
 
@@ -675,6 +679,25 @@ async function writeOpfsFile(
   await writable.close();
 }
 
+/**
+ * Best-effort copy of a corrupt manifest to `manifest.json.corrupt`.
+ *
+ * The original `manifest.json` is left untouched, so this never masks the
+ * failure or overwrites evidence; it only gives the operator a second copy
+ * with a stable name to inspect. Any failure here is logged by the caller.
+ */
+async function backupCorruptManifest(
+  deps: Fs9pDeps,
+  prefix: string,
+): Promise<void> {
+  const storage = await opfsRoot(deps);
+  if (!storage) return;
+  const dir = await ensureDir(storage, prefix, false);
+  const bytes = await readOpfsFile(dir, 'manifest.json');
+  if (!bytes) return;
+  await writeOpfsFile(dir, 'manifest.json.corrupt', bytes);
+}
+
 function toManifestNode(node: P9Node): ManifestNode {
   const entry: ManifestNode = {
     name: nodeName(node),
@@ -901,7 +924,9 @@ export function create9pHandler(deps: Fs9pDeps, options: Fs9pOptions = {}): Fs9p
     if (persistTimer) clearTimeout(persistTimer);
     persistTimer = setTimeout(() => {
       persistTimer = null;
-      void persist();
+      // persist() logs the failure itself; the timer must not leave an
+      // unhandled rejection behind.
+      void persist().catch(() => {});
     }, options.persistDebounceMs ?? 250);
   }
 
@@ -916,6 +941,17 @@ export function create9pHandler(deps: Fs9pDeps, options: Fs9pOptions = {}): Fs9p
       } catch (err) {
         deps.onLog?.(`fs9p: persist failed (${String(err)})`);
         dirty = true;
+        // Preserve a corrupt manifest under a stable name before giving up.
+        // This is best-effort: a read/write failure here must not replace the
+        // original error.
+        if (err instanceof ManifestError) {
+          try {
+            await backupCorruptManifest(deps, prefix);
+          } catch (backupErr) {
+            deps.onLog?.(`fs9p: manifest backup failed (${String(backupErr)})`);
+          }
+        }
+        throw err;
       } finally {
         persisting = null;
       }

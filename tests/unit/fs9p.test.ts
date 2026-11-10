@@ -30,6 +30,8 @@ class FakeFileHandle {
   data = new Uint8Array();
   /** Injected read failure: `getFile()` rejects with this error. */
   readError?: Error;
+  /** Injected write failure: `createWritable()` rejects with this error. */
+  writeError?: Error;
 
   constructor(
     private readonly dir: FakeDirHandle,
@@ -37,6 +39,7 @@ class FakeFileHandle {
   ) {}
 
   async createWritable() {
+    if (this.writeError) throw this.writeError;
     const handle = this;
     return {
       async write(chunk: Uint8Array) {
@@ -716,8 +719,9 @@ describe('fs9p handler', () => {
 
     const handle = create9pHandler(deps, { autoPersist: false });
     await expect(handle.ready()).rejects.toBeInstanceOf(ManifestError);
-    // An explicit persist must not replace the corrupt manifest with an empty tree.
-    await handle.persist();
+    // An explicit persist must reject and must not replace the corrupt
+    // manifest with an empty tree.
+    await expect(handle.persist()).rejects.toBeInstanceOf(ManifestError);
 
     expect(Array.from(await readOpfsFile(root, 'test', 'manifest.json'))).toEqual(
       Array.from(corrupt),
@@ -733,7 +737,7 @@ describe('fs9p handler', () => {
 
     const handle = create9pHandler(deps, { autoPersist: false });
     await expect(handle.ready()).rejects.toBeInstanceOf(ManifestError);
-    await handle.persist();
+    await expect(handle.persist()).rejects.toBeInstanceOf(ManifestError);
 
     expect(Array.from(await readOpfsFile(root, 'test', 'manifest.json'))).toEqual(
       Array.from(raw),
@@ -756,12 +760,11 @@ describe('fs9p handler', () => {
 
     const handle = create9pHandler(deps, { autoPersist: false });
     await expect(handle.ready()).rejects.toMatchObject({ name: 'SecurityError' });
-    // The failed read must not be mistaken for "nothing stored": a persist
-    // attempt must leave the real manifest in place.
-    await handle.persist().catch(() => {});
+    await expect(handle.persist()).rejects.toMatchObject({ name: 'SecurityError' });
 
-    // Read the fake's stored bytes directly so the injected read error does
-    // not interfere with the assertion.
+    // The failed read must not be mistaken for "nothing stored": the real
+    // manifest has to survive. Read the fake's stored bytes directly so the
+    // injected read error does not interfere with the assertion.
     expect(Array.from((manifestHandle as FakeFileHandle).data)).toEqual(
       Array.from(original),
     );
@@ -776,6 +779,42 @@ describe('fs9p handler', () => {
     };
 
     await expect(loadTree(deps, 'test')).rejects.toMatchObject({ name: 'UnknownError' });
+  });
+
+  it('rejects persist() and flush() when a write fails', async () => {
+    const { deps, root } = makeDeps();
+    const logs: string[] = [];
+    const handle = create9pHandler(
+      { ...deps, onLog: (message) => logs.push(message) },
+      { autoPersist: false },
+    );
+    await request(handle, 100, 1, new FrameWriter().u32(8192).string('9P2000.L').build());
+    await request(handle, 104, 2, attachPayload(1));
+    await request(
+      handle,
+      14,
+      3,
+      new FrameWriter().u32(1).string('note.txt').u32(0x2).u32(0o100644).u32(0).build(),
+    );
+    await handle.flush();
+    expect(logs.some((line) => line.includes('persist failed'))).toBe(false);
+
+    // Force the next manifest write to fail.
+    const dir = await root.getDirectoryHandle('test');
+    const manifestHandle = await dir.getFileHandle('manifest.json');
+    (manifestHandle as FakeFileHandle).writeError = new Error('disk full');
+
+    await request(
+      handle,
+      14,
+      4,
+      new FrameWriter().u32(1).string('other.txt').u32(0x2).u32(0o100644).u32(0).build(),
+    );
+    await expect(handle.persist()).rejects.toThrow('disk full');
+    expect(logs.some((line) => line.includes('persist failed'))).toBe(true);
+
+    // The failure is sticky: a later flush must not resolve as if it wrote.
+    await expect(handle.flush()).rejects.toThrow('disk full');
   });
 });
 
