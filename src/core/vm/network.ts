@@ -104,6 +104,34 @@ export function buildNetDevice(config: NetworkConfig): NetDevice | undefined {
   }
 }
 
+/**
+ * The subset of v86's `V86Options` this module writes. `V86VMHandle.start`
+ * should call this before constructing the emulator:
+ *
+ *   const options: V86Options = { ... };
+ *   applyNetwork(options, { mode: config.networkMode, wispUrl: ... });
+ *   this.emu = new V86(options);
+ *
+ * The VM layer owns the pass-through; this module owns the device shape so the
+ * two cannot drift.
+ */
+export interface NetworkOptionsTarget {
+  net_device?: V86Options['net_device'] | undefined;
+}
+
+/**
+ * Attach the device for `config` to a v86 options object. Airplane mode clears
+ * `net_device` so v86 constructs no adapter. Returns the device (or undefined).
+ */
+export function applyNetwork(
+  target: NetworkOptionsTarget,
+  config: NetworkConfig,
+): NetDevice | undefined {
+  const device = buildNetDevice(config);
+  target.net_device = device;
+  return device;
+}
+
 /** True when the VM has any network device attached. */
 export function isNetworkEnabled(mode: NetworkBackend): boolean {
   return mode !== 'off';
