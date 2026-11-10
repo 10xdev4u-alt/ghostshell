@@ -49,13 +49,60 @@ export const ALPINE_IMAGE_URLS = {
   v86VgaBios: 'https://copy.sh/v86/bios/vgabios.bin',
 } as const;
 
-export const DEFAULT_IMAGE: VMImage = {
+/** Probe for whether a boot artifact exists. */
+export type ArtifactExists = (path: string) => boolean;
+
+/**
+ * Default artifact probe.
+ *
+ * Under Node this checks the filesystem. The browser cannot (the 9p manifest
+ * is fetched over HTTP), so it assumes the artifact is present and lets v86's
+ * `download-error` event surface a missing file.
+ */
+export function nodeArtifactExists(path: string): boolean {
+  const proc = (
+    globalThis as {
+      process?: { getBuiltinModule?: (id: string) => unknown } | undefined;
+    }
+  ).process;
+  const fs = proc?.getBuiltinModule?.('node:fs') as
+    | { existsSync?: (candidate: string) => boolean }
+    | undefined;
+  return fs?.existsSync?.(path) ?? true;
+}
+
+/** A VM image plus the local artifacts required to boot it. */
+export interface ManifestImage extends VMImage {
+  /** Paths that must exist before this image can boot. */
+  artifacts?: string[];
+}
+
+/**
+ * Fail with an actionable message when an image's artifacts are missing.
+ *
+ * Without this, a missing rootfs surfaces as an opaque v86 `download-error`
+ * (or a hang) at boot time.
+ */
+export function assertImageAvailable(
+  image: ManifestImage,
+  exists: ArtifactExists = nodeArtifactExists,
+): void {
+  const missing = (image.artifacts ?? []).filter((path) => !exists(path));
+  if (missing.length === 0) return;
+  throw new Error(
+    `VM image "${image.id}" is missing required artifacts: ${missing.join(', ')}. ` +
+      'Run `bun run image:build` to build the Alpine i386 rootfs.',
+  );
+}
+
+export const DEFAULT_IMAGE: ManifestImage = {
   id: VM_CONSTRAINTS.bootImage,
   name: 'Alpine 3.21 i386 (pre-baked)',
   arch: 'ia32',
   // Recorded by scripts/build-image.sh once the rootfs is vendored.
   sizeBytes: 0,
   url: ALPINE_IMAGE_URLS.dockerBase,
+  artifacts: [ALPINE_BOOT.rootfsFsJson, ALPINE_BOOT.rootfsBaseUrl],
   prebaked: [
     'alpine-base',
     'git',
@@ -72,11 +119,12 @@ export const DEFAULT_IMAGE: VMImage = {
   ],
 };
 
-export const IMAGES: VMImage[] = [DEFAULT_IMAGE];
+export const IMAGES: ManifestImage[] = [DEFAULT_IMAGE];
 
-export function getImage(id: string): VMImage {
+export function getImage(id: string, exists: ArtifactExists = nodeArtifactExists): VMImage {
   const image = IMAGES.find((i) => i.id === id);
   if (!image) throw new Error(`Unknown VM image: ${id}`);
+  assertImageAvailable(image, exists);
   return image;
 }
 

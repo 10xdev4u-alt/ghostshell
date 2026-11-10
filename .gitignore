@@ -43,10 +43,12 @@ test-results/
 # OS
 Thumbs.db
 
-# v86 image artifacts (large; built in CI)
+# v86 image artifacts (large; built by scripts/build-image.sh)
 images/*.img
 images/*.iso
 images/build/
+images/alpine-rootfs-flat/
+images/alpine-fs.json
 
 # Scratch
 *.tmp
