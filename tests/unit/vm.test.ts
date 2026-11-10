@@ -174,6 +174,13 @@ describe('V86VMHandle', () => {
     await expect(vm.start(DEFAULT_IMAGE)).rejects.toThrow(/Timed out/);
   });
 
+  it('passes netDevice through to the v86 options', async () => {
+    const netDevice = { relay_url: 'fetch' } as V86Options['net_device'];
+    const vm = new V86VMHandle({ netDevice });
+    await vm.start(DEFAULT_IMAGE);
+    expect(instances[0]!.options.net_device).toEqual(netDevice);
+  });
+
   it('allows overriding the boot options', async () => {
     const vm = new V86VMHandle({
       memorySizeBytes: 256 * 1024 * 1024,
