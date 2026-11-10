@@ -17,14 +17,20 @@ import { createTwinView } from '@/ui/twinview.js';
 import { createFileTree } from '@/ui/filetree.js';
 import { createDiffView } from '@/ui/diff.js';
 import { createArtifactPanel } from '@/ui/artifact.js';
-import { createPrivacyReportSection, createSettings } from '@/ui/settings.js';
+import {
+  createPrivacyReportSection,
+  createSettings,
+  resolveSettingsConfig,
+  SETTINGS_KEY,
+} from '@/ui/settings.js';
 import {
   BOOT_EGRESS_ALLOWLIST,
   installEgressInterceptor,
   InMemoryEgressLog,
 } from '@/core/security/egress.js';
 import { V86_WASM_URL } from '@/core/vm/wasm.js';
-import type { AppEventMap } from '@/types/index.js';
+import { getModel } from '@/core/llm/models.js';
+import type { AgentConfig, AppEventMap } from '@/types/index.js';
 
 /**
  * App orchestrator. Wires the core modules to the UI.
@@ -75,9 +81,14 @@ export class App {
 
   async init(): Promise<void> {
     await this.db.open();
+    const persisted = await this.db.getSetting<Partial<AgentConfig>>(SETTINGS_KEY);
+    const config = resolveSettingsConfig(DEFAULT_AGENT_CONFIG, persisted);
+    // The persisted network mode must be in place before the first boot;
+    // a running VM keeps the device it booted with until restarted.
+    this.vm.setNetDevice(buildNetDevice({ mode: config.networkMode }));
     this.restoreEgress = installEgressInterceptor(
       this.egress,
-      DEFAULT_AGENT_CONFIG.networkMode === 'off',
+      config.networkMode === 'off',
       BOOT_EGRESS_ALLOWLIST,
     );
 
@@ -88,7 +99,8 @@ export class App {
     this.fileTree = createFileTree(document.getElementById('gs-filetree')!);
     this.diffView = createDiffView(document.getElementById('gs-diff')!);
     this.artifact = createArtifactPanel(document.getElementById('gs-artifact')!);
-    this.settings = createSettings(DEFAULT_AGENT_CONFIG);
+    this.settings = createSettings({ config, db: this.db });
+    this.settings.onChange((next) => this.applyConfigChange(next));
 
     if (FLAGS.privacyAttestation) {
       const privacyMount = document.getElementById('gs-privacy-report');
@@ -130,13 +142,35 @@ export class App {
     await this.vm.start(image);
     this.bus.emit('vm:ready', undefined);
 
+    const config = this.settings?.get() ?? DEFAULT_AGENT_CONFIG;
     const engine = createEngine('transformers');
     const registry = createToolRegistry(builtinTools());
     this.loop = new AgentLoop(registry, {
-      ...DEFAULT_AGENT_CONFIG,
-      systemPrompt: buildSystemPrompt({ modelName: 'Qwen2.5-1.5B', workspace: '/root/workspace' }),
+      ...config,
+      systemPrompt: buildSystemPrompt({
+        modelName: getModel(config.modelId).name,
+        workspace: '/root/workspace',
+      }),
     });
     void engine;
+    this.updateBadges();
+  }
+
+  /**
+   * Apply a settings change made in the panel.
+   *
+   * The network device is rebuilt for the next boot (a running VM keeps its
+   * NIC), and the egress interceptor is reinstalled so lockdown follows the
+   * selected mode.
+   */
+  private applyConfigChange(config: AgentConfig): void {
+    this.vm.setNetDevice(buildNetDevice({ mode: config.networkMode }));
+    this.restoreEgress?.();
+    this.restoreEgress = installEgressInterceptor(
+      this.egress,
+      config.networkMode === 'off',
+      BOOT_EGRESS_ALLOWLIST,
+    );
     this.updateBadges();
   }
 
@@ -144,7 +178,10 @@ export class App {
     const vm = document.getElementById('gs-vm');
     if (vm) vm.textContent = this.vm.running ? '🖥️ running' : '🖥️ stopped';
     const egress = document.getElementById('gs-egress');
-    if (egress) egress.textContent = '🌐 offline (lockdown)';
+    if (egress) {
+      const lockdown = this.settings?.get().networkMode === 'off';
+      egress.textContent = lockdown ? '🌐 offline (lockdown)' : '🌐 online (logged)';
+    }
   }
 
   dispose(): void {

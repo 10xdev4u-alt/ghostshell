@@ -239,6 +239,20 @@ describe('V86VMHandle', () => {
     expect(instances[0]!.options.net_device).toBeUndefined();
   });
 
+  it('applies a net device set after construction on the next boot', async () => {
+    const vm = new V86VMHandle();
+    vm.setNetDevice(buildNetDevice({ mode: 'fetch' }));
+    await vm.start(DEFAULT_IMAGE);
+    expect(instances[0]!.options.net_device).toEqual({ relay_url: 'fetch' });
+  });
+
+  it('lets a later setNetDevice override an earlier one', async () => {
+    const vm = new V86VMHandle({ netDevice: buildNetDevice({ mode: 'fetch' }) });
+    vm.setNetDevice(buildNetDevice({ mode: 'off' }));
+    await vm.start(DEFAULT_IMAGE);
+    expect(instances[0]!.options.net_device).toBeUndefined();
+  });
+
   it('allows overriding the boot options', async () => {
     const vm = new V86VMHandle({
       memorySizeBytes: 256 * 1024 * 1024,

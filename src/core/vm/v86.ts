@@ -61,7 +61,7 @@ export class V86VMHandle implements VMHandle {
   private queue = new SerialQueue();
   private serialListeners = new Set<(data: string) => void>();
   private decoder = new TextDecoder('utf-8', { fatal: false });
-  private readonly deps: V86Deps;
+  private deps: V86Deps;
   private readonly transport: SerialTransport = {
     send: (data) => {
       this.emu?.serial0_send(data);
@@ -76,6 +76,18 @@ export class V86VMHandle implements VMHandle {
 
   get running(): boolean {
     return this.emu?.is_running() ?? false;
+  }
+
+  /**
+   * Set the network device used by the next boot.
+   *
+   * v86 reads `net_device` once, while initializing the emulator, so a
+   * running guest cannot swap its NIC without tearing the VM down and
+   * discarding its state. The new device is stored and applied by the next
+   * `start()`; a running VM keeps the device it booted with.
+   */
+  setNetDevice(netDevice: V86Deps['netDevice']): void {
+    this.deps = { ...this.deps, netDevice };
   }
 
   async start(image: VMImage): Promise<void> {
