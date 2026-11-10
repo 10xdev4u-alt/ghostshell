@@ -1,0 +1,10 @@
+# GhostShell code owners
+# Every PR requests review from the module owner(s) it touches.
+
+* @10xdev4u-alt
+
+/src/core/vm/ @10xdev4u-alt
+/src/core/llm/ @10xdev4u-alt
+/src/core/agent/ @10xdev4u-alt
+/src/ui/ @10xdev4u-alt
+/src/core/security/ @10xdev4u-alt

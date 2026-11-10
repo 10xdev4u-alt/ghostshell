@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="GhostShell — a single static HTML file that runs an AI coding agent entirely in your browser. Real Linux VM, local LLM, no server, $0."
+    />
+    <meta name="color-scheme" content="dark light" />
+    <title>GhostShell</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>👻</text></svg>" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="gs-header">
+        <div class="gs-brand">
+          <span class="gs-logo">👻</span>
+          <span class="gs-name">GhostShell</span>
+          <span class="gs-version" id="gs-version">v0.1.0</span>
+        </div>
+        <div class="gs-status">
+          <span id="gs-egress" class="gs-badge" title="Network egress status">🌐 checking…</span>
+          <span id="gs-model" class="gs-badge" title="Model status">🧠 unloaded</span>
+          <span id="gs-vm" class="gs-badge" title="VM status">🖥️ stopped</span>
+        </div>
+      </header>
+
+      <main class="gs-main">
+        <section class="gs-chat" id="gs-chat">
+          <div class="gs-welcome">
+            <h1>GhostShell</h1>
+            <p>A coding agent that lives in one HTML file.</p>
+            <ul>
+              <li>🖥️ Real Linux VM (v86, Alpine, 32-bit)</li>
+              <li>🧠 Local LLM (WASM / WebGPU, no API keys)</li>
+              <li>🔒 No server, no account, no telemetry</li>
+            </ul>
+            <button id="gs-start" class="gs-btn gs-btn-primary">Start GhostShell</button>
+            <p class="gs-hint">First run downloads the model (~1 GB) and caches it.</p>
+          </div>
+        </section>
+
+        <section class="gs-side" id="gs-side">
+          <div class="gs-tabs">
+            <button class="gs-tab is-active" data-tab="terminal">Terminal</button>
+            <button class="gs-tab" data-tab="files">Files</button>
+            <button class="gs-tab" data-tab="diff">Diff</button>
+            <button class="gs-tab" data-tab="artifact">Artifact</button>
+            <button class="gs-tab" data-tab="settings">Settings</button>
+          </div>
+          <div class="gs-tab-panel is-active" id="gs-panel-terminal">
+            <div id="gs-terminal"></div>
+          </div>
+          <div class="gs-tab-panel" id="gs-panel-files">
+            <div id="gs-filetree" class="gs-filetree">No VM running.</div>
+          </div>
+          <div class="gs-tab-panel" id="gs-panel-diff">
+            <div id="gs-diff" class="gs-diff">No changes yet.</div>
+          </div>
+          <div class="gs-tab-panel" id="gs-panel-artifact">
+            <div id="gs-artifact" class="gs-artifact">No artifact.</div>
+          </div>
+          <div class="gs-tab-panel" id="gs-panel-settings">
+            <div id="gs-settings" class="gs-settings">
+              <label>Model
+                <select id="gs-model-select">
+                  <option value="qwen2.5-1.5b">Qwen2.5-1.5B (fast, 1 GB)</option>
+                  <option value="qwen2.5-3b">Qwen2.5-3B (smarter, 2 GB)</option>
+                </select>
+              </label>
+              <label>Network
+                <select id="gs-network-select">
+                  <option value="off">Off (airplane mode)</option>
+                  <option value="fetch">Fetch (host localhost)</option>
+                  <option value="wisp">WISP relay (self-hosted)</option>
+                </select>
+              </label>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <footer class="gs-footer">
+        <span>GhostShell is open source (MIT). Your code never leaves this machine.</span>
+        <a href="https://github.com/10xdev4u-alt/ghostshell" target="_blank" rel="noopener">GitHub</a>
+      </footer>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

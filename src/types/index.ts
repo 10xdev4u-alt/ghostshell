@@ -1,0 +1,314 @@
+/**
+ * GhostShell domain model.
+ *
+ * Every module depends on these types. They are deliberately backend-agnostic:
+ * the same `LLMEngine` is satisfied by Transformers.js or WebLLM, the same
+ * `VMHandle` by v86 today and a future native backend.
+ */
+
+export type UUID = string;
+
+// ---------------------------------------------------------------------------
+// Models
+// ---------------------------------------------------------------------------
+
+export type Quantization = 'q4_k_m' | 'q5_k_m' | 'q8_0' | 'f16';
+export type BackendKind = 'wasm' | 'webgpu';
+
+export interface ModelSpec {
+  id: string;
+  name: string;
+  repo: string;
+  sizeBytes: number;
+  contextLength: number;
+  quantization: Quantization;
+  backend: BackendKind;
+  license: string;
+  sha256?: string;
+}
+
+export interface ModelCard {
+  spec: ModelSpec;
+  description: string;
+  toolCallScore?: number;
+  tokPerSec?: Record<string, number>;
+}
+
+// ---------------------------------------------------------------------------
+// LLM engine
+// ---------------------------------------------------------------------------
+
+export interface LoadProgress {
+  phase: 'downloading' | 'extracting' | 'compiling' | 'loading';
+  loaded: number;
+  total: number;
+  message?: string;
+}
+
+export interface GenerateRequest {
+  messages: Message[];
+  temperature?: number;
+  maxTokens?: number;
+  grammar?: string;
+  stop?: string[];
+}
+
+export interface GenerateResult {
+  text: string;
+  tokens: number;
+  finishReason: 'stop' | 'length' | 'error' | 'aborted';
+  toolCalls?: ToolCall[];
+}
+
+export interface LLMEngine {
+  readonly id: string;
+  readonly kind: BackendKind;
+  load(spec: ModelSpec, onProgress: (p: LoadProgress) => void): Promise<void>;
+  unload(): Promise<void>;
+  isLoaded(): boolean;
+  generate(
+    req: GenerateRequest,
+    onToken: (token: string) => void,
+    signal: AbortSignal,
+  ): Promise<GenerateResult>;
+}
+
+// ---------------------------------------------------------------------------
+// Messages / conversation
+// ---------------------------------------------------------------------------
+
+export type MessageRole = 'system' | 'user' | 'assistant' | 'tool';
+
+export interface ToolCall {
+  id: string;
+  name: string;
+  arguments: Record<string, unknown>;
+  raw: string;
+}
+
+export interface ToolResult {
+  ok: boolean;
+  content: string;
+  artifacts?: Artifact[];
+  metadata?: Record<string, unknown>;
+}
+
+export interface Message {
+  id: UUID;
+  role: MessageRole;
+  content: string;
+  toolCalls?: ToolCall[];
+  toolResults?: ToolResult[];
+  timestamp: number;
+  model?: string;
+}
+
+export interface Conversation {
+  id: UUID;
+  title: string;
+  messages: Message[];
+  createdAt: number;
+  updatedAt: number;
+  modelId: string;
+  vmSnapshotId?: UUID;
+}
+
+// ---------------------------------------------------------------------------
+// Tools / agent
+// ---------------------------------------------------------------------------
+
+export interface JSONSchema {
+  type: 'object';
+  properties: Record<string, JSONSchemaProperty>;
+  required?: string[];
+}
+
+export interface JSONSchemaProperty {
+  type: 'string' | 'number' | 'boolean' | 'array' | 'object';
+  description?: string;
+  items?: JSONSchemaProperty;
+  enum?: string[];
+}
+
+export interface ToolContext {
+  vm: VMHandle;
+  llm: LLMEngine;
+  db: Database;
+  egress: EgressLog;
+  signal?: AbortSignal;
+}
+
+export interface ToolDefinition {
+  name: string;
+  description: string;
+  parameters: JSONSchema;
+  execute: (ctx: ToolContext, args: Record<string, unknown>) => Promise<ToolResult>;
+}
+
+export interface AgentConfig {
+  maxIterations: number;
+  toolTimeoutMs: number;
+  maxRetries: number;
+  contextWindow: number;
+  temperature: number;
+  modelId: string;
+  networkMode: NetworkMode;
+  systemPrompt: string;
+}
+
+export type NetworkMode = 'off' | 'fetch' | 'wisp' | 'inbrowser';
+
+// ---------------------------------------------------------------------------
+// VM
+// ---------------------------------------------------------------------------
+
+export interface VMImage {
+  id: string;
+  name: string;
+  arch: 'ia32';
+  sizeBytes: number;
+  url?: string;
+  prebaked: string[];
+}
+
+export interface CommandResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+  durationMs: number;
+  timedOut: boolean;
+}
+
+export interface DirEntry {
+  name: string;
+  kind: 'file' | 'dir' | 'symlink';
+  size: number;
+  mtime: number;
+}
+
+export interface VMHandle {
+  readonly id: string;
+  readonly running: boolean;
+  start(image: VMImage): Promise<void>;
+  stop(): Promise<void>;
+  pause(): Promise<void>;
+  resume(): Promise<void>;
+  exec(cmd: string, timeoutMs?: number): Promise<CommandResult>;
+  write(path: string, content: string): Promise<void>;
+  read(path: string): Promise<string>;
+  list(path: string): Promise<DirEntry[]>;
+  onSerial: (fn: (data: string) => void) => void;
+}
+
+// ---------------------------------------------------------------------------
+// Persistence
+// ---------------------------------------------------------------------------
+
+export interface VMSnapshot {
+  id: UUID;
+  conversationId: UUID;
+  createdAt: number;
+  kind: 'full' | 'delta';
+  sizeBytes: number;
+  stateRef: string;
+}
+
+export interface Database {
+  open(): Promise<void>;
+  close(): Promise<void>;
+  putConversation(c: Conversation): Promise<void>;
+  getConversation(id: UUID): Promise<Conversation | undefined>;
+  listConversations(): Promise<Conversation[]>;
+  deleteConversation(id: UUID): Promise<void>;
+  putSnapshot(s: VMSnapshot, data: Uint8Array): Promise<void>;
+  getSnapshot(id: UUID): Promise<{ meta: VMSnapshot; data: Uint8Array } | undefined>;
+  setSetting(key: string, value: unknown): Promise<void>;
+  getSetting<T>(key: string): Promise<T | undefined>;
+}
+
+// ---------------------------------------------------------------------------
+// Security
+// ---------------------------------------------------------------------------
+
+export interface EgressEvent {
+  id: UUID;
+  timestamp: number;
+  url: string;
+  method: string;
+  blocked: boolean;
+  reason?: string | undefined;
+}
+
+export interface EgressLog {
+  record(event: Omit<EgressEvent, 'id' | 'timestamp'>): void;
+  list(): EgressEvent[];
+  clear(): void;
+}
+
+export interface PrivacyReport {
+  htmlSha256: string;
+  modelSha256: string;
+  vmImageSha256: string;
+  dependencies: { name: string; version: string; license: string }[];
+  egress: EgressEvent[];
+  generatedAt: number;
+  signature?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Artifacts / plugins
+// ---------------------------------------------------------------------------
+
+export type ArtifactKind = 'html' | 'svg' | 'markdown' | 'canvas' | 'json';
+
+export interface Artifact {
+  id: UUID;
+  kind: ArtifactKind;
+  content: string;
+  mime: string;
+  createdAt: number;
+}
+
+export interface Recipe {
+  name: string;
+  version: string;
+  description: string;
+  license: string;
+  author: string;
+  prompt: string;
+  tools: string[];
+  fewShot?: unknown;
+  setup: string;
+  evals?: unknown;
+  integrity: { sha256: string };
+}
+
+export interface MCPServer {
+  name: string;
+  transport: 'stdio' | 'sse' | 'http';
+  command?: string;
+  url?: string;
+  enabled: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------
+
+export interface EventListener<T> {
+  (event: T): void;
+}
+
+export interface AppEventMap {
+  'vm:serial': string;
+  'vm:ready': void;
+  'vm:stopped': void;
+  'llm:progress': LoadProgress;
+  'llm:token': string;
+  'llm:loaded': void;
+  'agent:tool-call': ToolCall;
+  'agent:tool-result': ToolResult;
+  'agent:message': Message;
+  'egress': EgressEvent;
+  'snapshot': VMSnapshot;
+}
