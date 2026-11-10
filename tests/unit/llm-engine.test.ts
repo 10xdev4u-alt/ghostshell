@@ -445,6 +445,46 @@ describe('TransformersEngine', () => {
     const chat = generator.tokenizer.apply_chat_template.mock.calls[0]![0] as ChatMessageLike[];
     expect(chat[2]).toEqual({ role: 'tool', content: 'a.txt\nb.txt' });
   });
+
+  it('includes tool calls in the ChatML fallback (#72)', async () => {
+    const generator = makeGenerator();
+    generator.tokenizer.apply_chat_template = vi.fn(() => {
+      throw new Error('no chat template');
+    });
+    pipelineMock.mockResolvedValue(generator);
+    const engine = new TransformersEngine({ device: 'wasm', cache: 'browser' });
+    await engine.load(getModel('qwen2.5-1.5b'), () => {});
+
+    await engine.generate(
+      {
+        messages: [
+          { id: 'm1', role: 'user', content: 'list files', timestamp: 0 },
+          {
+            id: 'm2',
+            role: 'assistant',
+            content: '',
+            timestamp: 0,
+            toolCalls: [{ id: 'c1', name: 'list_dir', arguments: { path: '/' }, raw: '' }],
+          },
+          { id: 'm3', role: 'tool', content: 'a.txt\nb.txt', timestamp: 0 },
+        ],
+      },
+      () => {},
+      new AbortController().signal,
+    );
+
+    const prompt = generator.mock.calls[0]![0] as string;
+    expect(prompt).toContain('<tool_call>');
+    expect(prompt).toContain(JSON.stringify({ name: 'list_dir', arguments: { path: '/' } }));
+    expect(prompt).toContain('a.txt\nb.txt');
+
+    // The fallback uses the parser's Hermes syntax, so the call round-trips.
+    const parsed = parseToolCalls(prompt);
+    expect(parsed.strategy).toBe('hermes');
+    expect(parsed.toolCalls[0]?.name).toBe('list_dir');
+    expect(parsed.toolCalls[0]?.arguments).toEqual({ path: '/' });
+  });
+
 });
 
 describe('createEngine', () => {

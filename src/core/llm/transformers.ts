@@ -615,9 +615,21 @@ function toChatMessages(messages: Message[]): ChatMessage[] {
 
 /** ChatML fallback for tokenizers without a chat template. */
 function fallbackChatTemplate(messages: ChatMessage[]): string {
-  const parts = messages.map(
-    (message) => `<|im_start|>${message.role}\n${message.content}\n<|im_end|>`,
-  );
+  const parts = messages.map((message) => {
+    const blocks = message.tool_calls?.map(formatToolCall) ?? [];
+    const body = [message.content, ...blocks].filter((part) => part.length > 0).join('\n');
+    return `<|im_start|>${message.role}\n${body}\n<|im_end|>`;
+  });
   parts.push('<|im_start|>assistant\n');
   return parts.join('\n');
+}
+
+/**
+ * Render one tool call in the Hermes format `parseToolCalls` accepts
+ * (`<tool_call>{"name": …, "arguments": …}</tool_call>`), which is also the
+ * syntax Qwen's chat template emits.
+ */
+function formatToolCall(call: ChatToolCall): string {
+  const payload = JSON.stringify({ name: call.function.name, arguments: call.function.arguments });
+  return `<tool_call>\n${payload}\n</tool_call>`;
 }
