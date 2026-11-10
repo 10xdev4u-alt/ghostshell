@@ -222,6 +222,7 @@ export interface Database {
   deleteConversation(id: UUID): Promise<void>;
   putSnapshot(s: VMSnapshot, data: Uint8Array): Promise<void>;
   getSnapshot(id: UUID): Promise<{ meta: VMSnapshot; data: Uint8Array } | undefined>;
+  deleteSnapshot(id: UUID): Promise<void>;
   setSetting(key: string, value: unknown): Promise<void>;
   getSetting<T>(key: string): Promise<T | undefined>;
 }
