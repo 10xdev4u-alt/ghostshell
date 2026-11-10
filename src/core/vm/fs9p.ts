@@ -1482,15 +1482,13 @@ export function create9pHandler(deps: Fs9pDeps, options: Fs9pOptions = {}): Fs9p
 /**
  * Build the `filesystem` option object for v86's `V86Options`.
  *
- * INTEGRATION POINT — `src/core/vm/v86.ts` (outside this file's scope):
- * `V86Deps.filesystem?: V86Options['filesystem']` is declared but
- * `V86VMHandle.start()` never reads it. To finish the wiring, construct the
- * filesystem and hand it to the VM, e.g.:
+ * INTEGRATION POINT — `src/core/vm/v86.ts`: `V86VMHandle` accepts this as
+ * `V86Deps.filesystem` and `buildOptions()` forwards it to `new V86(...)`.
+ * For example:
  *
  * ```ts
  * const filesystem = createV86Filesystem({ prefix: 'fs9p' });
- * const vm = new V86VMHandle();
- * // in start(): options.filesystem = this.deps.filesystem;
+ * const vm = new V86VMHandle({ filesystem });
  * ```
  *
  * v86 calls `handle9p(reqbuf, reply)` once per request (`Virtio9pHandler` in

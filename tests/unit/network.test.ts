@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { applyNetwork, buildNetDevice, isNetworkEnabled } from '@/core/vm/network.js';
-import type { V86Options } from 'v86';
+import { buildNetDevice, isNetworkEnabled } from '@/core/vm/network.js';
 
 describe('buildNetDevice', () => {
   it('omits net_device entirely for airplane mode', () => {
@@ -90,25 +89,6 @@ describe('buildNetDevice', () => {
     for (const device of devices) {
       expect(device?.relay_url).toMatch(/^(fetch|inbrowser|wisp:\/\/|wisps:\/\/|ws:\/\/|wss:\/\/)/);
     }
-  });
-});
-
-describe('applyNetwork', () => {
-  it('attaches the built device to v86 options', () => {
-    const options: V86Options = {};
-    applyNetwork(options, { mode: 'fetch' });
-    expect(options.net_device).toEqual({ relay_url: 'fetch' });
-  });
-
-  it('clears net_device in airplane mode', () => {
-    const options: V86Options = { net_device: { relay_url: 'fetch' } };
-    applyNetwork(options, { mode: 'off' });
-    expect(options.net_device).toBeUndefined();
-  });
-
-  it('returns the device it attached', () => {
-    const options: V86Options = {};
-    expect(applyNetwork(options, { mode: 'inbrowser' })).toEqual({ relay_url: 'inbrowser' });
   });
 });
 

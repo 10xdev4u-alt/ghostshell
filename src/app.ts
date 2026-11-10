@@ -8,7 +8,9 @@ import { builtinTools } from '@/core/agent/tools.js';
 import { buildSystemPrompt } from '@/core/agent/prompts.js';
 import { createEngine } from '@/core/llm/engine.js';
 import { DEFAULT_AGENT_CONFIG, FLAGS } from '@/config.js';
-import { getImage } from '@/core/vm/image.js';
+import { ALPINE_BOOT, getImage } from '@/core/vm/image.js';
+import { buildNetDevice } from '@/core/vm/network.js';
+import { createV86Filesystem, DEFAULT_FS_PREFIX } from '@/core/vm/fs9p.js';
 import { createChat } from '@/ui/chat.js';
 import { createTerminal } from '@/ui/terminal.js';
 import { createTwinView } from '@/ui/twinview.js';
@@ -32,7 +34,18 @@ export class App {
   readonly bus = new EventBus<AppEventMap>();
   readonly db = new IdbDatabase();
   readonly egress = new InMemoryEgressLog();
-  readonly vm = new V86VMHandle();
+  /**
+   * Boots the vendored Alpine image. `ALPINE_BOOT` supplies the BIOS, VGA
+   * BIOS, and kernel cmdline; the guest root is the persistent OPFS-backed
+   * 9p filesystem; the NIC comes from the selected network mode.
+   */
+  readonly vm = new V86VMHandle({
+    bios: { url: ALPINE_BOOT.biosUrl },
+    vgaBios: { url: ALPINE_BOOT.vgaBiosUrl },
+    cmdline: ALPINE_BOOT.cmdline,
+    filesystem: createV86Filesystem({ prefix: DEFAULT_FS_PREFIX }),
+    netDevice: buildNetDevice({ mode: DEFAULT_AGENT_CONFIG.networkMode }),
+  });
   readonly conversations: ConversationRepository;
   readonly snapshots: SnapshotManager;
 

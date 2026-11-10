@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { V86Options } from 'v86';
 import { DEFAULT_IMAGE } from '@/core/vm/image.js';
+import { createV86Filesystem } from '@/core/vm/fs9p.js';
+import { buildNetDevice } from '@/core/vm/network.js';
 import { V86VMHandle } from '@/core/vm/v86.js';
 
 const { instances, neverReady } = vi.hoisted(() => ({
@@ -184,6 +186,49 @@ describe('V86VMHandle', () => {
     const vm = new V86VMHandle({ netDevice });
     await vm.start(DEFAULT_IMAGE);
     expect(instances[0]!.options.net_device).toEqual(netDevice);
+  });
+
+  it('passes every boot dependency through to the v86 options', async () => {
+    const bios = { url: 'bios.bin' };
+    const vgaBios = { url: 'vgabios.bin' };
+    const cdrom = { url: 'cdrom.iso' };
+    const hda = { url: 'hda.img' };
+    const filesystem = createV86Filesystem({ prefix: 'test-fs9p' });
+    const netDevice = { relay_url: 'fetch' } as V86Options['net_device'];
+    const wasmPath = 'build/v86.wasm';
+    const vm = new V86VMHandle({
+      bios,
+      vgaBios,
+      cdrom,
+      hda,
+      filesystem,
+      netDevice,
+      wasmPath,
+    });
+    await vm.start(DEFAULT_IMAGE);
+    const options = instances[0]!.options;
+
+    expect(options.bios).toEqual(bios);
+    expect(options.vga_bios).toEqual(vgaBios);
+    expect(options.cdrom).toEqual(cdrom);
+    expect(options.hda).toEqual(hda);
+    expect(options.filesystem).toBe(filesystem);
+    expect(options.net_device).toEqual(netDevice);
+    expect(options.wasm_path).toBe(wasmPath);
+  });
+
+  it('attaches the network device built for the configured mode', async () => {
+    const netDevice = buildNetDevice({ mode: 'fetch' });
+    const vm = new V86VMHandle({ netDevice });
+    await vm.start(DEFAULT_IMAGE);
+    expect(instances[0]!.options.net_device).toEqual({ relay_url: 'fetch' });
+  });
+
+  it('leaves net_device unset in airplane mode', async () => {
+    const netDevice = buildNetDevice({ mode: 'off' });
+    const vm = new V86VMHandle({ netDevice });
+    await vm.start(DEFAULT_IMAGE);
+    expect(instances[0]!.options.net_device).toBeUndefined();
   });
 
   it('allows overriding the boot options', async () => {
