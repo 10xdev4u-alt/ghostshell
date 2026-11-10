@@ -176,7 +176,7 @@ export class V86VMHandle implements VMHandle {
         `if [ -d ${shellQuote(path)} ]; then ` +
         `(cd ${shellQuote(path)} && ls -A -1 | while IFS= read -r f; do ` +
         `stat -c '%F${LIST_SEP}%s${LIST_SEP}%Y${LIST_SEP}%n' "$f"; done); ` +
-        `else echo "list: not a directory: ${path}"; false; fi`;
+        `else echo list: not a directory: ${shellQuote(path)}; false; fi`;
       const res = await this.runner.run(cmd);
       if (res.exitCode !== 0) {
         throw new Error(`list ${path} failed (exit ${res.exitCode}): ${res.stdout.trim()}`);

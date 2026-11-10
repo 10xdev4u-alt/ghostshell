@@ -326,6 +326,15 @@ describe('V86VMHandle', () => {
     expect(emu.sent[0]).not.toContain('\t');
   });
 
+  it('list quotes the path in the error branch', async () => {
+    const vm = new V86VMHandle();
+    await vm.start(DEFAULT_IMAGE);
+    const emu = instances[0]!;
+
+    await vm.list('/tmp/a b"c');
+    expect(emu.sent[0]).toContain(`echo list: not a directory: '/tmp/a b"c'`);
+  });
+
   it('list throws on a non-zero exit', async () => {
     const vm = new V86VMHandle();
     await vm.start(DEFAULT_IMAGE);
