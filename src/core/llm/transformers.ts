@@ -173,6 +173,31 @@ class OPFSCache {
       // Cache writes are best-effort; a quota error must not break loading.
     }
   }
+
+  /**
+   * Drop the cached directory handle and remove the cache directory.
+   *
+   * The handle is reset first so the next `match`/`put` re-opens the directory
+   * instead of writing into a removed one.
+   */
+  async clear(): Promise<void> {
+    this.dirPromise = null;
+    await removeOPFSCacheDirectory();
+  }
+}
+
+/**
+ * Remove the OPFS weight-cache directory. Best-effort: a missing directory or
+ * a denied removal must not break cache clearing.
+ */
+async function removeOPFSCacheDirectory(): Promise<void> {
+  if (!hasOPFS()) return;
+  try {
+    const root = await navigator.storage.getDirectory();
+    await root.removeEntry(OPFS_CACHE_DIR, { recursive: true });
+  } catch {
+    // The directory may not exist; clearing is best-effort.
+  }
 }
 
 /**
@@ -204,15 +229,28 @@ function isNode(): boolean {
   );
 }
 
-/** Delete the IndexedDB weight cache. Safe to call when it does not exist. */
+/**
+ * Delete the IndexedDB and OPFS weight caches. Safe to call when neither
+ * exists. The OPFS directory is removed even when the engine never installed
+ * an `OPFSCache` (for example, after a restart).
+ */
 export async function clearTransformersCache(): Promise<void> {
-  if (typeof indexedDB === 'undefined') return;
-  await new Promise<void>((resolve) => {
-    const request = indexedDB.deleteDatabase(CACHE_DB_NAME);
-    request.onsuccess = () => resolve();
-    request.onerror = () => resolve();
-    request.onblocked = () => resolve();
-  });
+  if (typeof indexedDB !== 'undefined') {
+    await new Promise<void>((resolve) => {
+      const request = indexedDB.deleteDatabase(CACHE_DB_NAME);
+      request.onsuccess = () => resolve();
+      request.onerror = () => resolve();
+      request.onblocked = () => resolve();
+    });
+  }
+
+  const cache = env.customCache;
+  if (cache instanceof OPFSCache) {
+    await cache.clear();
+    env.customCache = null;
+    return;
+  }
+  await removeOPFSCacheDirectory();
 }
 
 /**

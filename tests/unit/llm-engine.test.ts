@@ -65,7 +65,9 @@ vi.mock('@huggingface/transformers', () => ({
 }));
 
 import type { LoadProgress } from '@/types/index.js';
-import { TransformersEngine } from '@/core/llm/transformers.js';
+import { Template } from '@huggingface/jinja';
+import { parseToolCalls } from '@/core/agent/parser.js';
+import { TransformersEngine, clearTransformersCache } from '@/core/llm/transformers.js';
 import { createEngine, detectBackend, supportsBackend } from '@/core/llm/engine.js';
 import {
   getModel,
@@ -136,6 +138,12 @@ function makeOPFSRoot() {
           };
         }),
       };
+    }),
+    removeEntry: vi.fn(async (name: string, options?: { recursive?: boolean }) => {
+      if (name !== 'ghostshell-transformers-cache' || !options?.recursive) {
+        throw new DOMException('Not found', 'NotFoundError');
+      }
+      files.clear();
     }),
   };
 }
@@ -313,6 +321,28 @@ describe('TransformersEngine', () => {
     expect(matched).toBeDefined();
     expect(await matched!.text()).toBe('weight-bytes');
     await expect(cache.match('https://huggingface.co/missing.bin')).resolves.toBeUndefined();
+  });
+
+  it('clears the OPFS cache directory (#71)', async () => {
+    const root = makeOPFSRoot();
+    vi.stubGlobal('navigator', { storage: { getDirectory: vi.fn(async () => root) } });
+    pipelineMock.mockResolvedValue(makeGenerator());
+    const engine = new TransformersEngine({ device: 'wasm', cache: 'opfs' });
+    await engine.load(getModel('qwen2.5-1.5b'), () => {});
+
+    const cache = envMock.customCache as unknown as {
+      match(url: string): Promise<Response | undefined>;
+      put(url: string, response: Response): Promise<void>;
+    };
+    await cache.put('https://huggingface.co/weight.bin', new Response('weight-bytes'));
+    await expect(cache.match('https://huggingface.co/weight.bin')).resolves.toBeDefined();
+
+    await clearTransformersCache();
+
+    await expect(cache.match('https://huggingface.co/weight.bin')).resolves.toBeUndefined();
+    expect(root.removeEntry).toHaveBeenCalledWith('ghostshell-transformers-cache', {
+      recursive: true,
+    });
   });
 
   it('uses the filesystem cache for opfs in Node', async () => {
