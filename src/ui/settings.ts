@@ -118,8 +118,11 @@ export function renderPrivacyReport(report: PrivacyReport, container?: HTMLEleme
 export interface PrivacyReportSectionOptions {
   /** Hashes and dependency list captured at build time. */
   config: AttestationConfig;
-  /** Egress events recorded since the app started. */
-  egress: EgressEvent[];
+  /**
+   * Egress events recorded since the app started. Pass a getter so the
+   * report includes events logged after the section was mounted.
+   */
+  egress: EgressEvent[] | (() => EgressEvent[]);
   /** Long-lived keypair; omit to generate a throwaway pair. */
   keyPair?: AttestationKeyPair;
 }
@@ -127,13 +130,13 @@ export interface PrivacyReportSectionOptions {
 /**
  * Build the "Privacy report" section for the settings panel.
  *
- * `App` mounts it with:
+ * `App.init` mounts it with:
  *
- *   const section = createPrivacyReportSection({
+ *   const mount = document.getElementById('gs-privacy-report');
+ *   mount?.appendChild(createPrivacyReportSection({
  *     config: ATTESTATION_CONFIG,
- *     egress: this.egress.list(),
- *   });
- *   document.getElementById('gs-settings')!.appendChild(section);
+ *     egress: () => this.egress.list(),
+ *   }));
  *
  * "Generate report" calls `buildReport`, signs it, renders it with
  * `renderPrivacyReport`, and shows the public key that verifies the
@@ -183,7 +186,9 @@ export function createPrivacyReportSection(options: PrivacyReportSectionOptions)
     generate.disabled = true;
     output.textContent = 'Building report…';
     try {
-      const report = await buildReport(options.config, options.egress);
+      const egressEvents =
+        typeof options.egress === 'function' ? options.egress() : options.egress;
+      const report = await buildReport(options.config, egressEvents);
       const keyPair = options.keyPair ?? (await generateAttestationKey());
       current = { ...report, signature: await signReport(report, keyPair.privateKey) };
 

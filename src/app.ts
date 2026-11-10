@@ -7,7 +7,7 @@ import { createToolRegistry, makeSystemMessage, AgentLoop } from '@/core/agent/l
 import { builtinTools } from '@/core/agent/tools.js';
 import { buildSystemPrompt } from '@/core/agent/prompts.js';
 import { createEngine } from '@/core/llm/engine.js';
-import { DEFAULT_AGENT_CONFIG, FLAGS } from '@/config.js';
+import { ATTESTATION_CONFIG, DEFAULT_AGENT_CONFIG, FLAGS } from '@/config.js';
 import { ALPINE_BOOT, getImage } from '@/core/vm/image.js';
 import { buildNetDevice } from '@/core/vm/network.js';
 import { createV86Filesystem, DEFAULT_FS_PREFIX } from '@/core/vm/fs9p.js';
@@ -17,7 +17,7 @@ import { createTwinView } from '@/ui/twinview.js';
 import { createFileTree } from '@/ui/filetree.js';
 import { createDiffView } from '@/ui/diff.js';
 import { createArtifactPanel } from '@/ui/artifact.js';
-import { createSettings } from '@/ui/settings.js';
+import { createPrivacyReportSection, createSettings } from '@/ui/settings.js';
 import { installEgressInterceptor, InMemoryEgressLog } from '@/core/security/egress.js';
 import type { AppEventMap } from '@/types/index.js';
 
@@ -76,6 +76,18 @@ export class App {
     this.diffView = createDiffView(document.getElementById('gs-diff')!);
     this.artifact = createArtifactPanel(document.getElementById('gs-artifact')!);
     this.settings = createSettings(DEFAULT_AGENT_CONFIG);
+
+    if (FLAGS.privacyAttestation) {
+      const privacyMount = document.getElementById('gs-privacy-report');
+      if (privacyMount) {
+        privacyMount.appendChild(
+          createPrivacyReportSection({
+            config: ATTESTATION_CONFIG,
+            egress: () => this.egress.list(),
+          }),
+        );
+      }
+    }
 
     this.vm.onSerial((data) => this.bus.emit('vm:serial', data));
 
