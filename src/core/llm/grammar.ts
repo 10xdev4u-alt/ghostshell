@@ -39,6 +39,12 @@ export interface GrammarTool {
   parameters: unknown;
 }
 
+/** A tool definition for chat templates that support function calling. */
+export interface ChatTool extends GrammarTool {
+  /** Human-readable summary rendered into the prompt. */
+  description?: string;
+}
+
 interface ToolSchema {
   properties?: Record<string, JSONSchemaProperty>;
   required?: string[];
@@ -176,6 +182,26 @@ export function buildToolCallSchema(tools: GrammarTool[]): unknown {
     required: ['tool_calls'],
     additionalProperties: false,
   };
+}
+
+/**
+ * Build the OpenAI-style function definitions a chat template's `tools`
+ * argument expects.
+ *
+ * `apply_chat_template` forwards `tools` to the Jinja template, and Qwen's
+ * template serializes each entry with `tojson`. The description belongs on the
+ * inner `function` object, which is the format vLLM and the HF chat templating
+ * guide use.
+ */
+export function buildToolDefinitions(tools: ChatTool[]): Record<string, unknown>[] {
+  return tools.map((tool) => ({
+    type: 'function',
+    function: {
+      name: tool.name,
+      ...(tool.description === undefined ? {} : { description: tool.description }),
+      parameters: tool.parameters,
+    },
+  }));
 }
 
 function parseSchema(parameters: unknown): ToolSchema {

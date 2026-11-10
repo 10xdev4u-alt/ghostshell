@@ -15,6 +15,23 @@ import type {
   ModelSpec,
 } from '@/types/index.js';
 import { resolveModelDtype, resolveModelRepo, supportsBackend } from './models.js';
+import { buildToolDefinitions, type ChatTool } from './grammar.js';
+
+/**
+ * Tool schemas ride on `GenerateRequest` so chat templates can render them.
+ *
+ * The field is declared here rather than in `src/types` to keep the LLM engine
+ * self-contained; TypeScript merges it into the shared interface.
+ */
+declare module '@/types/index.js' {
+  interface GenerateRequest {
+    /**
+     * Tool schemas for chat templates that support function calling. When
+     * absent or empty, the template renders without a tool block.
+     */
+    tools?: ChatTool[];
+  }
+}
 
 /**
  * Transformers.js engine (default for v0.1).
@@ -441,7 +458,7 @@ export class TransformersEngine implements LLMEngine {
     }
 
     const tokenizer = generator.tokenizer;
-    const prompt = this.applyChatTemplate(req.messages, tokenizer);
+    const prompt = this.applyChatTemplate(req.messages, tokenizer, req.tools);
     const maxTokens = req.maxTokens ?? DEFAULT_MAX_NEW_TOKENS;
     const temperature = req.temperature ?? DEFAULT_TEMPERATURE;
 
@@ -522,14 +539,25 @@ export class TransformersEngine implements LLMEngine {
     }
   }
 
-  private applyChatTemplate(messages: Message[], tokenizer: PreTrainedTokenizer): string {
+  private applyChatTemplate(
+    messages: Message[],
+    tokenizer: PreTrainedTokenizer,
+    tools?: ChatTool[],
+  ): string {
     const chat = toChatMessages(messages);
+    const templateTools = tools && tools.length > 0 ? buildToolDefinitions(tools) : undefined;
 
     try {
-      const templated = tokenizer.apply_chat_template(chat, {
+      // `tool_choice` is not a documented transformers.js option, but unknown
+      // kwargs are forwarded to the Jinja context. Templates that understand it
+      // (Hermes-style) read it; Qwen's ignores it. It is only sent with tools so
+      // the no-tools prompt is byte-for-byte unchanged.
+      const options = {
         tokenize: false,
         add_generation_prompt: true,
-      });
+        ...(templateTools ? { tools: templateTools, tool_choice: 'auto' } : {}),
+      } as Parameters<PreTrainedTokenizer['apply_chat_template']>[1];
+      const templated = tokenizer.apply_chat_template(chat, options);
       if (typeof templated === 'string') return templated;
     } catch {
       // No chat template configured; fall through to the ChatML default.

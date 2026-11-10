@@ -96,9 +96,92 @@ interface ChatMessageLike {
   tool_calls?: unknown;
 }
 
+interface ChatTemplateOptions {
+  tools?: unknown[];
+  add_generation_prompt?: boolean;
+  [key: string]: unknown;
+}
+
 function makeTokenizer() {
   return {
-    apply_chat_template: vi.fn((_chat: ChatMessageLike[]) => '<|im_start|>assistant\n'),
+    apply_chat_template: vi.fn(
+      (_chat: ChatMessageLike[], _options?: ChatTemplateOptions) => '<|im_start|>assistant\n',
+    ),
+    encode: vi.fn(() => [1, 2, 3]),
+  };
+}
+
+/**
+ * The real Qwen2.5-1.5B-Instruct chat template, copied from its
+ * `tokenizer_config.json`. The tools branch is what issue #73 is about.
+ */
+const QWEN25_CHAT_TEMPLATE = String.raw`{%- if tools %}
+    {{- '<|im_start|>system\n' }}
+    {%- if messages[0]['role'] == 'system' %}
+        {{- messages[0]['content'] }}
+    {%- else %}
+        {{- 'You are Qwen, created by Alibaba Cloud. You are a helpful assistant.' }}
+    {%- endif %}
+    {{- "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>" }}
+    {%- for tool in tools %}
+        {{- "\n" }}
+        {{- tool | tojson }}
+    {%- endfor %}
+    {{- "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n" }}
+{%- else %}
+    {%- if messages[0]['role'] == 'system' %}
+        {{- '<|im_start|>system\n' + messages[0]['content'] + '<|im_end|>\n' }}
+    {%- else %}
+        {{- '<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n' }}
+    {%- endif %}
+{%- endif %}
+{%- for message in messages %}
+    {%- if (message.role == "user") or (message.role == "system" and not loop.first) or (message.role == "assistant" and not message.tool_calls) %}
+        {{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>' + '\n' }}
+    {%- elif message.role == "assistant" %}
+        {{- '<|im_start|>' + message.role }}
+        {%- if message.content %}
+            {{- '\n' + message.content }}
+        {%- endif %}
+        {%- for tool_call in message.tool_calls %}
+            {%- if tool_call.function is defined %}
+                {%- set tool_call = tool_call.function %}
+            {%- endif %}
+            {{- '\n<tool_call>\n{"name": "' }}
+            {{- tool_call.name }}
+            {{- '", "arguments": ' }}
+            {{- tool_call.arguments | tojson }}
+            {{- '}\n</tool_call>' }}
+        {%- endfor %}
+        {{- '<|im_end|>\n' }}
+    {%- elif message.role == "tool" %}
+        {%- if (loop.index0 == 0) or (messages[loop.index0 - 1].role != "tool") %}
+            {{- '<|im_start|>user' }}
+        {%- endif %}
+        {{- '\n<tool_response>\n' }}
+        {{- message.content }}
+        {{- '\n</tool_response>' }}
+        {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}
+            {{- '<|im_end|>\n' }}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+{%- endif %}`;
+
+/** A tokenizer stub that renders with the real Qwen2.5 chat template. */
+function makeQwenTokenizer() {
+  const template = new Template(QWEN25_CHAT_TEMPLATE);
+  return {
+    apply_chat_template: vi.fn(
+      (chat: ChatMessageLike[], options?: ChatTemplateOptions) =>
+        template.render({
+          messages: chat,
+          tools: options?.tools ?? null,
+          add_generation_prompt: options?.add_generation_prompt ?? false,
+        }),
+    ),
     encode: vi.fn(() => [1, 2, 3]),
   };
 }
@@ -582,5 +665,70 @@ describe('models', () => {
     const spec = getModel('qwen2.5-1.5b');
     expect(supportsBackend(spec, 'wasm')).toBe(true);
     expect(supportsBackend(spec, 'webgpu')).toBe(false);
+  });
+});
+
+describe('chat template tool schemas', () => {
+  beforeEach(() => {
+    pipelineMock.mockReset();
+    envMock.useBrowserCache = false;
+    envMock.useFSCache = false;
+    envMock.useCustomCache = false;
+    envMock.customCache = null;
+  });
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('passes tool schemas to a Qwen-style chat template (#73)', async () => {
+    const generator = makeGenerator();
+    generator.tokenizer.apply_chat_template = makeQwenTokenizer().apply_chat_template;
+    pipelineMock.mockResolvedValue(generator);
+    const engine = new TransformersEngine({ device: 'wasm', cache: 'browser' });
+    await engine.load(getModel('qwen2.5-1.5b'), () => {});
+
+    const tools = [
+      {
+        name: 'list_dir',
+        description: 'List the contents of a directory',
+        parameters: {
+          type: 'object',
+          properties: { path: { type: 'string' } },
+          required: ['path'],
+        },
+      },
+    ];
+
+    await engine.generate(
+      {
+        messages: [{ id: 'm1', role: 'user', content: 'list files', timestamp: 0 }],
+        tools,
+      },
+      () => {},
+      new AbortController().signal,
+    );
+
+    const [chat, options] = generator.tokenizer.apply_chat_template.mock.calls[0]!;
+    expect(chat).toEqual([{ role: 'user', content: 'list files' }]);
+    expect(options?.tools).toEqual([
+      {
+        type: 'function',
+        function: {
+          name: 'list_dir',
+          description: 'List the contents of a directory',
+          parameters: {
+            type: 'object',
+            properties: { path: { type: 'string' } },
+            required: ['path'],
+          },
+        },
+      },
+    ]);
+    expect(options?.add_generation_prompt).toBe(true);
+    expect(options?.tool_choice).toBe('auto');
+
+    const prompt = generator.mock.calls[0]![0] as string;
+    expect(prompt).toContain('<tools>');
+    expect(prompt).toContain('"name": "list_dir"');
+    expect(prompt).toContain('List the contents of a directory');
   });
 });
