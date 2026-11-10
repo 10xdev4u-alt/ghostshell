@@ -1,4 +1,3 @@
-import type { V86Options } from 'v86';
 import type { NetworkMode } from '@/types/index.js';
 
 /**
@@ -8,39 +7,74 @@ import type { NetworkMode } from '@/types/index.js';
  *  - `inbrowser` : BroadcastChannel between tabs. No external net, no server.
  *  - `fetch`     : browser fetch(); reaches host localhost via http://<port>.external
  *  - `wisp`      : TCP over WebSocket via a WISP proxy (self-hostable)
+ *  - `wsproxy`   : raw Ethernet over WebSocket via a self-hosted proxy
  *
- * GhostShell defaults to `off`. `fetch` and `wisp` are explicit opt-ins.
+ * GhostShell defaults to `off`. Every other mode is an explicit opt-in.
  */
 
+export type NetworkBackend = NetworkMode | 'wsproxy';
+
 export interface NetworkConfig {
-  mode: NetworkMode;
+  mode: NetworkBackend;
   /** WISP proxy URL when mode === 'wisp'. */
   wispUrl?: string;
-  /** Peer MAC/IP hints (advanced). */
+  /** Raw-Ethernet proxy URL when mode === 'wsproxy'. */
+  proxyUrl?: string;
+  /** Peer MAC hint (fetch/wisp/wsproxy). */
   peerMac?: string;
+  /** Peer IP hint (fetch/wisp/wsproxy). */
   peerIp?: string;
+  /** v86 network namespace id. */
+  id?: number;
 }
 
-export function buildNetDevice(config: NetworkConfig): V86Options['net_device'] | undefined {
+/**
+ * GhostShell's network device description. Assignable to v86's
+ * `V86Options['net_device']`; `backend` + `url` select the transport.
+ */
+export interface NetDevice {
+  backend: 'inbrowser' | 'fetch' | 'wisp' | 'wsproxy';
+  url?: string;
+  id?: number;
+  peer_mac?: string;
+  peer_ip?: string;
+}
+
+function withHints(device: NetDevice, config: NetworkConfig): NetDevice {
+  if (config.id !== undefined) device.id = config.id;
+  if (config.peerMac !== undefined) device.peer_mac = config.peerMac;
+  if (config.peerIp !== undefined) device.peer_ip = config.peerIp;
+  return device;
+}
+
+export function buildNetDevice(config: NetworkConfig): NetDevice | undefined {
   switch (config.mode) {
     case 'off':
       return undefined;
     case 'inbrowser':
-      // BroadcastChannel-backed; no URL needed.
-      return { backend: 'inbrowser' } as V86Options['net_device'];
+      // BroadcastChannel-backed; no URL, no server, no external network.
+      return withHints({ backend: 'inbrowser' }, config);
     case 'fetch':
-      return { backend: 'fetch' } as V86Options['net_device'];
+      // Browser fetch(); CORS-friendly mirrors and host localhost only.
+      return withHints({ backend: 'fetch' }, config);
     case 'wisp':
       if (!config.wispUrl) {
-        throw new Error('wisp mode requires a proxy URL (e.g. ws://localhost:8080)');
+        throw new Error('wisp mode requires a proxy URL (e.g. wss://relay.example.com)');
       }
-      return { backend: 'wisp', url: config.wispUrl } as V86Options['net_device'];
-    default:
-      return undefined;
+      return withHints({ backend: 'wisp', url: config.wispUrl }, config);
+    case 'wsproxy':
+      if (!config.proxyUrl) {
+        throw new Error('wsproxy mode requires a proxy URL (e.g. wss://proxy.example.com)');
+      }
+      return withHints({ backend: 'wsproxy', url: config.proxyUrl }, config);
+    default: {
+      const exhaustive: never = config.mode;
+      throw new Error(`Unsupported network mode: ${String(exhaustive)}`);
+    }
   }
 }
 
 /** True when the VM has any network device attached. */
-export function isNetworkEnabled(mode: NetworkMode): boolean {
+export function isNetworkEnabled(mode: NetworkBackend): boolean {
   return mode !== 'off';
 }
