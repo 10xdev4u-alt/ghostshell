@@ -22,6 +22,7 @@ class FakeFileHandle {
   ) {}
 
   async createWritable() {
+    if (this.dir.failWrites) throw new Error('quota exceeded');
     const handle = this;
     return {
       async write(chunk: Uint8Array) {
@@ -45,6 +46,8 @@ class FakeFileHandle {
 class FakeDirHandle {
   readonly dirs = new Map<string, FakeDirHandle>();
   readonly files = new Map<string, FakeFileHandle>();
+  /** When true, createWritable() rejects (simulates quota / write errors). */
+  failWrites = false;
 
   constructor(readonly name: string) {}
 
@@ -338,6 +341,28 @@ describe('SnapshotManager', () => {
     }
   });
 
+  it('falls back to IndexedDB when an OPFS save fails at runtime', async () => {
+    const root = new FakeDirHandle('root');
+    mockOpfs(root);
+    const db = new FakeSnapshotDb();
+    const manager = new SnapshotManager(db);
+    const data = text.encode('quota');
+    const snapDir = await root.getDirectoryHandle('snapshots', { create: true });
+
+    try {
+      snapDir.failWrites = true;
+      const snap = await manager.capture('c1', data);
+
+      expect(snap.stateRef).toBe(`idb:${snap.id}`);
+      expect(db.blobs.get(snap.id)).toEqual(data);
+
+      const loaded = await manager.load(snap.id);
+      expect(loaded?.data).toEqual(data);
+    } finally {
+      clearOpfs();
+    }
+  });
+
   it('works with a plain Database without extended accessors', async () => {
     const db = makePlainDb();
     const manager = new SnapshotManager(db);
@@ -413,5 +438,25 @@ describe('LazyBlobStore', () => {
     const ref = await store.save('id-4', text.encode('lazy-idb'));
     expect(ref).toBe('idb:id-4');
     expect(await store.load('id-4')).toEqual(text.encode('lazy-idb'));
+  });
+
+  it('still reads OPFS blobs saved before a write failover', async () => {
+    const root = new FakeDirHandle('root');
+    mockOpfs(root);
+    const db = new FakeSnapshotDb();
+    const store = new LazyBlobStore(db, 'lazy');
+    const lazyDir = await root.getDirectoryHandle('lazy', { create: true });
+
+    try {
+      await store.save('opfs-id', text.encode('opfs'));
+      lazyDir.failWrites = true;
+      await store.save('idb-id', text.encode('idb'));
+
+      expect(await store.load('idb-id')).toEqual(text.encode('idb'));
+      // The blob written while OPFS was healthy must stay reachable.
+      expect(await store.load('opfs-id')).toEqual(text.encode('opfs'));
+    } finally {
+      clearOpfs();
+    }
   });
 });

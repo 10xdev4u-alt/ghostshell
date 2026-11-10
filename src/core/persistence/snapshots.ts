@@ -50,6 +50,8 @@ export interface SnapshotDatabase extends Database {
 export interface SnapshotManagerOptions {
   /** OPFS directory (under the storage root) that holds snapshot blobs. */
   opfsPrefix?: string;
+  /** Called with diagnostics (notably blob-backend failovers). */
+  onLog?: (message: string) => void;
 }
 
 /** OPFS-backed blob store. Preferred: fast and quota-friendly for large blobs. */
@@ -152,15 +154,40 @@ export class IdbSnapshotStore implements SnapshotBlobStore {
 /**
  * Resolves the blob backend lazily: OPFS on first use, IndexedDB when OPFS is
  * missing or fails. Construction never touches the filesystem.
+ *
+ * The fallback is not limited to resolution: any OPFS operation that throws at
+ * runtime (quota exceeded, storage eviction, write error) fails over to
+ * IndexedDB. After a write failover, loads still consult OPFS so snapshots
+ * written while OPFS was healthy stay readable.
  */
 export class LazyBlobStore implements SnapshotBlobStore {
   private store: SnapshotBlobStore | null = null;
   private resolving: Promise<SnapshotBlobStore> | null = null;
+  private opfs: OpfsSnapshotStore | null = null;
+  private idb: IdbSnapshotStore | null = null;
 
   constructor(
     private readonly db: SnapshotDatabase,
     private readonly prefix: string,
+    private readonly onLog?: (message: string) => void,
   ) {}
+
+  private idbStore(): IdbSnapshotStore {
+    if (!this.idb) this.idb = new IdbSnapshotStore(this.db);
+    return this.idb;
+  }
+
+  private async opfsStore(): Promise<OpfsSnapshotStore> {
+    if (!this.opfs) {
+      const storage = (globalThis as { navigator?: Navigator }).navigator?.storage;
+      if (!storage || typeof storage.getDirectory !== 'function') {
+        throw new Error('OPFS is not available');
+      }
+      const root = await storage.getDirectory();
+      this.opfs = new OpfsSnapshotStore(root, this.prefix);
+    }
+    return this.opfs;
+  }
 
   private resolve(): Promise<SnapshotBlobStore> {
     if (this.store) return Promise.resolve(this.store);
@@ -175,31 +202,66 @@ export class LazyBlobStore implements SnapshotBlobStore {
 
   private async create(): Promise<SnapshotBlobStore> {
     try {
-      const storage = (globalThis as { navigator?: Navigator }).navigator?.storage;
-      if (storage && typeof storage.getDirectory === 'function') {
-        const root = await storage.getDirectory();
-        return new OpfsSnapshotStore(root, this.prefix);
-      }
-    } catch {
-      // fall through to IndexedDB
+      return await this.opfsStore();
+    } catch (err) {
+      this.onLog?.(`snapshot store: OPFS unavailable (${String(err)}); using IndexedDB`);
+      return this.idbStore();
     }
-    return new IdbSnapshotStore(this.db);
+  }
+
+  /** Switch writes to IndexedDB after an OPFS failure. */
+  private failover(err: unknown): IdbSnapshotStore {
+    this.onLog?.(`snapshot store: OPFS operation failed (${String(err)}); using IndexedDB`);
+    const idb = this.idbStore();
+    this.store = idb;
+    this.resolving = null;
+    return idb;
   }
 
   async save(id: string, data: Uint8Array): Promise<string> {
-    return (await this.resolve()).save(id, data);
+    try {
+      return await (await this.resolve()).save(id, data);
+    } catch (err) {
+      return this.failover(err).save(id, data);
+    }
   }
 
   async load(id: string): Promise<Uint8Array | undefined> {
-    return (await this.resolve()).load(id);
+    let primary: SnapshotBlobStore;
+    try {
+      primary = await this.resolve();
+    } catch (err) {
+      return this.failover(err).load(id);
+    }
+
+    let data: Uint8Array | undefined;
+    try {
+      data = await primary.load(id);
+    } catch (err) {
+      return this.failover(err).load(id);
+    }
+    if (data !== undefined) return data;
+
+    // The active backend has no such blob; check the other one. After a write
+    // failover, snapshots written while OPFS was healthy still live there.
+    const other = primary === this.opfs ? this.idbStore() : this.opfs;
+    return other ? other.load(id) : undefined;
   }
 
   async remove(id: string): Promise<void> {
-    return (await this.resolve()).remove(id);
+    try {
+      await (await this.resolve()).remove(id);
+    } catch (err) {
+      await this.failover(err).remove(id);
+    }
   }
 
   async list(): Promise<string[]> {
-    return (await this.resolve()).list();
+    try {
+      return await (await this.resolve()).list();
+    } catch (err) {
+      return this.failover(err).list();
+    }
   }
 }
 
@@ -213,7 +275,11 @@ export class SnapshotManager {
     this.db = database as SnapshotDatabase;
     this.blobs =
       typeof this.db.putSnapshotMeta === 'function'
-        ? new LazyBlobStore(this.db, options.opfsPrefix ?? DEFAULT_OPFS_PREFIX)
+        ? new LazyBlobStore(
+            this.db,
+            options.opfsPrefix ?? DEFAULT_OPFS_PREFIX,
+            options.onLog,
+          )
         : null;
   }
 
