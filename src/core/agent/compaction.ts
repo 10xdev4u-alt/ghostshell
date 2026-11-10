@@ -15,17 +15,22 @@ export interface CompactionResult {
   removed: number;
 }
 
-/**
- * Tokens reserved for the summary message itself. Dropping stops once the
- * retained conversation fits in `maxTokens - SUMMARY_HEADROOM_TOKENS`, so the
- * summary can be inserted without immediately exceeding the budget again.
- */
-const SUMMARY_HEADROOM_TOKENS = 128;
+/** The summary body is capped at this many tokens (mirrors the loop's request). */
+export const SUMMARY_MAX_TOKENS = 300;
+
+const SUMMARY_PREFIX = 'Summary of earlier conversation:\n';
 
 export function estimateTokens(text: string): number {
   // Rough heuristic: ~4 chars per token for English/code.
   return Math.ceil(text.length / 4);
 }
+
+/**
+ * Tokens reserved for the summary message while dropping. The summary body is
+ * capped at `SUMMARY_MAX_TOKENS` and the prefix adds a few more, so the
+ * headroom must cover both or compaction can exceed the budget again.
+ */
+const SUMMARY_HEADROOM_TOKENS = SUMMARY_MAX_TOKENS + estimateTokens(SUMMARY_PREFIX);
 
 /** Token estimate for a single message, including its tool calls and results. */
 export function messageTokens(message: Message): number {
@@ -68,11 +73,12 @@ export async function compactMessages(
     ...candidates.filter((message) => !isToolResult(message)),
   ];
 
-  const fits = (): boolean =>
-    tokenBudget(systems) + tokenBudget(kept) + SUMMARY_HEADROOM_TOKENS <= maxTokens;
+  const fitsWith = (summaryTokens: number): boolean =>
+    tokenBudget(systems) + tokenBudget(kept) + summaryTokens <= maxTokens;
 
+  // Drop until the retained conversation leaves room for the worst-case summary.
   for (const candidate of ordered) {
-    if (fits()) break;
+    if (fitsWith(SUMMARY_HEADROOM_TOKENS)) break;
     const index = kept.indexOf(candidate);
     if (index === -1) continue;
     kept.splice(index, 1);
@@ -88,9 +94,21 @@ export async function compactMessages(
   const summaryMessage: Message = {
     id: uuid(),
     role: 'system',
-    content: `Summary of earlier conversation:\n${summary}`,
+    content: `${SUMMARY_PREFIX}${summary}`,
     timestamp: Date.now(),
   };
+
+  // The summary is capped, but a model may overrun its token budget. Drop
+  // further old messages until the real summary fits, so the result never
+  // exceeds maxTokens when there is anything left to drop. Those extra drops
+  // are not covered by the summary; they are already past the compaction point.
+  for (const candidate of ordered) {
+    if (fitsWith(messageTokens(summaryMessage))) break;
+    const index = kept.indexOf(candidate);
+    if (index === -1) continue;
+    kept.splice(index, 1);
+    dropped.push(candidate);
+  }
 
   return {
     messages: [...systems, summaryMessage, ...kept],

@@ -39,7 +39,7 @@ describe('compaction', () => {
       toolCalls: [
         { id: '1', name: 'bash', arguments: { command: 'pytest' }, raw: '{"name":"bash"}' },
       ],
-      toolResults: [{ ok: true, content: 'x'.repeat(800) }],
+      toolResults: [{ ok: true, content: 'x'.repeat(2000) }],
     });
     const messages = [
       message('system', 'system prompt'),
@@ -49,7 +49,7 @@ describe('compaction', () => {
       message('assistant', 'final answer'),
     ];
 
-    const result = await compactMessages(messages, 200, async () => 'summary text');
+    const result = await compactMessages(messages, 400, async () => 'summary text');
 
     expect(result.compacted).toBe(true);
     expect(result.removed).toBe(1);
@@ -62,7 +62,22 @@ describe('compaction', () => {
     // The old user message survives because tool results are dropped first.
     expect(result.messages.some((m) => m.content === 'old question')).toBe(true);
     expect(result.messages.some((m) => m === toolMessage)).toBe(false);
-    expect(tokenBudget(result.messages)).toBeLessThanOrEqual(200);
+    expect(tokenBudget(result.messages)).toBeLessThanOrEqual(400);
+  });
+
+  it('never exceeds the budget when the summary is large', async () => {
+    const messages = [
+      message('system', 'sys'),
+      message('user', 'a'.repeat(400)),
+      message('assistant', 'b'.repeat(400)),
+      message('user', 'c'.repeat(400)),
+      message('user', 'd'.repeat(40)),
+    ];
+
+    const result = await compactMessages(messages, 250, async () => 's'.repeat(800));
+
+    expect(result.compacted).toBe(true);
+    expect(tokenBudget(result.messages)).toBeLessThanOrEqual(250);
   });
 
   it('keeps the current request when it is the only droppable-adjacent message', async () => {

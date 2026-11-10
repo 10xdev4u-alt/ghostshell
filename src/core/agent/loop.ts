@@ -13,7 +13,7 @@ import { SerialQueue } from '@/lib/queue.js';
 import { buildToolCallGrammar } from '@/core/llm/grammar.js';
 import { retryWithCorrection } from './parser.js';
 import type { GenerateOutcome } from './parser.js';
-import { compactMessages, tokenBudget } from './compaction.js';
+import { compactMessages, tokenBudget, SUMMARY_MAX_TOKENS } from './compaction.js';
 
 export interface AgentStep {
   iteration: number;
@@ -34,7 +34,6 @@ export interface AgentRunResult {
 const MAX_TOKENS_PER_TURN = 2048;
 /** Leave room for the next response (CONTEXT_BUDGET = 0.8 × ctx_len). */
 const CONTEXT_BUDGET_RATIO = 0.8;
-const SUMMARY_MAX_TOKENS = 300;
 
 const SUMMARY_SYSTEM_PROMPT = `You are a conversation summarizer. Compress the excerpt below into a concise summary of at most 200 words. Preserve file paths, shell commands, error messages, and conclusions. Do not answer the user's request; only summarize what has happened so far.`;
 
