@@ -124,6 +124,86 @@ class IndexedDBCache {
   }
 }
 
+const OPFS_CACHE_DIR = 'ghostshell-transformers-cache';
+
+/**
+ * Transformers.js custom cache backed by the Origin Private File System.
+ *
+ * `env.useFSCache` is the Node `fs`-backed `FileCache` and throws in a browser
+ * (`hub.js:458-464`), so the browser path needs its own `env.customCache`. The
+ * library only asks for the Web Cache API surface (`match` / `put`), which maps
+ * directly onto OPFS files. Writes are best-effort: a quota error must not
+ * break loading.
+ */
+class OPFSCache {
+  private dirPromise: Promise<FileSystemDirectoryHandle> | null = null;
+
+  private directory(): Promise<FileSystemDirectoryHandle> {
+    if (!this.dirPromise) {
+      this.dirPromise = navigator.storage
+        .getDirectory()
+        .then((root) => root.getDirectoryHandle(OPFS_CACHE_DIR, { create: true }));
+    }
+    return this.dirPromise;
+  }
+
+  async match(url: string): Promise<Response | undefined> {
+    try {
+      const dir = await this.directory();
+      const handle = await dir.getFileHandle(await cacheKey(url));
+      const file = await handle.getFile();
+      if (file.size === 0) return undefined;
+      return new Response(await file.arrayBuffer(), {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+      });
+    } catch {
+      return undefined;
+    }
+  }
+
+  async put(url: string, response: Response): Promise<void> {
+    try {
+      const dir = await this.directory();
+      const handle = await dir.getFileHandle(await cacheKey(url), { create: true });
+      const writable = await handle.createWritable();
+      await writable.write(await response.arrayBuffer());
+      await writable.close();
+    } catch {
+      // Cache writes are best-effort; a quota error must not break loading.
+    }
+  }
+}
+
+/**
+ * Map a cache key (an HF URL) to a stable OPFS file name. SHA-256 when WebCrypto
+ * is available, with a non-secure-context fallback.
+ */
+async function cacheKey(url: string): Promise<string> {
+  if (typeof crypto !== 'undefined' && crypto.subtle) {
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(url));
+    return Array.from(new Uint8Array(digest))
+      .map((byte) => byte.toString(16).padStart(2, '0'))
+      .join('');
+  }
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < url.length; index += 1) {
+    hash ^= url.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `${(hash >>> 0).toString(16).padStart(8, '0')}-${url.length.toString(16)}`;
+}
+
+/** True when running under Node rather than in a browser. */
+function isNode(): boolean {
+  return (
+    typeof window === 'undefined' &&
+    typeof process !== 'undefined' &&
+    process.versions != null &&
+    process.versions.node != null
+  );
+}
+
 /** Delete the IndexedDB weight cache. Safe to call when it does not exist. */
 export async function clearTransformersCache(): Promise<void> {
   if (typeof indexedDB === 'undefined') return;
@@ -418,11 +498,22 @@ export class TransformersEngine implements LLMEngine {
       return;
     }
 
-    if (this.cache === 'opfs' && hasOPFS()) {
-      env.useCustomCache = false;
-      env.useBrowserCache = false;
-      env.useFSCache = true;
-      return;
+    if (this.cache === 'opfs') {
+      if (hasOPFS()) {
+        // `env.useFSCache` is Node-only; browsers get an OPFS custom cache.
+        env.useCustomCache = true;
+        env.useBrowserCache = false;
+        env.useFSCache = false;
+        env.customCache = new OPFSCache();
+        return;
+      }
+      if (isNode()) {
+        env.useCustomCache = false;
+        env.useBrowserCache = false;
+        env.useFSCache = true;
+        return;
+      }
+      // Browser without OPFS: fall through to the Cache API.
     }
 
     env.useCustomCache = false;

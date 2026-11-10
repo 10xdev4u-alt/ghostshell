@@ -110,6 +110,36 @@ function makeGenerator(onGenerate?: (options: GeneratorOptions) => void | Promis
   return Object.assign(fn, { tokenizer, dispose: vi.fn(async () => {}) });
 }
 
+/** Minimal in-memory OPFS stand-in for the cache tests. */
+function makeOPFSRoot() {
+  const files = new Map<string, File>();
+  return {
+    getDirectoryHandle: vi.fn(async (_name: string, options?: { create?: boolean }) => {
+      if (!options?.create) throw new DOMException('Not found', 'NotFoundError');
+      return {
+        getFileHandle: vi.fn(async (name: string, fileOptions?: { create?: boolean }) => {
+          if (!files.has(name) && !fileOptions?.create) {
+            throw new DOMException('Not found', 'NotFoundError');
+          }
+          return {
+            getFile: async () => {
+              const file = files.get(name);
+              if (!file) throw new DOMException('Not found', 'NotFoundError');
+              return file;
+            },
+            createWritable: async () => ({
+              write: async (data: BlobPart) => {
+                files.set(name, new File([data], name));
+              },
+              close: async () => {},
+            }),
+          };
+        }),
+      };
+    }),
+  };
+}
+
 describe('TransformersEngine', () => {
   beforeEach(() => {
     pipelineMock.mockReset();
@@ -118,6 +148,8 @@ describe('TransformersEngine', () => {
     envMock.useCustomCache = false;
     envMock.customCache = null;
   });
+
+  afterEach(() => vi.unstubAllGlobals());
 
   it('loads through the text-generation pipeline and reports progress', async () => {
     pipelineMock.mockResolvedValue(makeGenerator());
@@ -232,6 +264,61 @@ describe('TransformersEngine', () => {
 
     expect(engine.isLoaded()).toBe(false);
     expect(generator.dispose).toHaveBeenCalled();
+  });
+
+  it('uses an OPFS-backed custom cache when OPFS is available', async () => {
+    vi.stubGlobal('navigator', { storage: { getDirectory: vi.fn(async () => makeOPFSRoot()) } });
+    pipelineMock.mockResolvedValue(makeGenerator());
+    const engine = new TransformersEngine({ device: 'wasm', cache: 'opfs' });
+    await engine.load(getModel('qwen2.5-1.5b'), () => {});
+
+    expect(envMock.useCustomCache).toBe(true);
+    expect(envMock.useFSCache).toBe(false);
+    expect(envMock.useBrowserCache).toBe(false);
+    expect(envMock.customCache).toHaveProperty('match');
+    expect(envMock.customCache).toHaveProperty('put');
+  });
+
+  it('stores and retrieves weight responses through the OPFS cache', async () => {
+    vi.stubGlobal('navigator', { storage: { getDirectory: vi.fn(async () => makeOPFSRoot()) } });
+    pipelineMock.mockResolvedValue(makeGenerator());
+    const engine = new TransformersEngine({ device: 'wasm', cache: 'opfs' });
+    await engine.load(getModel('qwen2.5-1.5b'), () => {});
+
+    const cache = envMock.customCache as unknown as {
+      match(url: string): Promise<Response | undefined>;
+      put(url: string, response: Response): Promise<void>;
+    };
+    await cache.put('https://huggingface.co/weight.bin', new Response('weight-bytes'));
+
+    const matched = await cache.match('https://huggingface.co/weight.bin');
+    expect(matched).toBeDefined();
+    expect(await matched!.text()).toBe('weight-bytes');
+    await expect(cache.match('https://huggingface.co/missing.bin')).resolves.toBeUndefined();
+  });
+
+  it('uses the filesystem cache for opfs in Node', async () => {
+    vi.stubGlobal('navigator', {});
+    pipelineMock.mockResolvedValue(makeGenerator());
+    const engine = new TransformersEngine({ device: 'wasm', cache: 'opfs' });
+    await engine.load(getModel('qwen2.5-1.5b'), () => {});
+
+    expect(envMock.useFSCache).toBe(true);
+    expect(envMock.useCustomCache).toBe(false);
+    expect(envMock.useBrowserCache).toBe(false);
+  });
+
+  it('falls back to the browser cache when OPFS is unavailable', async () => {
+    vi.stubGlobal('window', {});
+    vi.stubGlobal('navigator', {});
+    vi.stubGlobal('caches', {});
+    pipelineMock.mockResolvedValue(makeGenerator());
+    const engine = new TransformersEngine({ device: 'wasm', cache: 'opfs' });
+    await engine.load(getModel('qwen2.5-1.5b'), () => {});
+
+    expect(envMock.useFSCache).toBe(false);
+    expect(envMock.useCustomCache).toBe(false);
+    expect(envMock.useBrowserCache).toBe(true);
   });
 
   it('counts tokens with the loaded tokenizer', async () => {
