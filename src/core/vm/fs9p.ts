@@ -4,6 +4,7 @@
  * v86 calls `filesystem.handle9p(reqbuf, reply)` for every 9p request. The
  * request buffer contains the full 9P frame (4-byte size, 1-byte type,
  * 2-byte tag, payload); the reply must be a complete frame with the same tag.
+ * Use {@link createV86Filesystem} to build the option object v86 expects.
  *
  * Implemented messages (9P2000.L unless noted):
  *  - Tversion/Rversion (100/101)
@@ -42,6 +43,8 @@
  * the handler refuses to persist, so a corrupt manifest is never overwritten
  * with an empty tree. A missing manifest is not an error (fresh storage).
  */
+
+import type { V86Options } from 'v86';
 
 // ---------------------------------------------------------------------------
 // Domain model
@@ -1474,6 +1477,33 @@ export function create9pHandler(deps: Fs9pDeps, options: Fs9pOptions = {}): Fs9p
   handle.persist = persist;
 
   return handle;
+}
+
+/**
+ * Build the `filesystem` option object for v86's `V86Options`.
+ *
+ * INTEGRATION POINT — `src/core/vm/v86.ts` (outside this file's scope):
+ * `V86Deps.filesystem?: V86Options['filesystem']` is declared but
+ * `V86VMHandle.start()` never reads it. To finish the wiring, construct the
+ * filesystem and hand it to the VM, e.g.:
+ *
+ * ```ts
+ * const filesystem = createV86Filesystem({ prefix: 'fs9p' });
+ * const vm = new V86VMHandle();
+ * // in start(): options.filesystem = this.deps.filesystem;
+ * ```
+ *
+ * v86 calls `handle9p(reqbuf, reply)` once per request (`Virtio9pHandler` in
+ * `libv86-debug.mjs`), where `reqbuf` is the complete 9P frame and `reply`
+ * must be called with the complete reply frame. The handler returned by
+ * {@link create9pHandler} matches that signature; the extra
+ * `tree`/`ready`/`flush`/`persist` properties are invisible to v86.
+ */
+export function createV86Filesystem(
+  deps: Fs9pDeps,
+  options: Fs9pOptions = {},
+): NonNullable<V86Options['filesystem']> {
+  return { handle9p: create9pHandler(deps, options) };
 }
 
 /** Alias matching the v86 `filesystem.handle9p` option name. */

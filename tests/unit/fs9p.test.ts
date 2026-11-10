@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import type { V86Options } from 'v86';
 import {
   ManifestError,
   cloneNode,
@@ -8,6 +9,7 @@ import {
   cowWrite,
   create9pHandler,
   createEmptyTree,
+  createV86Filesystem,
   findNode,
   loadTree,
   persistTree,
@@ -666,6 +668,30 @@ describe('fs9p handler', () => {
     expect(reader.u32()).toBe(data.byteLength);
     expect(new TextDecoder().decode(reader.bytes(data.byteLength))).toBe('persisted');
     await handle2.flush();
+  });
+
+  it('reaches the v86 filesystem option with the expected call signature', async () => {
+    const { deps } = makeDeps();
+    const filesystem = createV86Filesystem(deps, { autoPersist: false });
+
+    // The exact option shape v86 consumes.
+    const options: V86Options = { filesystem };
+    const handle9p = options.filesystem?.handle9p;
+    expect(handle9p).toBeTypeOf('function');
+
+    // v86 calls it as handle9p(reqbuf, reply) with a complete 9P frame.
+    const reply = await new Promise<Reply>((resolve) => {
+      handle9p!(
+        encodeFrame(100, 1, new FrameWriter().u32(8192).string('9P2000.L').build()),
+        (buf) => resolve(decodeReply(buf)),
+      );
+    });
+    expect(reply.type).toBe(101);
+    expect(reply.tag).toBe(1);
+
+    // The host-side controls remain reachable on the same function object.
+    const host = filesystem.handle9p as Fs9pHandle;
+    expect(typeof host.flush).toBe('function');
   });
 
   it('returns undefined from loadTree when nothing is stored', async () => {
