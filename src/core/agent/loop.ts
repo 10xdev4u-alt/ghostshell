@@ -54,8 +54,9 @@ function errorMessage(err: unknown): string {
  *
  * Contract:
  *  - Call the LLM with the conversation + tool schemas.
- *  - If the model emits tool calls, execute them (serialized) and append the
- *    results, then loop.
+ *  - If the model emits tool calls, execute them (serialized), append an
+ *    assistant message carrying the calls and one `tool` message per result,
+ *    then loop.
  *  - If the model emits a final answer (no tool calls), stop.
  *  - Enforce `maxIterations`, `toolTimeoutMs`, and `maxRetries`.
  *  - Every step is emitted via `onStep` so the UI can stream progress.
@@ -135,8 +136,11 @@ export class AgentLoop {
           results.push(await this.executeTool(call, ctx, signal));
         }
 
-        const message = this.assistantMessage(outcome.parse.text, calls, results);
+        const message = this.assistantMessage(outcome.parse.text, calls);
         messages.push(message);
+        for (const result of results) {
+          messages.push(this.toolMessage(result));
+        }
         const step: AgentStep = { iteration: iterations, message, toolCalls: calls, results };
         steps.push(step);
         onStep(step);
@@ -313,11 +317,7 @@ export class AgentLoop {
     });
   }
 
-  private assistantMessage(
-    content: string,
-    toolCalls: ToolCall[],
-    toolResults?: ToolResult[],
-  ): Message {
+  private assistantMessage(content: string, toolCalls: ToolCall[]): Message {
     return {
       id: uuid(),
       role: 'assistant',
@@ -325,7 +325,21 @@ export class AgentLoop {
       timestamp: Date.now(),
       model: this.config.modelId,
       ...(toolCalls.length > 0 ? { toolCalls } : {}),
-      ...(toolResults && toolResults.length > 0 ? { toolResults } : {}),
+    };
+  }
+
+  /**
+   * Tool output travels in a `tool` role message, which is what chat templates
+   * expect. The engine passes the assistant's `toolCalls` and the tool
+   * message's content through to the tokenizer (see PR #31).
+   */
+  private toolMessage(result: ToolResult): Message {
+    return {
+      id: uuid(),
+      role: 'tool',
+      content: result.content,
+      timestamp: Date.now(),
+      model: this.config.modelId,
     };
   }
 

@@ -151,6 +151,26 @@ describe('AgentLoop', () => {
     expect(result.messages[0]!.role).toBe('system');
   });
 
+  it('sends tool results to the model as tool messages', async () => {
+    const llm = new FakeLLM();
+    llm.queue = [
+      { text: toolCall('bash', { command: 'ls' }), tokens: 10, finishReason: 'stop' },
+      { text: 'All done.', tokens: 2, finishReason: 'stop' },
+    ];
+    const vm = new FakeVM();
+    const loop = new AgentLoop(makeTools(), makeConfig());
+
+    await run(loop, makeConversation([makeMessage('user', 'list files')]), makeContext(vm, llm));
+
+    const nextRequest = llm.requests[1]!;
+    const toolMessages = nextRequest.messages.filter((m) => m.role === 'tool');
+    expect(toolMessages).toHaveLength(1);
+    expect(toolMessages[0]!.content).toContain('ok');
+    const assistant = nextRequest.messages.find((m) => m.role === 'assistant');
+    expect(assistant?.toolCalls?.[0]?.name).toBe('bash');
+    expect(assistant?.toolResults).toBeUndefined();
+  });
+
   it('stops at maxIterations and reports the limit', async () => {
     const llm = new FakeLLM();
     llm.fallback = { text: toolCall('bash', { command: 'ls' }), tokens: 1, finishReason: 'stop' };
