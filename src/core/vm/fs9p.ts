@@ -750,7 +750,18 @@ async function readManifest(
   ) {
     throw new ManifestError('manifest.json has an unrecognized schema');
   }
+  // Fail closed on a bad qid counter too: a reused qidPath would confuse the
+  // guest's 9P inode cache.
+  parseNextQidPath((parsed as Manifest).nextQidPath);
   return parsed as Manifest;
+}
+
+/** Parse and validate the manifest's `nextQidPath` (serialized as a string). */
+function parseNextQidPath(raw: unknown): bigint {
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw)) {
+    throw new ManifestError('manifest.json has an invalid nextQidPath');
+  }
+  return BigInt(raw);
 }
 
 /**
@@ -796,14 +807,26 @@ export async function persistTree(
   deps.onLog?.(`fs9p: persisted ${written}/${total} file(s)`);
 }
 
+interface LoadedTree {
+  root: P9Node;
+  /**
+   * The manifest's qid counter, bumped past every live qid when the stored
+   * value is stale. Recomputing `max(live qid) + 1` on its own would reuse the
+   * qidPath of a deleted file and confuse the guest's 9P inode cache.
+   */
+  nextQidPath: bigint;
+}
+
 /**
- * Load a persisted tree from OPFS. Returns undefined when nothing is stored
- * or OPFS is unavailable.
+ * Load a persisted tree and its qid counter from OPFS. Returns undefined when
+ * nothing is stored or OPFS is unavailable. A missing prefix directory and a
+ * missing manifest are both "fresh storage"; every other storage error
+ * propagates.
  */
-export async function loadTree(
+async function loadTreeState(
   deps: Fs9pDeps,
   prefix = DEFAULT_FS_PREFIX,
-): Promise<P9Node | undefined> {
+): Promise<LoadedTree | undefined> {
   const storage = await opfsRoot(deps);
   if (!storage) return undefined;
   let dir: FileSystemDirectoryHandle;
@@ -815,7 +838,23 @@ export async function loadTree(
   }
   const manifest = await readManifest(dir);
   if (!manifest) return undefined;
-  return rebuildNode(manifest.root, '/', dir);
+  const root = await rebuildNode(manifest.root, '/', dir);
+  let nextQidPath = parseNextQidPath(manifest.nextQidPath);
+  let max = 0n;
+  for (const node of walk(root)) if (node.qidPath > max) max = node.qidPath;
+  if (nextQidPath <= max) nextQidPath = max + 1n;
+  return { root, nextQidPath };
+}
+
+/**
+ * Load a persisted tree from OPFS. Returns undefined when nothing is stored
+ * or OPFS is unavailable.
+ */
+export async function loadTree(
+  deps: Fs9pDeps,
+  prefix = DEFAULT_FS_PREFIX,
+): Promise<P9Node | undefined> {
+  return (await loadTreeState(deps, prefix))?.root;
 }
 
 /** Parse and validate a manifest node's `qidPath` (serialized as a string). */
@@ -901,16 +940,15 @@ export function create9pHandler(deps: Fs9pDeps, options: Fs9pOptions = {}): Fs9p
     if (loaded) return Promise.resolve();
     if (!loadPromise) {
       loadPromise = (async () => {
-        // loadTree returns undefined when nothing is stored or OPFS is absent.
-        // It throws ManifestError when a stored manifest is corrupt; that must
-        // propagate. Falling back to an empty tree here would let the next
-        // persist overwrite the user's snapshot.
-        const persisted = await loadTree(deps, prefix);
+        // loadTreeState returns undefined when nothing is stored or OPFS is
+        // absent. It throws ManifestError when a stored manifest is corrupt
+        // and propagates real storage errors; both must propagate. Falling
+        // back to an empty tree here would let the next persist overwrite the
+        // user's snapshot.
+        const persisted = await loadTreeState(deps, prefix);
         if (persisted) {
-          root = persisted;
-          let max = 0n;
-          for (const node of walk(root)) if (node.qidPath > max) max = node.qidPath;
-          nextQidPath = max + 1n;
+          root = persisted.root;
+          nextQidPath = persisted.nextQidPath;
         }
         loaded = true;
       })();

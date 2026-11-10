@@ -816,6 +816,108 @@ describe('fs9p handler', () => {
     // The failure is sticky: a later flush must not resolve as if it wrote.
     await expect(handle.flush()).rejects.toThrow('disk full');
   });
+
+  it('restores nextQidPath from the manifest instead of reusing a deleted qid', async () => {
+    const { deps } = makeDeps();
+    const first = create9pHandler(deps, { autoPersist: false });
+    await request(first, 100, 1, new FrameWriter().u32(8192).string('9P2000.L').build());
+    await request(first, 104, 2, attachPayload(1));
+    await request(
+      first,
+      14,
+      3,
+      new FrameWriter().u32(1).string('a.txt').u32(0x2).u32(0o100644).u32(0).build(),
+    );
+    await request(first, 104, 4, attachPayload(2));
+    await request(
+      first,
+      14,
+      5,
+      new FrameWriter().u32(2).string('b.txt').u32(0x2).u32(0o100644).u32(0).build(),
+    );
+    await first.flush();
+
+    expect(findNode(first.tree, '/a.txt')!.qidPath).toBe(1n);
+    const deletedQid = findNode(first.tree, '/b.txt')!.qidPath;
+    expect(deletedQid).toBe(2n);
+
+    // Delete the highest-qid file and persist.
+    await request(first, 104, 6, attachPayload(3));
+    await request(first, 76, 7, new FrameWriter().u32(3).string('b.txt').u32(0).build());
+    await first.flush();
+
+    // Reload: the manifest must restore nextQidPath = 3, not max(live) + 1 = 2.
+    const second = create9pHandler(deps, { autoPersist: false });
+    await second.ready();
+    await request(second, 100, 1, new FrameWriter().u32(8192).string('9P2000.L').build());
+    await request(second, 104, 2, attachPayload(1));
+    await request(
+      second,
+      14,
+      3,
+      new FrameWriter().u32(1).string('c.txt').u32(0x2).u32(0o100644).u32(0).build(),
+    );
+
+    const created = findNode(second.tree, '/c.txt')!;
+    expect(created.qidPath).toBe(3n);
+    expect(created.qidPath).not.toBe(deletedQid);
+  });
+
+  it('bumps a stale manifest nextQidPath past every live qid', async () => {
+    const { deps, root } = makeDeps();
+    const stale = text.encode(
+      JSON.stringify({
+        version: 1,
+        nextQidPath: '1',
+        root: {
+          name: '/',
+          kind: 'dir',
+          mode: 0o40755,
+          uid: 0,
+          gid: 0,
+          nlink: 1,
+          rdev: 0,
+          size: 0,
+          atime: 0,
+          mtime: 0,
+          ctime: 0,
+          qidPath: '0',
+          qidVersion: 0,
+          children: [
+            {
+              name: 'a.txt',
+              kind: 'file',
+              mode: 0o100644,
+              uid: 0,
+              gid: 0,
+              nlink: 1,
+              rdev: 0,
+              size: 0,
+              atime: 0,
+              mtime: 0,
+              ctime: 0,
+              qidPath: '1',
+              qidVersion: 0,
+            },
+          ],
+        },
+      }),
+    );
+    await writeOpfsFile(root, 'test', 'manifest.json', stale);
+
+    const handle = create9pHandler(deps, { autoPersist: false });
+    await handle.ready();
+    await request(handle, 100, 1, new FrameWriter().u32(8192).string('9P2000.L').build());
+    await request(handle, 104, 2, attachPayload(1));
+    await request(
+      handle,
+      14,
+      3,
+      new FrameWriter().u32(1).string('b.txt').u32(0x2).u32(0o100644).u32(0).build(),
+    );
+
+    expect(findNode(handle.tree, '/b.txt')!.qidPath).toBe(2n);
+  });
 });
 
 describe('copy-on-write helpers', () => {
