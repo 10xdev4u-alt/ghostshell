@@ -47,3 +47,6 @@ export const CORRECTIVE_RETRY_PROMPT = `Your previous response was not a valid t
 Reply with exactly one <tool_call> block matching this schema:
 {"name": "<tool>", "arguments": {<args>}}
 Do not include any other text.`;
+
+export const CONTINUE_PROMPT = `You did not respond with a tool call or a final answer.
+Continue working, or reply with <answer>your final answer</answer>.`;

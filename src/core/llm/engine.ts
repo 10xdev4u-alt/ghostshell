@@ -1,4 +1,7 @@
-import type { LLMEngine, ModelSpec } from '@/types/index.js';
+import type { BackendKind, LLMEngine, ModelSpec } from '@/types/index.js';
+import { TransformersEngine, type TransformersEngineOptions } from './transformers.js';
+import { supportsBackend } from './models.js';
+import { WebLLMEngine } from './webllm.js';
 
 /**
  * LLM engine factory.
@@ -13,21 +16,51 @@ import type { LLMEngine, ModelSpec } from '@/types/index.js';
 
 export type EngineKind = 'transformers' | 'webllm';
 
-export function createEngine(kind: EngineKind): LLMEngine {
-  // TODO: import and instantiate the concrete engine (issue #14).
-  void kind;
-  throw new Error(`LLM engine "${kind}" not implemented (issue #14)`);
+export interface CreateEngineOptions extends TransformersEngineOptions {
+  /**
+   * Runtime device. Defaults to `detectBackend()`. `transformers` maps this
+   * straight to the ONNX runtime device; `webllm` always runs on WebGPU.
+   */
+  device?: BackendKind;
+  /**
+   * Model the engine will load. Used to pick a compatible default device;
+   * `TransformersEngine.load` re-validates and downgrades to WASM if the model
+   * does not support the requested backend.
+   */
+  spec?: ModelSpec;
 }
 
-/** Detect the best available backend. */
-export function detectBackend(): 'webgpu' | 'wasm' {
+export function createEngine(kind: EngineKind, options: CreateEngineOptions = {}): LLMEngine {
+  switch (kind) {
+    case 'transformers': {
+      const { spec, ...engineOptions } = options;
+      return new TransformersEngine({
+        ...engineOptions,
+        device: options.device ?? detectBackendFor(spec),
+      });
+    }
+    case 'webllm':
+      // WebLLM is a v1.0 fast path; the class exists but is not implemented yet.
+      return new WebLLMEngine();
+  }
+}
+
+/**
+ * Detect the best available backend.
+ *
+ * WebGPU is preferred when the browser exposes `navigator.gpu`; otherwise the
+ * engine runs on WASM (single-threaded unless the host sets COOP/COEP).
+ */
+export function detectBackend(): BackendKind {
   if (typeof globalThis.navigator !== 'undefined' && 'gpu' in globalThis.navigator) {
     return 'webgpu';
   }
   return 'wasm';
 }
 
-/** True when the model can run on the detected backend. */
-export function supportsBackend(spec: ModelSpec, backend: 'webgpu' | 'wasm'): boolean {
-  return spec.backend === backend || backend === 'wasm';
+/** Pick the default device for a model, falling back to WASM when unsupported. */
+function detectBackendFor(spec: ModelSpec | undefined): BackendKind {
+  return spec && !supportsBackend(spec, 'webgpu') ? 'wasm' : detectBackend();
 }
+
+export { supportsBackend };
