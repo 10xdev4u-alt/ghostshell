@@ -221,6 +221,26 @@ describe('builtin tools', () => {
     expect(vm.commands[0]!.cmd).toContain('*.ts');
   });
 
+  it('search treats a leading-dash pattern as a literal pattern', async () => {
+    const vm = new FakeVM();
+    vm.execResult = { stdout: '', stderr: '', exitCode: 1, durationMs: 1, timedOut: false };
+
+    await tool('search').execute(makeContext(vm), { pattern: '-v foo' });
+
+    expect(vm.commands[0]!.cmd).toContain('grep -rn');
+    expect(vm.commands[0]!.cmd).toContain("-e '-v foo'");
+    expect(vm.commands[0]!.cmd).not.toContain("grep -rn '-v foo'");
+  });
+
+  it('search treats a leading-dash glob-like pattern as a literal pattern', async () => {
+    const vm = new FakeVM();
+    vm.execResult = { stdout: '', stderr: '', exitCode: 1, durationMs: 1, timedOut: false };
+
+    await tool('search').execute(makeContext(vm), { pattern: '--include=secret' });
+
+    expect(vm.commands[0]!.cmd).toContain("-e '--include=secret'");
+  });
+
   it('search treats no matches as success', async () => {
     const vm = new FakeVM();
     vm.execResult = { stdout: '', stderr: '', exitCode: 1, durationMs: 2, timedOut: false };
