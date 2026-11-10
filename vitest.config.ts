@@ -1,9 +1,23 @@
 import { defineConfig } from 'vitest/config';
+import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 export default defineConfig({
   resolve: {
     alias: { '@': resolve(import.meta.dirname, 'src') },
+  },
+  // Required for the inlined v86.wasm asset import (src/core/vm/wasm.ts).
+  assetsInclude: ['**/*.wasm'],
+  server: {
+    fs: {
+      // node_modules can be a symlink to a directory outside the workspace
+      // (a shared store). Vite denies transforming files outside the root,
+      // which breaks inlined asset imports such as `v86/build/v86.wasm?inline`.
+      allow: [
+        resolve(import.meta.dirname),
+        realpathSync(resolve(import.meta.dirname, 'node_modules')),
+      ],
+    },
   },
   test: {
     globals: true,

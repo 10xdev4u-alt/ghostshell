@@ -17,7 +17,7 @@ Open one HTML file. Get a chat with an AI that runs **real commands in a real
 - 🖥️ **Real Linux VM** — [v86](https://copy.sh/v86/) x86 emulator, Alpine 3.21 i386
 - 🧠 **Local LLM** — [Transformers.js](https://huggingface.co/docs/transformers.js) / [WebLLM](https://webllm.mlc.ai), 1.5B–3B quantized
 - 🔒 **No server, no account, no telemetry** — the only network call is the one-time model download
-- 📦 **One file** — the whole app inlines into a single `index.html`
+- 📦 **One file** — the whole app, including the v86 WASM, inlines into a single `index.html`
 
 ### Why?
 
@@ -40,7 +40,7 @@ bun run dev          # http://localhost:5173
 Build the single file:
 
 ```bash
-bun run build:single # dist/single/index.html (~45–85 MB with inlined assets)
+bun run build:single # dist/single/index.html (~59 MB with inlined assets)
 ```
 
 Host it anywhere static (Netlify, Cloudflare Pages, GitHub Pages). For threaded

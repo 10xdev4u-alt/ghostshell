@@ -19,6 +19,7 @@ import { createDiffView } from '@/ui/diff.js';
 import { createArtifactPanel } from '@/ui/artifact.js';
 import { createPrivacyReportSection, createSettings } from '@/ui/settings.js';
 import { installEgressInterceptor, InMemoryEgressLog } from '@/core/security/egress.js';
+import { V86_WASM_URL } from '@/core/vm/wasm.js';
 import type { AppEventMap } from '@/types/index.js';
 
 /**
@@ -45,6 +46,10 @@ export class App {
     cmdline: ALPINE_BOOT.cmdline,
     filesystem: createV86Filesystem({ prefix: DEFAULT_FS_PREFIX }),
     netDevice: buildNetDevice({ mode: DEFAULT_AGENT_CONFIG.networkMode }),
+    // The single-file release has no build/ directory next to the page, so
+    // the emulator WASM is inlined into the bundle and handed to v86 as a
+    // data: URL (src/core/vm/wasm.ts).
+    wasmPath: V86_WASM_URL,
   });
   readonly conversations: ConversationRepository;
   readonly snapshots: SnapshotManager;
