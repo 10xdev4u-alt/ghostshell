@@ -285,6 +285,37 @@ describe('AgentLoop', () => {
     expect(steps[0]!.results[0]!.content).toContain('timed out');
   });
 
+  it('honors abort during tool execution without reporting a tool failure', async () => {
+    const controller = new AbortController();
+    const slow: ToolDefinition = {
+      name: 'slow',
+      description: 'hangs',
+      parameters: { type: 'object', properties: {} },
+      execute: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        return { ok: true, content: 'never' };
+      },
+    };
+    const llm = new FakeLLM();
+    llm.fallback = { text: toolCall('slow', {}), tokens: 1, finishReason: 'stop' };
+    const loop = new AgentLoop(new Map([['slow', slow]]), makeConfig({ maxIterations: 1 }));
+    const steps: AgentStep[] = [];
+    const start = Date.now();
+    setTimeout(() => controller.abort(), 20);
+
+    const result = await run(
+      loop,
+      makeConversation([makeMessage('user', 'hi')]),
+      makeContext(new FakeVM(), llm),
+      steps,
+      controller.signal,
+    );
+
+    expect(result.finishReason).toBe('aborted');
+    expect(steps).toHaveLength(0);
+    expect(Date.now() - start).toBeLessThan(300);
+  });
+
   it('reports unknown tools without throwing', async () => {
     const llm = new FakeLLM();
     llm.fallback = { text: toolCall('nope', {}), tokens: 1, finishReason: 'stop' };

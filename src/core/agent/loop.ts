@@ -45,6 +45,13 @@ class ToolTimeoutError extends Error {
   }
 }
 
+class ToolAbortedError extends Error {
+  constructor(toolName: string) {
+    super(`Tool "${toolName}" was aborted.`);
+    this.name = 'ToolAbortedError';
+  }
+}
+
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -288,9 +295,12 @@ export class AgentLoop {
           definition.execute(toolCtx, call.arguments),
           this.config.toolTimeoutMs,
           call.name,
+          signal,
         ),
       );
     } catch (err) {
+      // An abort is not a tool failure: rethrow so the loop reports `aborted`.
+      if (signal.aborted) throw err;
       if (err instanceof ToolTimeoutError) {
         return { ok: false, content: err.message };
       }
@@ -298,19 +308,57 @@ export class AgentLoop {
     }
   }
 
-  private withTimeout<T>(promise: Promise<T>, timeoutMs: number, toolName: string): Promise<T> {
+  /**
+   * Race a tool against its timeout and the run's abort signal. Whichever
+   * fires first settles the promise; the other listener is removed so a late
+   * tool result cannot leak into a settled run.
+   */
+  private withTimeout<T>(
+    promise: Promise<T>,
+    timeoutMs: number,
+    toolName: string,
+    signal: AbortSignal,
+  ): Promise<T> {
+    if (signal.aborted) {
+      return Promise.reject(new ToolAbortedError(toolName));
+    }
+
     return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(
-        () => reject(new ToolTimeoutError(toolName, timeoutMs)),
-        Math.max(1, timeoutMs),
-      );
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+
+      function cleanup(): void {
+        if (timer !== undefined) clearTimeout(timer);
+        signal.removeEventListener('abort', onAbort);
+      }
+
+      function onAbort(): void {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(new ToolAbortedError(toolName));
+      }
+
+      timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(new ToolTimeoutError(toolName, timeoutMs));
+      }, Math.max(1, timeoutMs));
+
+      signal.addEventListener('abort', onAbort, { once: true });
+
       promise.then(
         (value) => {
-          clearTimeout(timer);
+          if (settled) return;
+          settled = true;
+          cleanup();
           resolve(value);
         },
         (err: unknown) => {
-          clearTimeout(timer);
+          if (settled) return;
+          settled = true;
+          cleanup();
           reject(err);
         },
       );
