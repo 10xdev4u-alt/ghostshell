@@ -249,6 +249,19 @@ describe('V86VMHandle', () => {
     expect(result.stdout).toBe('');
   });
 
+  it('exec reports multi-digit exit codes', async () => {
+    const vm = new V86VMHandle();
+    await vm.start(DEFAULT_IMAGE);
+    const emu = instances[0]!;
+    emu.serialScript = (data: string) => {
+      const id = sentinelId(data);
+      return `__GS_BEGIN_${id}__\n__GS_DONE_${id}__ 127\n`;
+    };
+
+    const result = await vm.exec('false');
+    expect(result.exitCode).toBe(127);
+  });
+
   it('exec throws when the VM is not started', async () => {
     const vm = new V86VMHandle();
     await expect(vm.exec('echo hi')).rejects.toThrow('VM not started');

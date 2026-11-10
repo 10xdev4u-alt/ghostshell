@@ -70,6 +70,15 @@ describe('extractSentinelOutput', () => {
     const raw = 'echo __GS_DONE_abc__ $?\n__GS_BEGIN_abc__\nhello\n__GS_DONE_abc__ 3\n';
     expect(extractSentinelOutput(raw, 'abc')).toEqual({ body: '\nhello\n', exitCode: 3 });
   });
+
+  it('does not settle on a partial exit code', () => {
+    expect(extractSentinelOutput('__GS_BEGIN_abc__\n__GS_DONE_abc__ 1', 'abc')).toBeNull();
+  });
+
+  it('parses a multi-digit exit code once the line terminates', () => {
+    const raw = '__GS_BEGIN_abc__\nhello\n__GS_DONE_abc__ 127\n';
+    expect(extractSentinelOutput(raw, 'abc')).toEqual({ body: '\nhello\n', exitCode: 127 });
+  });
 });
 
 describe('cleanOutput', () => {
@@ -100,6 +109,10 @@ describe('stripAnsi', () => {
 
 const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
+function sentinelId(data: string): string {
+  return /__GS_DONE_([A-Za-z0-9]+)__/.exec(data)?.[1] ?? 'missing';
+}
+
 describe('createCommandRunner', () => {
   it('sends a sentinel-wrapped command', async () => {
     const transport = new FakeTransport();
@@ -129,6 +142,21 @@ describe('createCommandRunner', () => {
 
     const result = await pending;
     expect(result.exitCode).toBe(7);
+  });
+
+  it('waits for the full multi-digit exit code, one byte at a time', async () => {
+    const transport = new FakeTransport();
+    const runner = createCommandRunner(transport);
+    const pending = runner.run('false');
+    await tick();
+    const id = sentinelId(transport.sent[0]!);
+
+    // Emit the begin marker first so the runner is collecting output.
+    transport.emit(`__GS_BEGIN_${id}__\n`);
+    for (const ch of `__GS_DONE_${id}__ 127\n`) transport.emit(ch);
+
+    const result = await pending;
+    expect(result.exitCode).toBe(127);
   });
 
   it('strips the prompt and the echoed command', async () => {

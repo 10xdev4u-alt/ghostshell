@@ -50,6 +50,17 @@ export function buildSentinelCommand(cmd: string, id: string): string {
 }
 
 /**
+ * Compiled done-sentinel matcher.
+ *
+ * The exit code must be terminated by a newline. Bytes arrive one at a time,
+ * so an unterminated `(-?\d+)` matches after the first digit and truncates
+ * codes of two or more digits (e.g. `127` would settle as `1`).
+ */
+export function doneSentinelPattern(id: string): RegExp {
+  return new RegExp(`__GS_DONE_${escapeRegExp(id)}__ (-?\\d+)\\r?\\n`);
+}
+
+/**
  * Split a raw serial stream at the done sentinel. Returns the body between
  * the last begin marker and the done marker, plus the parsed exit code.
  * Returns null when the done sentinel has not arrived yet.
@@ -57,8 +68,9 @@ export function buildSentinelCommand(cmd: string, id: string): string {
 export function extractSentinelOutput(
   raw: string,
   id: string,
+  pattern: RegExp = doneSentinelPattern(id),
 ): { body: string; exitCode: number } | null {
-  const done = new RegExp(`__GS_DONE_${escapeRegExp(id)}__ (-?\\d+)`).exec(raw);
+  const done = pattern.exec(raw);
   if (!done || done.index === undefined) return null;
   const before = raw.slice(0, done.index);
   const begin = `__GS_BEGIN_${id}__`;
@@ -117,6 +129,7 @@ export function createCommandRunner(
     return new Promise<CommandResult>((resolve) => {
       const id = newSentinelId();
       const wrapped = buildSentinelCommand(cmd, id);
+      const donePattern = doneSentinelPattern(id);
       const started = Date.now();
       let output = '';
       let settled = false;
@@ -143,7 +156,7 @@ export function createCommandRunner(
       unsubscribe = transport.onData((chunk) => {
         if (settled) return;
         output += chunk;
-        const found = extractSentinelOutput(output, id);
+        const found = extractSentinelOutput(output, id, donePattern);
         if (found) {
           finish(timedOut, found.exitCode, found.body);
           return;
@@ -162,7 +175,7 @@ export function createCommandRunner(
       transport.send(wrapped);
 
       function bodyBeforeSentinel(): string {
-        const found = extractSentinelOutput(output, id);
+        const found = extractSentinelOutput(output, id, donePattern);
         return found ? found.body : output;
       }
     });
