@@ -4,13 +4,17 @@ import { builtinTools } from '@/core/agent/tools.js';
 
 const tools = builtinTools().map((tool) => ({ name: tool.name, parameters: tool.parameters }));
 
-function definedRules(grammar: string): Set<string> {
-  const rules = new Set<string>();
+function ruleNames(grammar: string): string[] {
+  const names: string[] = [];
   for (const line of grammar.split('\n')) {
     const match = /^([a-zA-Z][a-zA-Z0-9-]*)\s*::=/.exec(line.trim());
-    if (match) rules.add(match[1]!);
+    if (match) names.push(match[1]!);
   }
-  return rules;
+  return names;
+}
+
+function definedRules(grammar: string): Set<string> {
+  return new Set(ruleNames(grammar));
 }
 
 function referencedRules(grammar: string): string[] {
@@ -105,6 +109,44 @@ describe('buildToolCallGrammar', () => {
     expect(ruleBody(grammar, 'answer-char')).toBe('[^<] | "<" [^/]');
 
     // The final-answer branch must not reference an undefined rule.
+    const defined = definedRules(grammar);
+    for (const ref of referencedRules(grammar)) {
+      expect(defined.has(ref), `undefined rule: ${ref}`).toBe(true);
+    }
+  });
+
+  it('disambiguates tool names that slug to the same rule name', () => {
+    const grammar = buildToolCallGrammar([
+      { name: 'read-file', parameters: { type: 'object', properties: { path: { type: 'string' } } } },
+      { name: 'read_file', parameters: { type: 'object', properties: { path: { type: 'string' } } } },
+    ]);
+
+    const names = ruleNames(grammar);
+    expect(new Set(names).size).toBe(names.length);
+    const defined = definedRules(grammar);
+    for (const ref of referencedRules(grammar)) {
+      expect(defined.has(ref), `undefined rule: ${ref}`).toBe(true);
+    }
+    expect(grammar).toContain('"read-file"');
+    expect(grammar).toContain('"read_file"');
+  });
+
+  it('disambiguates property names that slug to the same rule name', () => {
+    const grammar = buildToolCallGrammar([
+      {
+        name: 'write',
+        parameters: {
+          type: 'object',
+          properties: {
+            'file-path': { type: 'string' },
+            file_path: { type: 'string' },
+          },
+        },
+      },
+    ]);
+
+    const names = ruleNames(grammar);
+    expect(new Set(names).size).toBe(names.length);
     const defined = definedRules(grammar);
     for (const ref of referencedRules(grammar)) {
       expect(defined.has(ref), `undefined rule: ${ref}`).toBe(true);

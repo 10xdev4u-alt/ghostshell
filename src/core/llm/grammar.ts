@@ -83,19 +83,21 @@ export function buildToolCallGrammar(tools: GrammarTool[]): string {
 
   const lines: string[] = [];
   const callAlternatives: string[] = [];
+  const toolSlugs = new SlugAllocator();
 
   for (const tool of tools) {
-    const toolRule = ruleSlug(tool.name);
+    const toolRule = toolSlugs.slug(tool.name);
     const schema = parseSchema(tool.parameters);
     const properties = Object.keys(schema.properties ?? {});
     const required = new Set(schema.required ?? []);
+    const propertySlugs = new SlugAllocator();
 
     // One key/value rule per known property.
     for (const property of properties) {
       const definition = schema.properties?.[property];
       if (!definition) continue;
       lines.push(
-        `args-${toolRule}-${ruleSlug(property)}-kv ::= ${gbnfLiteral(property)} space ":" space ${valueRule(definition)}`,
+        `args-${toolRule}-${propertySlugs.slug(property)}-kv ::= ${gbnfLiteral(property)} space ":" space ${valueRule(definition)}`,
       );
     }
 
@@ -103,7 +105,7 @@ export function buildToolCallGrammar(tools: GrammarTool[]): string {
     // hatch, so the model can still emit properties added after this grammar
     // was generated.
     const kvAlternatives = [
-      ...properties.map((property) => `args-${toolRule}-${ruleSlug(property)}-kv`),
+      ...properties.map((property) => `args-${toolRule}-${propertySlugs.slug(property)}-kv`),
       'additional-kv',
     ];
     lines.push(`args-${toolRule}-kv ::= ${kvAlternatives.join(' | ')}`);
@@ -112,7 +114,7 @@ export function buildToolCallGrammar(tools: GrammarTool[]): string {
     // is optional. This mirrors llama.cpp's JSON-schema converter.
     const requiredSequence = properties
       .filter((property) => required.has(property))
-      .map((property) => `args-${toolRule}-${ruleSlug(property)}-kv`)
+      .map((property) => `args-${toolRule}-${propertySlugs.slug(property)}-kv`)
       .join(' "," space ');
     const objectBody = requiredSequence
       ? `${requiredSequence} ("," space (args-${toolRule}-kv ("," space args-${toolRule}-kv)*))?`
@@ -204,12 +206,57 @@ function valueRule(definition: JSONSchemaProperty): string {
 }
 
 /** GBNF rule names are dashed lowercase words. */
-function ruleSlug(value: string): string {
+function slugify(value: string): string {
   const slug = value
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '');
   return slug || 'tool';
+}
+
+/** Short FNV-1a hash used to disambiguate colliding rule slugs. */
+function slugHash(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+/**
+ * Allocate GBNF rule-name fragments.
+ *
+ * Raw values are memoized, so a property referenced from several rules keeps
+ * one name. Two different values can slug alike (`read-file`, `read_file`);
+ * the second gets a hash suffix instead of emitting a duplicate rule, which
+ * llama.cpp rejects as a parse error.
+ */
+class SlugAllocator {
+  private readonly used = new Set<string>();
+  private readonly memo = new Map<string, string>();
+
+  slug(value: string): string {
+    const memoized = this.memo.get(value);
+    if (memoized !== undefined) return memoized;
+
+    const base = slugify(value);
+    const slug = this.used.has(base) ? this.unique(base, value) : base;
+    this.used.add(slug);
+    this.memo.set(value, slug);
+    return slug;
+  }
+
+  private unique(base: string, value: string): string {
+    const hash = slugHash(value);
+    let slug = `${base}-${hash}`;
+    let suffix = 1;
+    while (this.used.has(slug)) {
+      slug = `${base}-${hash}-${suffix}`;
+      suffix += 1;
+    }
+    return slug;
+  }
 }
 
 /** Quote a string as a GBNF terminal. */
