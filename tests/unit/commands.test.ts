@@ -45,7 +45,10 @@ class FakeTransport implements SerialTransport {
 describe('buildSentinelCommand', () => {
   it('wraps the command in begin/done sentinels', () => {
     expect(buildSentinelCommand('echo hi', 'abc123')).toBe(
-      'echo __GS_BEGIN_abc123__\necho hi\necho __GS_DONE_abc123__ $?\n',
+      "PS1='__GS_PROMPT_abc123__'\n" +
+        'echo __GS_BEGIN_abc123__\n' +
+        'echo hi\n' +
+        'echo __GS_DONE_abc123__ $?\n',
     );
   });
 });
@@ -78,6 +81,12 @@ describe('extractSentinelOutput', () => {
   it('parses a multi-digit exit code once the line terminates', () => {
     const raw = '__GS_BEGIN_abc__\nhello\n__GS_DONE_abc__ 127\n';
     expect(extractSentinelOutput(raw, 'abc')).toEqual({ body: '\nhello\n', exitCode: 127 });
+  });
+
+  it('strips the prompt sentinel from the body', () => {
+    const raw =
+      '__GS_BEGIN_abc__\n__GS_PROMPT_abc__hello\n__GS_PROMPT_abc____GS_DONE_abc__ 0\n';
+    expect(extractSentinelOutput(raw, 'abc')).toEqual({ body: '\nhello\n', exitCode: 0 });
   });
 });
 
@@ -157,6 +166,24 @@ describe('createCommandRunner', () => {
 
     const result = await pending;
     expect(result.exitCode).toBe(127);
+  });
+
+  it('strips prompts printed between the markers', async () => {
+    const transport = new FakeTransport();
+    const runner = createCommandRunner(transport);
+    const pending = runner.run('echo hi');
+    await tick();
+    const id = sentinelId(transport.sent[0]!);
+    const prompt = `__GS_PROMPT_${id}__`;
+
+    transport.emit(`localhost:~# ${transport.sent[0]}`);
+    transport.emit(`__GS_BEGIN_${id}__\n`);
+    transport.emit(`${prompt}hi\n`);
+    transport.emit(prompt);
+    transport.emit(`__GS_DONE_${id}__ 0\n`);
+
+    const result = await pending;
+    expect(result.stdout).toBe('hi');
   });
 
   it('strips the prompt and the echoed command', async () => {

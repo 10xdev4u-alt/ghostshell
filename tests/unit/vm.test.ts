@@ -105,11 +105,16 @@ vi.mock('v86', () => {
         const mkdir = /mkdir -p '([^']+)'/.exec(data);
         if (mkdir) this.dirs.add(mkdir[1]!);
         const id = /__GS_DONE_([A-Za-z0-9]+)__/.exec(data)?.[1] ?? 'missing';
+        const prompt = `__GS_PROMPT_${id}__`;
         let body = 'hello\n';
         if (data.includes('ls -A -1')) {
           body = 'regular file\t5\t1700000000\ta.txt\ndirectory\t0\t1700000000\tsub\n';
         }
-        return `localhost:~# ${data}__GS_BEGIN_${id}__\n${body}__GS_DONE_${id}__ 0\n`;
+        return (
+          `localhost:~# ${data}__GS_BEGIN_${id}__\n` +
+          `${prompt}${body}${prompt}` +
+          `__GS_DONE_${id}__ 0\n`
+        );
       }
 
       emitSerial(text: string): void {
@@ -260,6 +265,16 @@ describe('V86VMHandle', () => {
 
     const result = await vm.exec('false');
     expect(result.exitCode).toBe(127);
+  });
+
+  it('exec strips the shell prompt from stdout', async () => {
+    const vm = new V86VMHandle();
+    await vm.start(DEFAULT_IMAGE);
+
+    const result = await vm.exec('echo hello');
+    expect(result.stdout).toBe('hello');
+    expect(result.stdout).not.toContain('__GS_PROMPT_');
+    expect(result.stdout).not.toContain('localhost:~#');
   });
 
   it('exec throws when the VM is not started', async () => {

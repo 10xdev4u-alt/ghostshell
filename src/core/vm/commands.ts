@@ -44,9 +44,25 @@ const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_GRACE_MS = 500;
 const DEFAULT_MAX_OUTPUT_CHARS = 1_000_000;
 
+/**
+ * Prompt marker set while a command runs.
+ *
+ * The guest shell prints a prompt before every line it reads, so a prompt can
+ * appear between the begin marker and the done marker. Setting `PS1` to a
+ * per-run sentinel makes those prompts identifiable and strippable.
+ */
+export function promptSentinel(id: string): string {
+  return `__GS_PROMPT_${id}__`;
+}
+
 /** Wrap a command in the begin/done sentinel pair. */
 export function buildSentinelCommand(cmd: string, id: string): string {
-  return `echo __GS_BEGIN_${id}__\n${cmd}\necho __GS_DONE_${id}__ $?\n`;
+  return (
+    `PS1='${promptSentinel(id)}'\n` +
+    `echo __GS_BEGIN_${id}__\n` +
+    `${cmd}\n` +
+    `echo __GS_DONE_${id}__ $?\n`
+  );
 }
 
 /**
@@ -75,7 +91,9 @@ export function extractSentinelOutput(
   const before = raw.slice(0, done.index);
   const begin = `__GS_BEGIN_${id}__`;
   const idx = before.lastIndexOf(begin);
-  const body = idx === -1 ? before : before.slice(idx + begin.length);
+  const prompt = promptSentinel(id);
+  const rawBody = idx === -1 ? before : before.slice(idx + begin.length);
+  const body = rawBody.split(prompt).join('');
   return { body, exitCode: Number(done[1]) };
 }
 
