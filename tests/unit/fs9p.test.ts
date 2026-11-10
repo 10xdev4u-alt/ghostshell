@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  ManifestError,
   cloneNode,
   cloneTree,
   cowRemoveChild,
@@ -246,6 +247,53 @@ function makeDeps(): { deps: { storage: FileSystemDirectoryHandle; prefix: strin
 
 function attachPayload(fid: number): Uint8Array {
   return new FrameWriter().u32(fid).u32(0xffffffff).string('root').string('/').u32(0).build();
+}
+
+async function writeOpfsFile(
+  root: FakeDirHandle,
+  prefix: string,
+  name: string,
+  data: Uint8Array,
+): Promise<void> {
+  const dir = await root.getDirectoryHandle(prefix, { create: true });
+  const handle = await dir.getFileHandle(name, { create: true });
+  const writable = await handle.createWritable();
+  await writable.write(data);
+  await writable.close();
+}
+
+async function readOpfsFile(
+  root: FakeDirHandle,
+  prefix: string,
+  name: string,
+): Promise<Uint8Array> {
+  const dir = await root.getDirectoryHandle(prefix);
+  const handle = await dir.getFileHandle(name);
+  const file = await handle.getFile();
+  return new Uint8Array(await file.arrayBuffer());
+}
+
+function manifestJson(rootQidPath: string): string {
+  return JSON.stringify({
+    version: 1,
+    nextQidPath: '2',
+    root: {
+      name: '/',
+      kind: 'dir',
+      mode: 0o40755,
+      uid: 0,
+      gid: 0,
+      nlink: 1,
+      rdev: 0,
+      size: 0,
+      atime: 0,
+      mtime: 0,
+      ctime: 0,
+      qidPath: rootQidPath,
+      qidVersion: 0,
+      children: [],
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -555,6 +603,39 @@ describe('fs9p handler', () => {
   it('returns undefined from loadTree when nothing is stored', async () => {
     const { deps } = makeDeps();
     expect(await loadTree(deps, 'missing')).toBeUndefined();
+  });
+
+  it('fails closed on a corrupt manifest and leaves it untouched', async () => {
+    const { deps, root } = makeDeps();
+    const corrupt = text.encode('{ this is not json');
+    await writeOpfsFile(root, 'test', 'manifest.json', corrupt);
+
+    await expect(loadTree(deps, 'test')).rejects.toBeInstanceOf(ManifestError);
+
+    const handle = create9pHandler(deps, { autoPersist: false });
+    await expect(handle.ready()).rejects.toBeInstanceOf(ManifestError);
+    // An explicit persist must not replace the corrupt manifest with an empty tree.
+    await handle.persist();
+
+    expect(Array.from(await readOpfsFile(root, 'test', 'manifest.json'))).toEqual(
+      Array.from(corrupt),
+    );
+  });
+
+  it('fails closed on a manifest with a non-integer qidPath', async () => {
+    const { deps, root } = makeDeps();
+    const raw = text.encode(manifestJson('not-a-number'));
+    await writeOpfsFile(root, 'test', 'manifest.json', raw);
+
+    await expect(loadTree(deps, 'test')).rejects.toBeInstanceOf(ManifestError);
+
+    const handle = create9pHandler(deps, { autoPersist: false });
+    await expect(handle.ready()).rejects.toBeInstanceOf(ManifestError);
+    await handle.persist();
+
+    expect(Array.from(await readOpfsFile(root, 'test', 'manifest.json'))).toEqual(
+      Array.from(raw),
+    );
   });
 });
 

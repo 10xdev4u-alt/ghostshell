@@ -36,6 +36,11 @@
  * Persistence: the tree is written to OPFS as `manifest.json` plus one
  * `<qidPath>.bin` blob per file. When OPFS is unavailable the tree stays in
  * memory and every load/persist is skipped with a log message.
+ *
+ * A manifest that exists but cannot be parsed, or whose nodes are not valid,
+ * is a corruption signal: {@link loadTree} throws {@link ManifestError} and
+ * the handler refuses to persist, so a corrupt manifest is never overwritten
+ * with an empty tree. A missing manifest is not an error (fresh storage).
  */
 
 // ---------------------------------------------------------------------------
@@ -220,6 +225,14 @@ export class P9Error extends Error {
   constructor(public readonly errno: number) {
     super(`9p error ${errno}`);
     this.name = 'P9Error';
+  }
+}
+
+/** Thrown when a persisted manifest exists but cannot be trusted. */
+export class ManifestError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ManifestError';
   }
 }
 
@@ -663,11 +676,21 @@ async function readManifest(
 ): Promise<Manifest | undefined> {
   const bytes = await readOpfsFile(dir, 'manifest.json');
   if (!bytes) return undefined;
+  let parsed: unknown;
   try {
-    return JSON.parse(textDecoder.decode(bytes)) as Manifest;
-  } catch {
-    return undefined;
+    parsed = JSON.parse(textDecoder.decode(bytes));
+  } catch (err) {
+    throw new ManifestError(`manifest.json is not valid JSON (${String(err)})`);
   }
+  if (
+    !parsed ||
+    typeof parsed !== 'object' ||
+    (parsed as Manifest).version !== 1 ||
+    !(parsed as Manifest).root
+  ) {
+    throw new ManifestError('manifest.json has an unrecognized schema');
+  }
+  return parsed as Manifest;
 }
 
 /**
@@ -737,12 +760,24 @@ export async function loadTree(
   return rebuildNode(manifest.root, '/', dir);
 }
 
+/** Parse and validate a manifest node's `qidPath` (serialized as a string). */
+function parseQidPath(entry: ManifestNode, path: string): bigint {
+  const raw = entry.qidPath;
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw)) {
+    throw new ManifestError(`manifest node ${path} has an invalid qidPath`);
+  }
+  return BigInt(raw);
+}
+
 async function rebuildNode(
   entry: ManifestNode,
   parentPath: string,
   dir: FileSystemDirectoryHandle,
 ): Promise<P9Node> {
   const path = parentPath === '/' && entry.name === '/' ? '/' : joinPath(parentPath, entry.name);
+  if (entry.kind !== 'file' && entry.kind !== 'dir' && entry.kind !== 'symlink') {
+    throw new ManifestError(`manifest node ${path} has an invalid kind`);
+  }
   const node: P9Node = {
     path,
     kind: entry.kind,
@@ -757,7 +792,7 @@ async function rebuildNode(
     atime: entry.atime,
     mtime: entry.mtime,
     ctime: entry.ctime,
-    qidPath: BigInt(entry.qidPath),
+    qidPath: parseQidPath(entry, path),
     qidVersion: entry.qidVersion,
   };
   if (entry.symlink !== undefined) node.symlink = entry.symlink;
@@ -808,19 +843,18 @@ export function create9pHandler(deps: Fs9pDeps, options: Fs9pOptions = {}): Fs9p
     if (loaded) return Promise.resolve();
     if (!loadPromise) {
       loadPromise = (async () => {
-        try {
-          const persisted = await loadTree(deps, prefix);
-          if (persisted) {
-            root = persisted;
-            let max = 0n;
-            for (const node of walk(root)) if (node.qidPath > max) max = node.qidPath;
-            nextQidPath = max + 1n;
-          }
-        } catch (err) {
-          deps.onLog?.(`fs9p: load skipped (${String(err)})`);
-        } finally {
-          loaded = true;
+        // loadTree returns undefined when nothing is stored or OPFS is absent.
+        // It throws ManifestError when a stored manifest is corrupt; that must
+        // propagate. Falling back to an empty tree here would let the next
+        // persist overwrite the user's snapshot.
+        const persisted = await loadTree(deps, prefix);
+        if (persisted) {
+          root = persisted;
+          let max = 0n;
+          for (const node of walk(root)) if (node.qidPath > max) max = node.qidPath;
+          nextQidPath = max + 1n;
         }
+        loaded = true;
       })();
     }
     return loadPromise;
@@ -840,6 +874,8 @@ export function create9pHandler(deps: Fs9pDeps, options: Fs9pOptions = {}): Fs9p
     if (persisting) return persisting;
     persisting = (async () => {
       try {
+        // Never write the in-memory tree over a manifest that failed to load.
+        await ensureLoaded();
         await persistTree(root, deps, prefix, nextQidPath);
         dirty = false;
       } catch (err) {
@@ -1403,7 +1439,11 @@ export function create9pHandler(deps: Fs9pDeps, options: Fs9pOptions = {}): Fs9p
       w.u32(msize);
       w.string(P9_VERSION);
       reply(buildReply(request.type + 1, request.tag, w.payload()));
-      if (!loaded && !loadPromise) void ensureLoaded();
+      if (!loaded && !loadPromise) {
+        void ensureLoaded().catch((err) =>
+          deps.onLog?.(`fs9p: load failed (${String(err)})`),
+        );
+      }
       return;
     }
 
