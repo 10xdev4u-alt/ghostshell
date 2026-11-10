@@ -1188,11 +1188,15 @@ export function create9pHandler(deps: Fs9pDeps, options: Fs9pOptions = {}): Fs9p
         const mode = r.u32();
         const uid = r.u32();
         const gid = r.u32();
+        // 9P2000.L field order: size, atime_sec, atime_nsec, mtime_sec,
+        // mtime_nsec. v86's own decoder reads "wwwwwddddd" (Tsetattr,
+        // libv86-debug.mjs). Reading mtime_sec as atime_nsec corrupts atime
+        // and never sets mtime.
         const size = r.u64();
         const atimeSec = r.u64();
+        r.u64(); // atime_nsec: the tree stores whole seconds
         const mtimeSec = r.u64();
-        r.u64(); // atime nsec
-        r.u64(); // mtime nsec
+        r.u64(); // mtime_nsec
         const node = requireFid(fid).node;
         if (valid & SETATTR_MODE) node.mode = mode;
         if (valid & SETATTR_UID) node.uid = uid;
@@ -1208,9 +1212,12 @@ export function create9pHandler(deps: Fs9pDeps, options: Fs9pOptions = {}): Fs9p
           }
           node.size = nextSize;
         }
-        if (valid & SETATTR_ATIME) node.atime = Number(atimeSec);
-        if (valid & SETATTR_MTIME) node.mtime = Number(mtimeSec);
-        if (valid & SETATTR_CTIME) node.ctime = Number(mtimeSec);
+        // ATIME/MTIME/CTIME without the _SET flag mean "now" (v86 behavior);
+        // the *_SET flags carry the wire values.
+        const now = nowSeconds();
+        if (valid & SETATTR_ATIME) node.atime = now;
+        if (valid & SETATTR_MTIME) node.mtime = now;
+        if (valid & SETATTR_CTIME) node.ctime = now;
         if (valid & SETATTR_ATIME_SET) node.atime = Number(atimeSec);
         if (valid & SETATTR_MTIME_SET) node.mtime = Number(mtimeSec);
         markDirty();

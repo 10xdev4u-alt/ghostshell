@@ -249,6 +249,29 @@ function attachPayload(fid: number): Uint8Array {
   return new FrameWriter().u32(fid).u32(0xffffffff).string('root').string('/').u32(0).build();
 }
 
+/** Build a Tsetattr payload in the 9P2000.L wire order. */
+function setattrPayload(
+  valid: number,
+  size: bigint,
+  atimeSec: bigint,
+  atimeNsec: bigint,
+  mtimeSec: bigint,
+  mtimeNsec: bigint,
+): Uint8Array {
+  return new FrameWriter()
+    .u32(1) // fid
+    .u32(valid)
+    .u32(0o100644) // mode
+    .u32(0) // uid
+    .u32(0) // gid
+    .u64(size)
+    .u64(atimeSec)
+    .u64(atimeNsec)
+    .u64(mtimeSec)
+    .u64(mtimeNsec)
+    .build();
+}
+
 async function writeOpfsFile(
   root: FakeDirHandle,
   prefix: string,
@@ -454,6 +477,51 @@ describe('fs9p handler', () => {
     expect(g.u32() & 0o170000).toBe(0o100000); // S_IFREG
     expect(g.u32()).toBe(0); // uid
     expect(g.u32()).toBe(0); // gid
+
+    await handle.flush();
+  });
+
+  it('reads Tsetattr fields in the 9P2000.L wire order', async () => {
+    const { deps } = makeDeps();
+    const handle = create9pHandler(deps, { autoPersist: false });
+    await request(handle, 100, 1, new FrameWriter().u32(8192).string('9P2000.L').build());
+    await request(handle, 104, 2, attachPayload(1));
+    await request(
+      handle,
+      14,
+      3,
+      new FrameWriter().u32(1).string('f.txt').u32(0x2).u32(0o100644).u32(0).build(),
+    );
+    const node = findNode(handle.tree, '/f.txt')!;
+    expect(node).toBeDefined();
+
+    // valid = MTIME | MTIME_SET: the mtime seconds are the fourth 8-byte field.
+    const mtimeReply = await request(
+      handle,
+      26,
+      4,
+      setattrPayload(0x120, 0n, 111n, 222n, 333n, 444n),
+    );
+    expect(mtimeReply.type).toBe(27);
+    expect(node.mtime).toBe(333);
+    expect(node.atime).not.toBe(111);
+
+    // valid = ATIME | ATIME_SET: the atime seconds are the second 8-byte field.
+    const atimeReply = await request(
+      handle,
+      26,
+      5,
+      setattrPayload(0x90, 0n, 555n, 666n, 777n, 888n),
+    );
+    expect(atimeReply.type).toBe(27);
+    expect(node.atime).toBe(555);
+    expect(node.mtime).toBe(333);
+
+    // valid = MTIME without MTIME_SET means "now" and must not touch atime.
+    const before = Math.floor(Date.now() / 1000);
+    await request(handle, 26, 6, setattrPayload(0x20, 0n, 111n, 0n, 0n, 0n));
+    expect(node.mtime).toBeGreaterThanOrEqual(before);
+    expect(node.atime).toBe(555);
 
     await handle.flush();
   });
