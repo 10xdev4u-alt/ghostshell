@@ -180,6 +180,24 @@ describe('TransformersEngine', () => {
     expect(options['dtype']).toBe('q4f16');
   });
 
+  it('downgrades a WASM-only model to wasm instead of building a webgpu pipeline', async () => {
+    pipelineMock.mockResolvedValue(makeGenerator());
+    const engine = new TransformersEngine({ device: 'webgpu', cache: 'browser' });
+    await engine.load(getModel('qwen2.5-1.5b'), () => {});
+
+    expect(engine.kind).toBe('wasm');
+    expect(pipelineMock.mock.calls[0]![2]['device']).toBe('wasm');
+  });
+
+  it('keeps webgpu when the model declares it', async () => {
+    pipelineMock.mockResolvedValue(makeGenerator());
+    const engine = new TransformersEngine({ device: 'webgpu', cache: 'browser' });
+    await engine.load({ ...getModel('qwen2.5-1.5b'), backend: 'webgpu' }, () => {});
+
+    expect(engine.kind).toBe('webgpu');
+    expect(pipelineMock.mock.calls[0]![2]['device']).toBe('webgpu');
+  });
+
   it('streams tokens and returns the generated text', async () => {
     pipelineMock.mockResolvedValue(
       makeGenerator((options) => {
@@ -406,6 +424,12 @@ describe('createEngine', () => {
     vi.stubGlobal('navigator', {});
     const engine = createEngine('transformers');
     expect(engine.id).toBe('transformers');
+    expect(engine.kind).toBe('wasm');
+  });
+
+  it('defaults to wasm for a WASM-only model on a webgpu host', () => {
+    vi.stubGlobal('navigator', { gpu: {} });
+    const engine = createEngine('transformers', { spec: getModel('qwen2.5-1.5b') });
     expect(engine.kind).toBe('wasm');
   });
 

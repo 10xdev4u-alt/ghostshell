@@ -1,5 +1,6 @@
 import type { BackendKind, LLMEngine, ModelSpec } from '@/types/index.js';
 import { TransformersEngine, type TransformersEngineOptions } from './transformers.js';
+import { supportsBackend } from './models.js';
 import { WebLLMEngine } from './webllm.js';
 
 /**
@@ -21,12 +22,23 @@ export interface CreateEngineOptions extends TransformersEngineOptions {
    * straight to the ONNX runtime device; `webllm` always runs on WebGPU.
    */
   device?: BackendKind;
+  /**
+   * Model the engine will load. Used to pick a compatible default device;
+   * `TransformersEngine.load` re-validates and downgrades to WASM if the model
+   * does not support the requested backend.
+   */
+  spec?: ModelSpec;
 }
 
 export function createEngine(kind: EngineKind, options: CreateEngineOptions = {}): LLMEngine {
   switch (kind) {
-    case 'transformers':
-      return new TransformersEngine({ ...options, device: options.device ?? detectBackend() });
+    case 'transformers': {
+      const { spec, ...engineOptions } = options;
+      return new TransformersEngine({
+        ...engineOptions,
+        device: options.device ?? detectBackendFor(spec),
+      });
+    }
     case 'webllm':
       // WebLLM is a v1.0 fast path; the class exists but is not implemented yet.
       return new WebLLMEngine();
@@ -46,13 +58,9 @@ export function detectBackend(): BackendKind {
   return 'wasm';
 }
 
-/**
- * True when the model can run on the given backend.
- *
- * WASM is the universal fallback (every ONNX model loads there). WebGPU is
- * only selected for models whose registry entry declares it, so a model that
- * was only validated on WASM is not silently pushed onto a GPU.
- */
-export function supportsBackend(spec: ModelSpec, backend: BackendKind): boolean {
-  return backend === 'wasm' || spec.backend === backend;
+/** Pick the default device for a model, falling back to WASM when unsupported. */
+function detectBackendFor(spec: ModelSpec | undefined): BackendKind {
+  return spec && !supportsBackend(spec, 'webgpu') ? 'wasm' : detectBackend();
 }
+
+export { supportsBackend };

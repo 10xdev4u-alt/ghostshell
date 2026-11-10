@@ -1,5 +1,5 @@
 import type { DataType } from '@huggingface/transformers';
-import type { ModelCard, ModelSpec } from '@/types/index.js';
+import type { BackendKind, ModelCard, ModelSpec } from '@/types/index.js';
 import { MODELS } from '@/config.js';
 import type { EngineKind } from './engine.js';
 
@@ -93,6 +93,17 @@ function onnxTarget(spec: ModelSpec): ONNXModelTarget {
     );
   }
   return target;
+}
+
+/**
+ * True when the model can run on the given backend.
+ *
+ * WASM is the universal fallback (every ONNX model loads there). WebGPU is
+ * only selected for models whose registry entry declares it, so a model that
+ * was only validated on WASM is not silently pushed onto a GPU.
+ */
+export function supportsBackend(spec: ModelSpec, backend: BackendKind): boolean {
+  return backend === 'wasm' || spec.backend === backend;
 }
 
 /**

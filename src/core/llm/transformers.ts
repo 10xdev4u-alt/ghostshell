@@ -14,7 +14,7 @@ import type {
   Message,
   ModelSpec,
 } from '@/types/index.js';
-import { resolveModelDtype, resolveModelRepo } from './models.js';
+import { resolveModelDtype, resolveModelRepo, supportsBackend } from './models.js';
 
 /**
  * Transformers.js engine (default for v0.1).
@@ -317,7 +317,7 @@ function toLoadProgress(info: ProgressInfo, spec: ModelSpec): LoadProgress {
 
 export class TransformersEngine implements LLMEngine {
   readonly id = 'transformers';
-  readonly kind: BackendKind;
+  private deviceKind: BackendKind;
 
   private readonly dtype: DataType | undefined;
   private readonly cache: CacheBackend;
@@ -326,10 +326,15 @@ export class TransformersEngine implements LLMEngine {
   private loaded = false;
 
   constructor(options: TransformersEngineOptions = {}) {
-    this.kind = options.device ?? 'wasm';
+    this.deviceKind = options.device ?? 'wasm';
     this.dtype = options.dtype;
     this.cache = options.cache ?? 'indexeddb';
     this.revision = options.revision;
+  }
+
+  /** Device the loaded pipeline runs on. Downgraded to WASM for WASM-only models. */
+  get kind(): BackendKind {
+    return this.deviceKind;
   }
 
   isLoaded(): boolean {
@@ -338,6 +343,12 @@ export class TransformersEngine implements LLMEngine {
 
   async load(spec: ModelSpec, onProgress: (p: LoadProgress) => void): Promise<void> {
     this.configureCache();
+
+    // A model validated only on WASM must never build a WebGPU pipeline, even
+    // when the host (or `detectBackend`) asked for WebGPU.
+    if (!supportsBackend(spec, this.deviceKind)) {
+      this.deviceKind = 'wasm';
+    }
 
     const repo = resolveModelRepo(spec, 'transformers');
     const dtype = this.dtype ?? resolveModelDtype(spec);
