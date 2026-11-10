@@ -46,7 +46,9 @@ describe('index.html Content-Security-Policy', () => {
     const connectSrc = directive(csp, 'connect-src');
     for (const host of [
       'https://huggingface.co',
-      'https://cdn-lfs.huggingface.co',
+      // HF resolve URLs redirect to the Xet CDN (us.aws.cdn.hf.co, and
+      // other regional hosts), so the wildcard covers the CDN.
+      'https://*.hf.co',
       'https://cdn.jsdelivr.net',
       'https://copy.sh',
     ]) {

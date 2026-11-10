@@ -50,10 +50,13 @@ export class InMemoryEgressLog implements EgressLog {
  *    `<iframe src>`, `<source>`/`<video>`/`<audio>`/`<track>`, `<embed>`,
  *    `<object data>`, `<form action>`, and CSS `@import`/`url()`.
  *
- * The CSP in index.html is the second layer that blocks those vectors
- * (`connect-src 'none'`, `frame-src 'none'`, `worker-src 'none'`,
- * `object-src 'none'`, `form-action 'none'`). This interceptor remains the
- * audit log for the APIs it covers.
+ * Defense in depth, not the enforcement layer. In lockdown mode this
+ * interceptor is what actually blocks the calls it covers. The CSP in
+ * index.html is the second layer, but it cannot police every vector: a
+ * blob: worker's own network calls are outside connect-src's reach, and
+ * dynamic import() of a same-origin module is allowed by script-src 'self'
+ * and its fetches are not CSP-checked. This interceptor remains the audit
+ * log for the APIs it covers.
  */
 interface NetworkGlobals {
   fetch?: typeof fetch;
