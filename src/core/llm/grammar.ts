@@ -15,9 +15,13 @@
  *   - `buildToolCallSchema`   → a JSON Schema object (WebLLM JSON mode /
  *                               XGrammar, which accept schemas rather than GBNF).
  *
- * Both emit the same shape:
+ * Both emit the tool-call shape:
  *
  *   {"tool_calls": [{"name": "<tool>", "arguments": {…}}]}
+ *
+ * The GBNF root also admits a final answer (`<answer>…</answer>`), so a
+ * constrained model can finish a task without a tool call. The JSON Schema
+ * emits the tool-call shape only.
  *
  * That shape is exactly what `parseToolCalls` (src/core/agent/parser.ts)
  * accepts as its first strategy, so a grammar-constrained response needs no
@@ -123,8 +127,14 @@ export function buildToolCallGrammar(tools: GrammarTool[]): string {
 
   lines.push(`call ::= ${callAlternatives.join(' | ')}`);
   lines.push(
-    'root ::= "{" space "tool_calls" space ":" space "[" space call ("," space call)* "]" space "}" space',
+    'tool-calls ::= "{" space "tool_calls" space ":" space "[" space call ("," space call)* "]" space "}" space',
   );
+  // A final answer is plain text between <answer> tags. `answer-char` excludes
+  // `<` so the closing tag is never consumed as content, and excludes `</` so
+  // the first closing tag ends the answer.
+  lines.push('answer-char ::= [^<] | "<" [^/]');
+  lines.push('answer ::= "<answer>" answer-char* "</answer>" space');
+  lines.push('root ::= tool-calls | answer');
   lines.push(COMMON_RULES.trim());
 
   return lines.join('\n');

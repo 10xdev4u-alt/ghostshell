@@ -27,6 +27,12 @@ function referencedRules(grammar: string): string[] {
   return refs;
 }
 
+function ruleBody(grammar: string, rule: string): string | undefined {
+  const prefix = `${rule} ::=`;
+  const line = grammar.split('\n').find((candidate) => candidate.trim().startsWith(prefix));
+  return line?.trim().slice(prefix.length).trim();
+}
+
 describe('buildToolCallGrammar', () => {
   it('emits a GBNF grammar with a root rule', () => {
     const grammar = buildToolCallGrammar(tools);
@@ -85,6 +91,21 @@ describe('buildToolCallGrammar', () => {
     const grammar = buildToolCallGrammar(tools);
     const defined = definedRules(grammar);
     expect(defined.size).toBeGreaterThan(0);
+    for (const ref of referencedRules(grammar)) {
+      expect(defined.has(ref), `undefined rule: ${ref}`).toBe(true);
+    }
+  });
+
+  it('admits both a tool call and a final answer from the root rule', () => {
+    const grammar = buildToolCallGrammar(tools);
+
+    expect(ruleBody(grammar, 'root')).toBe('tool-calls | answer');
+    expect(ruleBody(grammar, 'tool-calls')).toContain('"tool_calls"');
+    expect(ruleBody(grammar, 'answer')).toBe('"<answer>" answer-char* "</answer>" space');
+    expect(ruleBody(grammar, 'answer-char')).toBe('[^<] | "<" [^/]');
+
+    // The final-answer branch must not reference an undefined rule.
+    const defined = definedRules(grammar);
     for (const ref of referencedRules(grammar)) {
       expect(defined.has(ref), `undefined rule: ${ref}`).toBe(true);
     }
