@@ -5,23 +5,261 @@
  * decoding forces the model to produce a syntactically valid tool-call object,
  * converting a probabilistic parse into a guaranteed one.
  *
- * Strategy:
- *   1. Build a GBNF/JSON grammar from the tool schemas.
- *   2. Pass it to the engine (`req.grammar`).
+ * Strategy (see docs/CREATIVE_INNOVATION.md §6.1):
+ *   1. Build a GBNF grammar from the tool schemas (`buildToolCallGrammar`).
+ *   2. Pass it to the engine (`GenerateRequest.grammar`).
  *   3. Parse with the grammar strategy first; fall back to Hermes/fenced.
  *
- * See docs/CREATIVE_INNOVATION.md §6.1.
+ * Two artifacts are produced:
+ *   - `buildToolCallGrammar`  → a GBNF string (llama.cpp / GGUF tooling).
+ *   - `buildToolCallSchema`   → a JSON Schema object (WebLLM JSON mode /
+ *                               XGrammar, which accept schemas rather than GBNF).
+ *
+ * Both emit the tool-call shape:
+ *
+ *   {"tool_calls": [{"name": "<tool>", "arguments": {…}}]}
+ *
+ * The GBNF root also admits a final answer (`<answer>…</answer>`), so a
+ * constrained model can finish a task without a tool call. The JSON Schema
+ * emits the tool-call shape only.
+ *
+ * That shape is exactly what `parseToolCalls` (src/core/agent/parser.ts)
+ * accepts as its first strategy, so a grammar-constrained response needs no
+ * special handling downstream.
+ *
+ * The grammar builder is pure: it never touches a model, tokenizer, or the
+ * network, which makes it trivially unit-testable.
  */
 
-export function buildToolCallGrammar(tools: { name: string; parameters: unknown }[]): string {
-  // TODO: emit a GBNF grammar that matches:
-  //   {"tool_calls": [{"name": <one of tool names>, "arguments": <object>}]}
-  void tools;
-  throw new Error('buildToolCallGrammar not implemented (issue #18)');
+import type { JSONSchemaProperty } from '@/types/index.js';
+
+/** Minimal tool description accepted by the grammar builders. */
+export interface GrammarTool {
+  name: string;
+  parameters: unknown;
 }
 
-export function buildToolCallSchema(tools: { name: string; parameters: unknown }[]): unknown {
-  // TODO: emit a JSON Schema for the tool-call object.
-  void tools;
-  throw new Error('buildToolCallSchema not implemented (issue #18)');
+interface ToolSchema {
+  properties?: Record<string, JSONSchemaProperty>;
+  required?: string[];
+}
+
+/**
+ * Shared GBNF rules for JSON. Kept in `String.raw` so the escape sequences
+ * (`\x7F`, `\n`, `\t`, `\"`, `\\`) survive verbatim into the emitted grammar.
+ */
+const COMMON_RULES = String.raw`
+char ::= [^"\\\x7F\x00-\x1F] | [\\] (["\\bfnrt] | "u" [0-9a-fA-F]{4})
+string ::= "\"" char* "\"" space
+number ::= ("-"? ([0-9] | [1-9] [0-9]{0,15})) ("." [0-9]+)? ([eE] [-+]? [0-9] [1-9]{0,15})? space
+boolean ::= ("true" | "false") space
+null ::= "null" space
+array ::= "[" space (value ("," space value)*)? "]" space
+object ::= "{" space (string ":" space value ("," space string ":" space value)*)? "}" space
+value ::= object | array | string | number | boolean | null
+additional-kv ::= string ":" space value
+space ::= | " " | "\n" [ \t]{0,20}
+`;
+
+/**
+ * Build a GBNF grammar for tool calls.
+ *
+ * The generated grammar:
+ *   - enumerates every tool name, so the model cannot invent one;
+ *   - emits `arguments` as a JSON object;
+ *   - types each known property (string / number / boolean / array / object)
+ *     and inlines `enum` values as literals;
+ *   - requires the schema's `required` properties (in order) while still
+ *     allowing optional and additional properties after them.
+ *
+ * GBNF was chosen because the model registry stores GGUF repos, llama.cpp is
+ * the reference GBNF runtime, and the format is a plain string that fits
+ * `GenerateRequest.grammar` without engine-specific adapters.
+ */
+export function buildToolCallGrammar(tools: GrammarTool[]): string {
+  if (!Array.isArray(tools) || tools.length === 0) {
+    throw new Error('buildToolCallGrammar: at least one tool is required');
+  }
+
+  const lines: string[] = [];
+  const callAlternatives: string[] = [];
+  const toolSlugs = new SlugAllocator();
+
+  for (const tool of tools) {
+    const toolRule = toolSlugs.slug(tool.name);
+    const schema = parseSchema(tool.parameters);
+    const properties = Object.keys(schema.properties ?? {});
+    const required = new Set(schema.required ?? []);
+    const propertySlugs = new SlugAllocator();
+
+    // One key/value rule per known property.
+    for (const property of properties) {
+      const definition = schema.properties?.[property];
+      if (!definition) continue;
+      lines.push(
+        `args-${toolRule}-${propertySlugs.slug(property)}-kv ::= ${gbnfLiteral(property)} space ":" space ${valueRule(definition)}`,
+      );
+    }
+
+    // A key/value alternative for every known property plus a generic escape
+    // hatch, so the model can still emit properties added after this grammar
+    // was generated.
+    const kvAlternatives = [
+      ...properties.map((property) => `args-${toolRule}-${propertySlugs.slug(property)}-kv`),
+      'additional-kv',
+    ];
+    lines.push(`args-${toolRule}-kv ::= ${kvAlternatives.join(' | ')}`);
+
+    // Required properties come first and are mandatory; everything after them
+    // is optional. This mirrors llama.cpp's JSON-schema converter.
+    const requiredSequence = properties
+      .filter((property) => required.has(property))
+      .map((property) => `args-${toolRule}-${propertySlugs.slug(property)}-kv`)
+      .join(' "," space ');
+    const objectBody = requiredSequence
+      ? `${requiredSequence} ("," space (args-${toolRule}-kv ("," space args-${toolRule}-kv)*))?`
+      : `(args-${toolRule}-kv ("," space args-${toolRule}-kv)*)?`;
+    lines.push(`args-${toolRule} ::= "{" space ${objectBody} "}" space`);
+
+    lines.push(
+      `call-${toolRule} ::= "{" space "name" space ":" space ${gbnfLiteral(tool.name)} space "," space "arguments" space ":" space args-${toolRule} space "}" space`,
+    );
+    callAlternatives.push(`call-${toolRule}`);
+  }
+
+  lines.push(`call ::= ${callAlternatives.join(' | ')}`);
+  lines.push(
+    'tool-calls ::= "{" space "tool_calls" space ":" space "[" space call ("," space call)* "]" space "}" space',
+  );
+  // A final answer is plain text between <answer> tags. `answer-char` excludes
+  // `<` so the closing tag is never consumed as content, and excludes `</` so
+  // the first closing tag ends the answer.
+  lines.push('answer-char ::= [^<] | "<" [^/]');
+  lines.push('answer ::= "<answer>" answer-char* "</answer>" space');
+  lines.push('root ::= tool-calls | answer');
+  lines.push(COMMON_RULES.trim());
+
+  return lines.join('\n');
+}
+
+/**
+ * Build a JSON Schema for the same tool-call shape.
+ *
+ * Engines that support JSON-mode structured generation (WebLLM, XGrammar)
+ * take a schema instead of a GBNF string. `oneOf` ties each tool name to its
+ * own argument schema, which is the closest JSON Schema equivalent of the
+ * GBNF dispatch in `buildToolCallGrammar`.
+ */
+export function buildToolCallSchema(tools: GrammarTool[]): unknown {
+  if (!Array.isArray(tools) || tools.length === 0) {
+    throw new Error('buildToolCallSchema: at least one tool is required');
+  }
+
+  return {
+    type: 'object',
+    properties: {
+      tool_calls: {
+        type: 'array',
+        items: {
+          oneOf: tools.map((tool) => ({
+            type: 'object',
+            properties: {
+              name: { type: 'string', enum: [tool.name] },
+              arguments: tool.parameters,
+            },
+            required: ['name', 'arguments'],
+            additionalProperties: false,
+          })),
+        },
+      },
+    },
+    required: ['tool_calls'],
+    additionalProperties: false,
+  };
+}
+
+function parseSchema(parameters: unknown): ToolSchema {
+  if (!parameters || typeof parameters !== 'object') return {};
+  const candidate = parameters as ToolSchema;
+  if (!candidate.properties || typeof candidate.properties !== 'object') return {};
+  return candidate;
+}
+
+function valueRule(definition: JSONSchemaProperty): string {
+  if (definition.enum && definition.enum.length > 0) {
+    return `(${definition.enum.map((value) => gbnfLiteral(value)).join(' | ')})`;
+  }
+  switch (definition.type) {
+    case 'string':
+      return 'string';
+    case 'number':
+      return 'number';
+    case 'boolean':
+      return 'boolean';
+    case 'array':
+      return 'array';
+    case 'object':
+      return 'object';
+    default:
+      return 'value';
+  }
+}
+
+/** GBNF rule names are dashed lowercase words. */
+function slugify(value: string): string {
+  const slug = value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return slug || 'tool';
+}
+
+/** Short FNV-1a hash used to disambiguate colliding rule slugs. */
+function slugHash(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+/**
+ * Allocate GBNF rule-name fragments.
+ *
+ * Raw values are memoized, so a property referenced from several rules keeps
+ * one name. Two different values can slug alike (`read-file`, `read_file`);
+ * the second gets a hash suffix instead of emitting a duplicate rule, which
+ * llama.cpp rejects as a parse error.
+ */
+class SlugAllocator {
+  private readonly used = new Set<string>();
+  private readonly memo = new Map<string, string>();
+
+  slug(value: string): string {
+    const memoized = this.memo.get(value);
+    if (memoized !== undefined) return memoized;
+
+    const base = slugify(value);
+    const slug = this.used.has(base) ? this.unique(base, value) : base;
+    this.used.add(slug);
+    this.memo.set(value, slug);
+    return slug;
+  }
+
+  private unique(base: string, value: string): string {
+    const hash = slugHash(value);
+    let slug = `${base}-${hash}`;
+    let suffix = 1;
+    while (this.used.has(slug)) {
+      slug = `${base}-${hash}-${suffix}`;
+      suffix += 1;
+    }
+    return slug;
+  }
+}
+
+/** Quote a string as a GBNF terminal. */
+function gbnfLiteral(value: string): string {
+  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
