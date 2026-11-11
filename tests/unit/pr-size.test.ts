@@ -1,3 +1,7 @@
+import { execFileSync, spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { delimiter, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
   buildReport,
@@ -12,7 +16,7 @@ import {
 const sampleJson = JSON.stringify({
   additions: 250,
   deletions: 100,
-  merged: false,
+  state: 'OPEN',
   files: [
     { path: 'src/big.ts', additions: 200, deletions: 50 },
     { path: 'src/small.ts', additions: 50, deletions: 50 },
@@ -34,9 +38,22 @@ describe('pr-size', () => {
       ]);
     });
 
-    it('defaults merged to undefined when gh omits it', () => {
-      const parsed = parsePrViewJson('{"additions":1,"deletions":2,"files":[]}');
-      expect(parsed.merged).toBeUndefined();
+    it('derives merged from state for OPEN, MERGED, and CLOSED', () => {
+      const base = { additions: 1, deletions: 2, files: [] };
+      expect(parsePrViewJson(JSON.stringify({ ...base, state: 'OPEN' })).merged).toBe(false);
+      expect(parsePrViewJson(JSON.stringify({ ...base, state: 'MERGED' })).merged).toBe(true);
+      expect(parsePrViewJson(JSON.stringify({ ...base, state: 'CLOSED' })).merged).toBe(false);
+    });
+
+    it('rejects an unknown state', () => {
+      const raw = JSON.stringify({ additions: 1, deletions: 2, files: [], state: 'DRAFT' });
+      expect(() => parsePrViewJson(raw)).toThrow('invalid state');
+    });
+
+    it('rejects a missing state', () => {
+      expect(() => parsePrViewJson('{"additions":1,"deletions":2,"files":[]}')).toThrow(
+        'invalid state',
+      );
     });
 
     it('rejects invalid JSON', () => {
@@ -44,15 +61,16 @@ describe('pr-size', () => {
     });
 
     it('rejects a missing files array', () => {
-      expect(() => parsePrViewJson('{"additions":1,"deletions":2}')).toThrow(
-        'missing the files array',
-      );
+      expect(() =>
+        parsePrViewJson('{"additions":1,"deletions":2,"state":"OPEN"}'),
+      ).toThrow('missing the files array');
     });
 
     it('rejects negative counts', () => {
       const raw = JSON.stringify({
         additions: -1,
         deletions: 0,
+        state: 'OPEN',
         files: [{ path: 'a.ts', additions: 0, deletions: 0 }],
       });
       expect(() => parsePrViewJson(raw)).toThrow('invalid additions');
@@ -186,4 +204,54 @@ describe('pr-size', () => {
       expect(text).not.toContain('Per-file breakdown');
     });
   });
+});
+
+function canRunGh(): boolean {
+  try {
+    execFileSync('gh', ['auth', 'status'], { stdio: 'ignore', timeout: 10_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function findBun(): string | null {
+  const bunVersion = (process.versions as unknown as Record<string, unknown>).bun;
+  if (typeof bunVersion === 'string') return process.execPath;
+  for (const dir of (process.env.PATH ?? '').split(delimiter)) {
+    if (dir === '') continue;
+    const candidate = join(dir, 'bun');
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+describe('pr-size real gh regression', () => {
+  const scriptPath = fileURLToPath(new URL('../../scripts/pr-size.ts', import.meta.url));
+  const ghReady = canRunGh();
+  const bunPath = findBun();
+
+  if (!ghReady || bunPath === null) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      'Skipping the real-gh pr-size regression test: ' +
+        `${ghReady ? '' : 'gh is missing or not authenticated (`gh auth status` failed). '}` +
+        `${bunPath === null ? 'bun was not found on PATH.' : ''}`,
+    );
+  }
+
+  it.skipIf(!ghReady || bunPath === null)(
+    'runs against PR #107 and exits 0',
+    () => {
+      const result = spawnSync(
+        bunPath ?? 'bun',
+        ['run', scriptPath, '--pr', '107', '--limit', '100000'],
+        { encoding: 'utf8', timeout: 30_000 },
+      );
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('skipped');
+      expect(result.stderr).not.toContain('Unknown JSON field');
+    },
+    60_000,
+  );
 });
