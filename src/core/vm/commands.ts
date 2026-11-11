@@ -80,58 +80,97 @@ export function doneSentinelPattern(id: string): RegExp {
  * Split a raw serial stream at the done sentinel. Returns the body between
  * the last begin marker and the done marker, plus the parsed exit code.
  * Returns null when the done sentinel has not arrived yet.
+ *
+ * When `wrapped` is given, lines the tty echoed from it are dropped. The echo
+ * is identified by the prompt sentinel that precedes it: the guest prints the
+ * prompt before reading each line we send, while command output is not
+ * prompt-prefixed. This keeps output lines that merely equal the command text.
  */
 export function extractSentinelOutput(
   raw: string,
   id: string,
   pattern: RegExp = doneSentinelPattern(id),
+  wrapped?: string,
 ): { body: string; exitCode: number } | null {
   const done = pattern.exec(raw);
   if (!done || done.index === undefined) return null;
   const before = raw.slice(0, done.index);
   const begin = `__GS_BEGIN_${id}__`;
   const idx = before.lastIndexOf(begin);
-  const prompt = promptSentinel(id);
   const rawBody = idx === -1 ? before : before.slice(idx + begin.length);
-  const body = rawBody.split(prompt).join('');
+  const body = stripPromptsAndEchoedLines(
+    rawBody,
+    promptSentinel(id),
+    wrapped === undefined ? undefined : echoedLineSet(wrapped),
+  );
   return { body, exitCode: Number(done[1]) };
+}
+
+/**
+ * The non-empty lines of the echoed wrapper.
+ *
+ * The tty echoes every line we send. Sentinel extraction cuts the body at the
+ * marker's *output*, so the echoed command and done lines survive inside it,
+ * interleaved with prompts.
+ */
+function echoedLineSet(wrapped: string): Set<string> {
+  return new Set(
+    wrapped
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0),
+  );
+}
+
+/**
+ * Strip prompt sentinels from a body, dropping lines echoed from the wrapper.
+ *
+ * A line echoed by the tty starts with the prompt sentinel; command output
+ * does not. Only prompt-prefixed lines that match a wrapper line are dropped,
+ * so output that happens to equal the command text is preserved.
+ */
+function stripPromptsAndEchoedLines(
+  body: string,
+  prompt: string,
+  echoed?: Set<string>,
+): string {
+  return body
+    .split('\n')
+    .map((line) => {
+      let rest = line;
+      let isEcho = false;
+      if (rest.startsWith(prompt)) {
+        rest = rest.slice(prompt.length);
+        isEcho = echoed !== undefined && echoed.has(rest.trim());
+      }
+      return isEcho ? null : rest.split(prompt).join('');
+    })
+    .filter((line): line is string => line !== null)
+    .join('\n');
 }
 
 /**
  * Clean a partial serial stream from a timed-out command.
  *
  * Mirrors `extractSentinelOutput` without requiring the done sentinel: drops
- * everything up to the last begin marker and strips prompt sentinels. The
- * tty echoes the wrapper with prompt sentinels interleaved between its lines,
- * so the echoed wrapper is removed line-by-line instead of by a contiguous
- * match (which is what `cleanOutput`'s `echoed` argument does).
+ * everything up to the last begin marker, strips prompt sentinels, and
+ * removes the echoed wrapper lines.
  */
 export function stripSentinels(raw: string, id: string, wrapped?: string): string {
   const begin = `__GS_BEGIN_${id}__`;
   const idx = raw.lastIndexOf(begin);
-  let body = idx === -1 ? raw : raw.slice(idx + begin.length);
-  body = body.split(promptSentinel(id)).join('');
-  if (wrapped === undefined) return body;
-  const echoed = new Set(
-    wrapped
-      .split('\n')
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0),
+  const body = idx === -1 ? raw : raw.slice(idx + begin.length);
+  return stripPromptsAndEchoedLines(
+    body,
+    promptSentinel(id),
+    wrapped === undefined ? undefined : echoedLineSet(wrapped),
   );
-  return body
-    .split('\n')
-    .filter((line) => !echoed.has(line.trim()))
-    .join('\n');
 }
 
 /** Strip terminal escape sequences and normalize line endings. */
-export function cleanOutput(raw: string, echoed?: string): string {
+export function cleanOutput(raw: string): string {
   let out = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   out = stripAnsi(out);
-  if (echoed !== undefined) {
-    const idx = out.indexOf(echoed);
-    if (idx !== -1) out = out.slice(0, idx) + out.slice(idx + echoed.length);
-  }
   out = out
     .split('\n')
     .filter((line) => !SENTINEL_LINE.test(line.trim()))
@@ -142,7 +181,7 @@ export function cleanOutput(raw: string, echoed?: string): string {
 /** Remove ANSI CSI and OSC escape sequences. */
 export function stripAnsi(text: string): string {
   return text
-    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '')
     .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, '');
 }
 
@@ -190,7 +229,7 @@ export function createCommandRunner(
         if (grace !== undefined) clearTimeout(grace);
         unsubscribe();
         resolve({
-          stdout: cleanOutput(body, wrapped),
+          stdout: cleanOutput(body),
           stderr: '',
           exitCode,
           durationMs: Date.now() - started,
@@ -220,7 +259,7 @@ export function createCommandRunner(
       transport.send(wrapped);
 
       function bodyBeforeSentinel(): string {
-        const found = extractSentinelOutput(output, id, donePattern);
+        const found = extractSentinelOutput(output, id, donePattern, wrapped);
         return found ? found.body : stripSentinels(output, id, wrapped);
       }
     });
