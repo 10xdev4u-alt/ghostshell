@@ -8,6 +8,7 @@ import { createToolRegistry, AgentLoop, type AgentStep } from '@/core/agent/loop
 import { builtinTools } from '@/core/agent/tools.js';
 import { buildSystemPrompt } from '@/core/agent/prompts.js';
 import { createEngine } from '@/core/llm/engine.js';
+import { ProgressReportingEngine } from '@/core/llm/reporting.js';
 import { ATTESTATION_CONFIG, DEFAULT_AGENT_CONFIG, FLAGS } from '@/config.js';
 import { ALPINE_BOOT, getImage } from '@/core/vm/image.js';
 import { buildNetDevice } from '@/core/vm/network.js';
@@ -18,6 +19,7 @@ import { createTwinView } from '@/ui/twinview.js';
 import { createFileTree } from '@/ui/filetree.js';
 import { computeDiff, createDiffView, type DiffEntry } from '@/ui/diff.js';
 import { createArtifactPanel } from '@/ui/artifact.js';
+import { createModelProgress } from '@/ui/progress.js';
 import { createSerialFilter, type SerialFilter } from '@/ui/serial.js';
 import type { ToolLineRange } from '@/ui/lineRange.js';
 import {
@@ -91,8 +93,10 @@ export class App {
   private diffView: ReturnType<typeof createDiffView> | null = null;
   private artifact: ReturnType<typeof createArtifactPanel> | null = null;
   private settings: ReturnType<typeof createSettings> | null = null;
+  private modelProgress: ReturnType<typeof createModelProgress> | null = null;
   private engine: LLMEngine | null = null;
   private engineLoad: Promise<LLMEngine> | null = null;
+  private engineLoadController: AbortController | null = null;
   private loadedModelId: string | null = null;
   private conversation: Conversation | null = null;
   private runController: AbortController | null = null;
@@ -132,6 +136,13 @@ export class App {
     this.artifact = createArtifactPanel(document.getElementById('gs-artifact')!);
     this.settings = createSettings({ config, db: this.db });
     this.settings.onChange((next) => this.applyConfigChange(next));
+
+    const progressMount = document.getElementById('gs-model-progress');
+    if (progressMount) {
+      this.modelProgress = createModelProgress(progressMount);
+      this.modelProgress.onCancel(() => this.cancelModelWork());
+    }
+    this.bus.on('llm:progress', (progress) => this.modelProgress?.update(progress));
 
     if (FLAGS.privacyAttestation) {
       const privacyMount = document.getElementById('gs-privacy-report');
@@ -239,6 +250,16 @@ export class App {
       const controller = new AbortController();
       this.runController = controller;
 
+      // Load progress is hidden by `ensureEngine`; generation progress is
+      // driven by the engine's `generating` events.
+      this.modelProgress?.show({
+        phase: 'generating',
+        loaded: 0,
+        total: 0,
+        percent: null,
+        message: 'Generating…',
+      });
+
       const result = await loop.run(
         conversation,
         {
@@ -251,7 +272,6 @@ export class App {
         (step) => this.handleStep(step, config),
         controller.signal,
       );
-      this.runController = null;
 
       conversation.messages = result.messages;
       conversation.updatedAt = Date.now();
@@ -259,15 +279,25 @@ export class App {
 
       const after = await snapshotWorkspace(this.filteredVM, WORKSPACE_ROOT);
       this.showDiff(before, after);
-      this.chat?.setWorking(false);
     } catch (err) {
+      if (isAbortError(err)) {
+        this.chat?.append({
+          id: uuid(),
+          role: 'assistant',
+          content: 'Canceled.',
+          timestamp: Date.now(),
+        });
+      } else {
+        this.chat?.append({
+          id: uuid(),
+          role: 'assistant',
+          content: `Something went wrong: ${errorMessage(err)}`,
+          timestamp: Date.now(),
+        });
+      }
+    } finally {
       this.runController = null;
-      this.chat?.append({
-        id: uuid(),
-        role: 'assistant',
-        content: `Something went wrong: ${errorMessage(err)}`,
-        timestamp: Date.now(),
-      });
+      this.modelProgress?.hide();
       this.chat?.setWorking(false);
     }
   }
@@ -366,23 +396,39 @@ export class App {
     }
 
     const spec = getModel(config.modelId);
-    const engine = createEngine('transformers', { spec });
+    const engine = new ProgressReportingEngine(
+      createEngine('transformers', { spec }),
+      (progress) => {
+        this.bus.emit('llm:progress', progress);
+      },
+    );
     this.engine = engine;
     this.loadedModelId = spec.id;
     this.updateModelBadge();
 
+    const controller = new AbortController();
+    this.engineLoadController = controller;
+    // `load` emits its own initial progress event synchronously.
+    this.modelProgress?.show();
+
     this.engineLoad = engine
-      .load(spec, (progress) => {
-        this.bus.emit('llm:progress', progress);
-        this.updateModelBadge();
-      })
+      .load(
+        spec,
+        (progress) => {
+          this.bus.emit('llm:progress', progress);
+          this.updateModelBadge();
+        },
+        controller.signal,
+      )
       .then(
         () => {
           // A settings change may have superseded this load.
           if (this.engine !== engine) return engine;
           this.engineLoad = null;
+          this.engineLoadController = null;
           this.bus.emit('llm:loaded', undefined);
           this.updateModelBadge();
+          this.modelProgress?.hide();
           return engine;
         },
         (err: unknown) => {
@@ -392,11 +438,20 @@ export class App {
             this.engineLoad = null;
             this.updateModelBadge();
           }
+          if (this.engineLoadController === controller) this.engineLoadController = null;
+          this.modelProgress?.hide();
           throw err;
         },
       );
 
     return this.engineLoad;
+  }
+
+  /** Cancel an in-flight model load or agent run. */
+  private cancelModelWork(): void {
+    this.engineLoadController?.abort();
+    this.runController?.abort();
+    this.modelProgress?.hide();
   }
 
   private createLoop(config: AgentConfig): AgentLoop {
@@ -479,6 +534,7 @@ export class App {
   dispose(): void {
     this.restoreEgress?.();
     this.runController?.abort();
+    this.engineLoadController?.abort();
     this.twinView?.detach();
     this.chat?.dispose();
     this.terminal?.dispose();
@@ -486,6 +542,7 @@ export class App {
     this.diffView?.dispose();
     this.artifact?.dispose();
     this.settings?.dispose();
+    this.modelProgress?.dispose();
     void this.db.close();
   }
 }
@@ -600,4 +657,11 @@ async function snapshotWorkspace(vm: VMHandle, root: string): Promise<Map<string
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** True when an error is the standard cancellation signal. */
+function isAbortError(err: unknown): boolean {
+  return (
+    typeof err === 'object' && err !== null && (err as { name?: unknown }).name === 'AbortError'
+  );
 }
