@@ -131,8 +131,13 @@ export async function compactMessages(
   }
 
   // If the retained messages alone still exceed the budget, shrink the
-  // current request. Dropping it is the last resort; when it is dropped,
-  // regenerate the summary so the request is not lost.
+  // current request. Dropping it is the last resort. This branch is only
+  // reached after the drop loop has removed every other droppable message, so
+  // `kept` holds only the request and `remaining` is
+  // `maxTokens - tokenBudget(systems)`. When that is <= 0 the system prompt
+  // alone fills the budget, leaving no room for a summary: the request is
+  // dropped and the summary stays dropped, matching the sacrifice order in
+  // the module docstring.
   if (tokenBudget(systems) + tokenBudget(kept) > maxTokens && kept.length > 0) {
     const current = kept[kept.length - 1]!;
     const remaining = maxTokens - tokenBudget(systems) - tokenBudget(kept.slice(0, -1));
@@ -141,13 +146,6 @@ export async function compactMessages(
     } else {
       kept.pop();
       dropped.push(current);
-      const room = maxTokens - tokenBudget(systems) - tokenBudget(kept);
-      if (room > 0) {
-        const summary = await summarizeDropped();
-        if (summary !== undefined) {
-          summaryMessage = truncateMessageToTokens(makeSummaryMessage(summary), room);
-        }
-      }
     }
   }
 
