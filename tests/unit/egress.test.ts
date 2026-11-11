@@ -108,6 +108,65 @@ describe('installEgressInterceptor', () => {
     );
   });
 
+  it('reads the url from a string input', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('ok')));
+    restore = installEgressInterceptor(log, false);
+
+    await fetch('https://example.com/string');
+    expect(log.list()[0]).toEqual(
+      expect.objectContaining({
+        url: 'https://example.com/string',
+        method: 'GET',
+        blocked: false,
+      }),
+    );
+  });
+
+  it('reads the url from a real URL input', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('ok')));
+    restore = installEgressInterceptor(log, false);
+
+    await fetch(new URL('https://example.com/url'));
+    expect(log.list()[0]).toEqual(
+      expect.objectContaining({
+        url: 'https://example.com/url',
+        method: 'GET',
+        blocked: false,
+      }),
+    );
+  });
+
+  it('reads the url from a real Request input', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('ok')));
+    restore = installEgressInterceptor(log, false);
+
+    await fetch(new Request('https://example.com/request', { method: 'PATCH' }));
+    expect(log.list()[0]).toEqual(
+      expect.objectContaining({
+        url: 'https://example.com/request',
+        method: 'PATCH',
+        blocked: false,
+      }),
+    );
+  });
+
+  it('reads the url from a cross-realm URL-like input', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('ok')));
+    restore = installEgressInterceptor(log, false);
+
+    // A URL from another realm is not `instanceof URL`; duck-typing must
+    // still read its href instead of falling through to `.url` (undefined).
+    const urlLike = { href: 'https://example.com/url' } as unknown as URL;
+    await fetch(urlLike);
+    expect(log.list()[0]).toEqual(
+      expect.objectContaining({
+        url: 'https://example.com/url',
+        method: 'GET',
+        blocked: false,
+      }),
+    );
+  });
+
   it('blocks and logs fetch calls in lockdown', async () => {
     const fetchMock = vi.fn(async () => new Response('ok'));
     vi.stubGlobal('fetch', fetchMock);
