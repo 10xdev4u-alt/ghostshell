@@ -278,6 +278,7 @@ describe('AgentLoop', () => {
     const result = await run(loop, makeConversation([makeMessage('user', 'hi')]), makeContext(vm, llm), [], controller.signal);
 
     expect(result.finishReason).toBe('aborted');
+    expect(result.iterations).toBe(0);
   });
 
   it('stops retrying when the signal aborts between corrective attempts', async () => {
@@ -385,8 +386,20 @@ describe('AgentLoop', () => {
     );
 
     expect(result.finishReason).toBe('aborted');
+    expect(result.iterations).toBe(0);
     expect(steps).toHaveLength(0);
     expect(Date.now() - start).toBeLessThan(300);
+  });
+
+  it('counts a retries-exhausted iteration as completed', async () => {
+    const llm = new FakeLLM();
+    llm.fallback = { text: '<tool_call>not json</tool_call>', tokens: 1, finishReason: 'stop' };
+    const loop = new AgentLoop(makeTools(), makeConfig({ maxRetries: 1 }));
+
+    const result = await run(loop, makeConversation([makeMessage('user', 'hi')]), makeContext(new FakeVM(), llm));
+
+    expect(result.finishReason).toBe('error');
+    expect(result.iterations).toBe(1);
   });
 
   it('reports unknown tools without throwing', async () => {

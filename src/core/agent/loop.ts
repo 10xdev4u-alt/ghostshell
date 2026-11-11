@@ -25,6 +25,10 @@ export interface AgentStep {
 export interface AgentRunResult {
   messages: Message[];
   steps: AgentStep[];
+  /**
+   * Number of loop iterations that ran to completion. An iteration aborted or
+   * thrown mid-flight is not counted; one that exhausts its retries is.
+   */
   iterations: number;
   finishReason: 'stop' | 'max-iterations' | 'error' | 'aborted';
   error?: string | undefined;
@@ -88,11 +92,11 @@ export class AgentLoop {
     const steps: AgentStep[] = [];
     this.ensureSystemMessage(messages);
 
-    let iterations = 0;
+    let completed = 0;
     try {
-      for (iterations = 0; iterations < this.config.maxIterations; iterations += 1) {
+      for (let iteration = 0; iteration < this.config.maxIterations; iteration += 1) {
         if (signal.aborted) {
-          return this.finish(messages, steps, iterations, 'aborted');
+          return this.finish(messages, steps, completed, 'aborted');
         }
 
         await this.compactIfNeeded(messages, ctx, signal);
@@ -105,7 +109,7 @@ export class AgentLoop {
         );
 
         if (outcome.aborted || signal.aborted) {
-          return this.finish(messages, steps, iterations, 'aborted');
+          return this.finish(messages, steps, completed, 'aborted');
         }
 
         // Keep any corrective messages the retry helper appended.
@@ -114,10 +118,11 @@ export class AgentLoop {
         if (outcome.finalAnswer !== undefined) {
           const message = this.assistantMessage(outcome.finalAnswer, []);
           messages.push(message);
-          const step: AgentStep = { iteration: iterations, message, toolCalls: [], results: [] };
+          const step: AgentStep = { iteration, message, toolCalls: [], results: [] };
           steps.push(step);
           onStep(step);
-          return this.finish(messages, steps, iterations + 1, 'stop');
+          completed += 1;
+          return this.finish(messages, steps, completed, 'stop');
         }
 
         if (outcome.parse.toolCalls.length === 0) {
@@ -128,17 +133,18 @@ export class AgentLoop {
             [],
           );
           messages.push(message);
-          const step: AgentStep = { iteration: iterations, message, toolCalls: [], results: [] };
+          const step: AgentStep = { iteration, message, toolCalls: [], results: [] };
           steps.push(step);
           onStep(step);
-          return this.finish(messages, steps, iterations + 1, 'error', error);
+          completed += 1;
+          return this.finish(messages, steps, completed, 'error', error);
         }
 
         const calls = outcome.parse.toolCalls;
         const results: ToolResult[] = [];
         for (const call of calls) {
           if (signal.aborted) {
-            return this.finish(messages, steps, iterations, 'aborted');
+            return this.finish(messages, steps, completed, 'aborted');
           }
           results.push(await this.executeTool(call, ctx, signal));
         }
@@ -148,9 +154,10 @@ export class AgentLoop {
         for (const result of results) {
           messages.push(this.toolMessage(result));
         }
-        const step: AgentStep = { iteration: iterations, message, toolCalls: calls, results };
+        const step: AgentStep = { iteration, message, toolCalls: calls, results };
         steps.push(step);
         onStep(step);
+        completed += 1;
       }
 
       const note =
@@ -158,15 +165,15 @@ export class AgentLoop {
         'Here is where things stand; send another message to continue.';
       const message = this.assistantMessage(note, []);
       messages.push(message);
-      const step: AgentStep = { iteration: iterations, message, toolCalls: [], results: [] };
+      const step: AgentStep = { iteration: completed, message, toolCalls: [], results: [] };
       steps.push(step);
       onStep(step);
-      return this.finish(messages, steps, iterations, 'max-iterations');
+      return this.finish(messages, steps, completed, 'max-iterations');
     } catch (err) {
       if (signal.aborted) {
-        return this.finish(messages, steps, iterations, 'aborted');
+        return this.finish(messages, steps, completed, 'aborted');
       }
-      return this.finish(messages, steps, iterations, 'error', errorMessage(err));
+      return this.finish(messages, steps, completed, 'error', errorMessage(err));
     }
   }
 
