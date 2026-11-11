@@ -21,8 +21,13 @@ export const ARTIFACT_CSP = [
 
 export const ARTIFACT_SANDBOX = 'allow-scripts';
 
+/**
+ * Wrap sanitized HTML in the artifact document.
+ *
+ * Callers must sanitize untrusted HTML before inlining; `src/ui/artifact.ts`
+ * does this with DOMPurify before calling here.
+ */
 export function artifactSrcDoc(html: string): string {
-  // TODO: sanitize with DOMPurify before inlining.
   return `<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="${ARTIFACT_CSP}"></head><body>${html}</body></html>`;
 }
 
