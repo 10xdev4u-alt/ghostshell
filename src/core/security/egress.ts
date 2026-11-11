@@ -39,9 +39,11 @@ export type EgressAllowlist = readonly EgressAllowlistEntry[];
 /**
  * Hosts the app itself needs at boot, even in lockdown.
  *
- * Mirrors the `connect-src` allowlist in index.html: the interceptor and the
- * CSP must agree, or a request the browser permits is blocked by the app (or
- * vice versa). Everything not listed here stays blocked and logged.
+ * The interceptor is the enforcement layer: this allowlist decides which
+ * requests pass, and everything not listed stays blocked and logged. The CSP
+ * in index.html is the broader static defense-in-depth layer — it also
+ * permits the non-network data:/blob: local origins, which cannot
+ * exfiltrate — so the two are deliberately not exact mirrors.
  */
 export const BOOT_EGRESS_ALLOWLIST: EgressAllowlist = [
   // v86 boot media (BIOS + VGA BIOS) — src/core/vm/image.ts.
@@ -127,8 +129,7 @@ export class InMemoryEgressLog implements EgressLog {
  * boot or load a model without v86's BIOS (`copy.sh`), the inlined v86 WASM
  * (`data:`), and the HF model CDN. Those hosts stay reachable so GhostShell
  * works out of the box; application egress to every other host is still
- * blocked. The allowlist mirrors the CSP's connect-src, and every allowed
- * request is logged exactly like a blocked one.
+ * blocked. Every allowed request is logged exactly like a blocked one.
  */
 interface NetworkGlobals {
   fetch?: typeof fetch;
