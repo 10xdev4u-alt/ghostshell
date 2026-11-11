@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   buildReport,
   canonicalize,
@@ -30,6 +30,10 @@ const egress: EgressEvent[] = [
   },
 ];
 
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
 function reportWith(dependencies: PrivacyReport['dependencies']): PrivacyReport {
   return {
     htmlSha256: 'aa'.repeat(32),
@@ -50,6 +54,11 @@ describe('sha256Hex', () => {
 
   it('hashes bytes identically to their string form', async () => {
     expect(await sha256Hex(new Uint8Array([97, 98, 99]))).toBe(await sha256Hex('abc'));
+  });
+
+  it('throws when WebCrypto is unavailable', async () => {
+    vi.stubGlobal('crypto', undefined);
+    await expect(sha256Hex('abc')).rejects.toThrow('WebCrypto is unavailable');
   });
 });
 
@@ -134,6 +143,14 @@ describe('signReport / verifyReport', () => {
     await expect(
       verifyReport({ ...report, signature }, { kty: 'oct', k: 'AAAA', alg: 'HS256' }),
     ).resolves.toBe(false);
+  });
+
+  it('returns false for a key that is neither a CryptoKey nor a JWK', async () => {
+    const report = await buildReport(config, egress);
+    const { privateKey } = await generateAttestationKey();
+    const signature = await signReport(report, privateKey);
+
+    await expect(verifyReport({ ...report, signature }, {} as JsonWebKey)).resolves.toBe(false);
   });
 
   it('returns false for a signature that is not hex', async () => {

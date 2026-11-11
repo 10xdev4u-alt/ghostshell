@@ -1,6 +1,11 @@
-import { describe, expect, it } from 'vitest';
-import { buildExport, parseExport, serializeExport } from '@/core/persistence/export.js';
-import type { Conversation } from '@/types/index.js';
+import { describe, expect, it, vi } from 'vitest';
+import {
+  buildExport,
+  importExport,
+  parseExport,
+  serializeExport,
+} from '@/core/persistence/export.js';
+import type { Conversation, Database } from '@/types/index.js';
 
 function makeConversation(): Conversation {
   return {
@@ -30,5 +35,21 @@ describe('export', () => {
     expect(() => parseExport('{"kind":"ghostshell-export","version":99}')).toThrow(
       'Unsupported export version',
     );
+  });
+
+  it('imports every conversation into the database', async () => {
+    const putConversation = vi.fn(async () => {});
+    const db = { putConversation } as unknown as Database;
+
+    const count = await importExport(serializeExport(buildExport([makeConversation()])), db);
+
+    expect(count).toBe(1);
+    expect(putConversation).toHaveBeenCalledOnce();
+  });
+
+  it('rejects an import that is not a GhostShell export', async () => {
+    const db = { putConversation: vi.fn(async () => {}) } as unknown as Database;
+
+    await expect(importExport('{"kind":"other"}', db)).rejects.toThrow('Not a GhostShell export');
   });
 });
