@@ -96,7 +96,7 @@ vi.mock('v86', () => {
 
       async create_file(path: string, data: Uint8Array): Promise<void> {
         const parent = path.slice(0, path.lastIndexOf('/')) || '/';
-        if (parent !== '/' && !this.dirs.has(parent)) throw new Error('FileNotFoundError');
+        if (parent !== '/' && !this.dirs.has(parent)) throw new Error('File not found');
         this.files.set(path, data);
         this.dirs.add(path);
       }
@@ -114,7 +114,7 @@ vi.mock('v86', () => {
         const id = /__GS_DONE_([A-Za-z0-9]+)__/.exec(data)?.[1] ?? 'missing';
         const prompt = `__GS_PROMPT_${id}__`;
         let body = 'hello\n';
-        if (data.includes('ls -A -1')) {
+        if (data.includes('stat -c')) {
           body = 'regular file|5|1700000000|a.txt\ndirectory|0|1700000000|sub\n';
         }
         return (
@@ -427,6 +427,18 @@ describe('V86VMHandle', () => {
     expect(emu.sent.some((s: string) => s.includes("mkdir -p '/root/workspace'"))).toBe(true);
   });
 
+  it('write surfaces non-missing-parent errors instead of retrying', async () => {
+    const vm = new V86VMHandle();
+    await vm.start(DEFAULT_IMAGE);
+    const emu = instances[0]!;
+    emu.create_file = async (): Promise<void> => {
+      throw new Error('EACCES: permission denied');
+    };
+
+    await expect(vm.write('/root/workspace/a.txt', 'hello')).rejects.toThrow('EACCES');
+    expect(emu.sent.some((s: string) => s.includes('mkdir -p'))).toBe(false);
+  });
+
   it('read decodes file contents', async () => {
     const vm = new V86VMHandle();
     await vm.start(DEFAULT_IMAGE);
@@ -457,8 +469,31 @@ describe('V86VMHandle', () => {
     const emu = instances[0]!;
 
     await vm.list('/root/workspace');
-    expect(emu.sent[0]).toContain("stat -c '%F|%s|%Y|%n'");
+    expect(emu.sent[0]).toContain("stat -c '%F|%s|%Y'");
+    expect(emu.sent[0]).toContain("printf '%s|%s\\n'");
     expect(emu.sent[0]).not.toContain('\t');
+  });
+
+  it('list decodes filenames containing newlines and backslashes', async () => {
+    const vm = new V86VMHandle();
+    await vm.start(DEFAULT_IMAGE);
+    const emu = instances[0]!;
+    emu.serialScript = (data: string) => {
+      const id = sentinelId(data);
+      // The shell escapes a newline as `\n` and a backslash as `\\`.
+      const body = 'regular file|1|1700000000|b\\nb\nregular file|2|1700000000|a\\\\b\n';
+      return (
+        `localhost:~# ${data}__GS_BEGIN_${id}__\n` +
+        `__GS_PROMPT_${id}__${body}__GS_PROMPT_${id}__` +
+        `__GS_DONE_${id}__ 0\n`
+      );
+    };
+
+    const entries = await vm.list('/root/workspace');
+    expect(entries).toEqual([
+      { name: 'a\\b', kind: 'file', size: 2, mtime: 1_700_000_000_000 },
+      { name: 'b\nb', kind: 'file', size: 1, mtime: 1_700_000_000_000 },
+    ]);
   });
 
   it('list quotes the path in the error branch', async () => {
