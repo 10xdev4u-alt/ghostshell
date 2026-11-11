@@ -1,5 +1,6 @@
 import type { Message } from '@/types/index.js';
 import { escapeHtml, truncate } from '@/lib/utils.js';
+import type { ToolLineRange } from './lineRange.js';
 
 /**
  * Chat panel.
@@ -8,11 +9,32 @@ import { escapeHtml, truncate } from '@/lib/utils.js';
  * get a distinct card with the tool name, arguments, and result. All content
  * is rendered with textContent / createElement — never innerHTML — to prevent
  * XSS from model output.
+ *
+ * The composer is created with the panel but its listeners are attached by
+ * `attach()`, which the app calls once the surrounding DOM is ready. This
+ * keeps the panel constructible in tests with a minimal DOM stub.
  */
 
 export interface ChatHandle {
   render(messages: Message[]): void;
-  append(message: Message): void;
+  /** Append a message and return its card element. */
+  append(message: Message): HTMLElement;
+  /**
+   * Add jump links to the tool-call cards of a message. `ranges` maps tool
+   * call ids to serial line ranges; `onJump` is called with the range when a
+   * link is clicked.
+   */
+  annotateToolCalls(
+    messageId: string,
+    ranges: ToolLineRange[],
+    onJump: (start: number, end: number) => void,
+  ): void;
+  /** Enable/disable the composer and show a working indicator. */
+  setWorking(working: boolean): void;
+  /** Register the submit handler. */
+  onSubmit(fn: (text: string) => void): void;
+  /** Attach composer listeners. Safe to call more than once. */
+  attach(): void;
   scrollToBottom(): void;
   dispose(): void;
 }
@@ -22,62 +44,168 @@ export function createChat(container: HTMLElement): ChatHandle {
   stream.className = 'gs-chat-stream';
   container.appendChild(stream);
 
-  return {
-    render(messages: Message[]) {
-      stream.replaceChildren();
-      for (const message of messages) stream.appendChild(renderMessage(message));
-      this.scrollToBottom();
-    },
-    append(message: Message) {
-      stream.appendChild(renderMessage(message));
-      this.scrollToBottom();
-    },
-    scrollToBottom() {
-      stream.scrollTop = stream.scrollHeight;
-    },
-    dispose() {
-      stream.remove();
-    },
+  const composer = document.createElement('div');
+  composer.className = 'gs-chat-composer';
+  const textarea = document.createElement('textarea');
+  textarea.className = 'gs-chat-input';
+  textarea.placeholder = 'Ask GhostShell…';
+  textarea.rows = 2;
+  const send = document.createElement('button');
+  send.className = 'gs-chat-send';
+  send.type = 'button';
+  send.textContent = 'Send';
+  composer.appendChild(textarea);
+  composer.appendChild(send);
+  container.appendChild(composer);
+
+  const status = document.createElement('div');
+  status.className = 'gs-chat-status';
+  container.appendChild(status);
+
+  const messageElements = new Map<string, HTMLElement>();
+  const toolCallElements = new Map<string, HTMLElement>();
+  let submitHandler: ((text: string) => void) | null = null;
+  let attached = false;
+  let onSubmit: (() => void) | null = null;
+  let onKeydown: ((event: KeyboardEvent) => void) | null = null;
+
+  const scrollToBottom = (): void => {
+    stream.scrollTop = stream.scrollHeight;
   };
-}
 
-function renderMessage(message: Message): HTMLElement {
-  const card = document.createElement('div');
-  card.className = `gs-msg gs-msg--${message.role}`;
+  function renderToolCall(call: { id: string; name: string; arguments: Record<string, unknown> }): HTMLElement {
+    const el = document.createElement('details');
+    el.className = 'gs-tool-call';
+    const summary = document.createElement('summary');
+    summary.textContent = `🔧 ${call.name}`;
+    el.appendChild(summary);
+    const pre = document.createElement('pre');
+    pre.textContent = JSON.stringify(call.arguments, null, 2);
+    el.appendChild(pre);
+    return el;
+  }
 
-  const header = document.createElement('div');
-  header.className = 'gs-msg-header';
-  const role = document.createElement('span');
-  role.className = 'gs-msg-role';
-  role.textContent = message.role;
-  header.appendChild(role);
-  card.appendChild(header);
+  function renderMessage(message: Message): HTMLElement {
+    const card = document.createElement('div');
+    card.className = `gs-msg gs-msg--${message.role}`;
+    messageElements.set(message.id, card);
 
-  const body = document.createElement('div');
-  body.className = 'gs-msg-body';
-  card.appendChild(body);
+    const header = document.createElement('div');
+    header.className = 'gs-msg-header';
+    const role = document.createElement('span');
+    role.className = 'gs-msg-role';
+    role.textContent = message.role;
+    header.appendChild(role);
+    card.appendChild(header);
 
-  // The loop emits tool output as a dedicated `tool` message. Render it with
-  // the same ok/error styling as the legacy `toolResults` path.
-  if (message.role === 'tool') {
-    body.appendChild(renderToolMessage(message));
+    const body = document.createElement('div');
+    body.className = 'gs-msg-body';
+    card.appendChild(body);
+
+    // The loop emits tool output as a dedicated `tool` message. Render it with
+    // the same ok/error styling as the legacy `toolResults` path.
+    if (message.role === 'tool') {
+      body.appendChild(renderToolMessage(message));
+      return card;
+    }
+
+    if (message.content) {
+      body.textContent = message.content;
+    } else if (!message.toolCalls?.length && !message.toolResults?.length) {
+      body.textContent = '(no content)';
+    }
+
+    if (message.toolCalls?.length) {
+      for (const call of message.toolCalls) {
+        const el = renderToolCall(call);
+        toolCallElements.set(call.id, el);
+        body.appendChild(el);
+      }
+    }
+    if (message.toolResults?.length) {
+      for (const result of message.toolResults) {
+        body.appendChild(renderToolResult(result));
+      }
+    }
+
     return card;
   }
 
-  body.textContent = message.content || '(no content)';
+  return {
+    render(messages: Message[]) {
+      stream.replaceChildren();
+      messageElements.clear();
+      toolCallElements.clear();
+      for (const message of messages) stream.appendChild(renderMessage(message));
+      scrollToBottom();
+    },
 
-  if (message.toolCalls?.length) {
-    for (const call of message.toolCalls) {
-      body.appendChild(renderToolCall(call));
-    }
-  }
-  if (message.toolResults?.length) {
-    for (const result of message.toolResults) {
-      body.appendChild(renderToolResult(result));
-    }
-  }
+    append(message: Message) {
+      const card = renderMessage(message);
+      stream.appendChild(card);
+      scrollToBottom();
+      return card;
+    },
 
-  return card;
+    annotateToolCalls(messageId, ranges, onJump) {
+      const card = messageElements.get(messageId);
+      if (!card) return;
+      for (const range of ranges) {
+        const el = toolCallElements.get(range.callId);
+        if (!el) continue;
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'gs-tool-range';
+        button.textContent =
+          range.end >= range.start
+            ? `Lines ${range.start}–${range.end}`
+            : `Line ${range.start}`;
+        button.addEventListener('click', () => onJump(range.start, range.end));
+        el.appendChild(button);
+      }
+    },
+
+    setWorking(working: boolean) {
+      send.disabled = working;
+      textarea.disabled = working;
+      status.textContent = working ? 'Working…' : '';
+    },
+
+    onSubmit(fn) {
+      submitHandler = fn;
+    },
+
+    attach() {
+      if (attached) return;
+      attached = true;
+      onSubmit = () => {
+        const text = textarea.value.trim();
+        if (!text) return;
+        textarea.value = '';
+        submitHandler?.(text);
+      };
+      onKeydown = (event) => {
+        if (event.key === 'Enter' && !event.shiftKey) {
+          event.preventDefault();
+          onSubmit?.();
+        }
+      };
+      send.addEventListener('click', onSubmit);
+      textarea.addEventListener('keydown', onKeydown);
+    },
+
+    scrollToBottom,
+
+    dispose() {
+      if (onSubmit) send.removeEventListener('click', onSubmit);
+      if (onKeydown) textarea.removeEventListener('keydown', onKeydown);
+      messageElements.clear();
+      toolCallElements.clear();
+      stream.remove();
+      composer.remove();
+      status.remove();
+    },
+  };
 }
 
 function renderToolMessage(message: Message): HTMLElement {
@@ -111,18 +239,6 @@ function deriveToolOk(content: string): boolean {
   // grep exits 0 (match) or 1 (no match); anything else is an error.
   if (/grep exited with code (?!0\b|1\b)\d+/i.test(content)) return false;
   return true;
-}
-
-function renderToolCall(call: { name: string; arguments: Record<string, unknown> }): HTMLElement {
-  const el = document.createElement('details');
-  el.className = 'gs-tool-call';
-  const summary = document.createElement('summary');
-  summary.textContent = `🔧 ${call.name}`;
-  el.appendChild(summary);
-  const pre = document.createElement('pre');
-  pre.textContent = JSON.stringify(call.arguments, null, 2);
-  el.appendChild(pre);
-  return el;
 }
 
 function renderToolResult(result: { ok: boolean; content: string }): HTMLElement {
