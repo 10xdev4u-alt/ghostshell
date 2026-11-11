@@ -97,6 +97,33 @@ export function extractSentinelOutput(
   return { body, exitCode: Number(done[1]) };
 }
 
+/**
+ * Clean a partial serial stream from a timed-out command.
+ *
+ * Mirrors `extractSentinelOutput` without requiring the done sentinel: drops
+ * everything up to the last begin marker and strips prompt sentinels. The
+ * tty echoes the wrapper with prompt sentinels interleaved between its lines,
+ * so the echoed wrapper is removed line-by-line instead of by a contiguous
+ * match (which is what `cleanOutput`'s `echoed` argument does).
+ */
+export function stripSentinels(raw: string, id: string, wrapped?: string): string {
+  const begin = `__GS_BEGIN_${id}__`;
+  const idx = raw.lastIndexOf(begin);
+  let body = idx === -1 ? raw : raw.slice(idx + begin.length);
+  body = body.split(promptSentinel(id)).join('');
+  if (wrapped === undefined) return body;
+  const echoed = new Set(
+    wrapped
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0),
+  );
+  return body
+    .split('\n')
+    .filter((line) => !echoed.has(line.trim()))
+    .join('\n');
+}
+
 /** Strip terminal escape sequences and normalize line endings. */
 export function cleanOutput(raw: string, echoed?: string): string {
   let out = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
@@ -194,7 +221,7 @@ export function createCommandRunner(
 
       function bodyBeforeSentinel(): string {
         const found = extractSentinelOutput(output, id, donePattern);
-        return found ? found.body : output;
+        return found ? found.body : stripSentinels(output, id, wrapped);
       }
     });
   }
