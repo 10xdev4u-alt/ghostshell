@@ -250,24 +250,43 @@ function isNode(): boolean {
  * Delete the IndexedDB and OPFS weight caches. Safe to call when neither
  * exists. The OPFS directory is removed even when the engine never installed
  * an `OPFSCache` (for example, after a restart).
+ *
+ * Both caches are cleared even when the IndexedDB deletion is blocked or
+ * fails; the IndexedDB error is then rethrown so the caller never assumes
+ * that cache is gone while it still exists.
  */
 export async function clearTransformersCache(): Promise<void> {
+  let indexedDBError: unknown;
   if (typeof indexedDB !== 'undefined') {
-    await new Promise<void>((resolve) => {
-      const request = indexedDB.deleteDatabase(CACHE_DB_NAME);
-      request.onsuccess = () => resolve();
-      request.onerror = () => resolve();
-      request.onblocked = () => resolve();
-    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const request = indexedDB.deleteDatabase(CACHE_DB_NAME);
+        request.onsuccess = () => resolve();
+        request.onerror = () =>
+          reject(
+            request.error ?? new Error('Failed to delete the Transformers.js cache database'),
+          );
+        request.onblocked = () =>
+          reject(
+            new Error(
+              'Transformers.js cache deletion is blocked by an open connection; close other tabs and retry',
+            ),
+          );
+      });
+    } catch (err) {
+      indexedDBError = err;
+    }
   }
 
   const cache = env.customCache;
   if (cache instanceof OPFSCache) {
     await cache.clear();
     env.customCache = null;
-    return;
+  } else {
+    await removeOPFSCacheDirectory();
   }
-  await removeOPFSCacheDirectory();
+
+  if (indexedDBError !== undefined) throw indexedDBError;
 }
 
 /**
@@ -551,6 +570,18 @@ export class TransformersEngine implements LLMEngine {
         pending as Promise<TextGenerationPipelineType>,
         abortSignal,
       )) as unknown as TextGenerationPipelineType;
+
+      // Dispose the generator being replaced before swapping it out. Doing
+      // this after the new pipeline resolves means a failed reload leaves the
+      // old model loaded instead of leaking it or stranding the engine.
+      const previous = this.generator;
+      if (previous && previous !== generator) {
+        try {
+          await previous.dispose();
+        } catch {
+          // Disposing the old pipeline is best-effort; the new one is ready.
+        }
+      }
       this.generator = generator;
       this.loaded = true;
       emit({
@@ -656,7 +687,8 @@ export class TransformersEngine implements LLMEngine {
         finishReason = 'stop';
         stoppedOn = err.stopString;
       } else {
-        finishReason = 'error';
+        // Generation errors propagate to the caller; `finishReason` only
+        // describes a run that produced a result.
         throw err;
       }
     }

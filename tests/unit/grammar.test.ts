@@ -72,6 +72,47 @@ describe('buildToolCallGrammar', () => {
     expect(grammar).toContain('args-pick-color-kv');
   });
 
+  it('escapes control characters in GBNF literals', () => {
+    const grammar = buildToolCallGrammar([
+      {
+        name: 'line\nbreak',
+        parameters: {
+          type: 'object',
+          properties: {
+            'tab\tkey': {
+              type: 'string',
+              enum: [
+                'carriage\rreturn',
+                'back\bspace',
+                'form\ffeed',
+                'bell\u0007',
+                'nul\u0000',
+                'unit\u001fsep',
+              ],
+            },
+          },
+        },
+      },
+    ]);
+
+    expect(grammar).toContain('"line\\nbreak"');
+    expect(grammar).toContain('"tab\\tkey"');
+    expect(grammar).toContain('"carriage\\rreturn"');
+    expect(grammar).toContain('"back\\bspace"');
+    expect(grammar).toContain('"form\\ffeed"');
+    expect(grammar).toContain('"bell\\u0007"');
+    expect(grammar).toContain('"nul\\u0000"');
+    expect(grammar).toContain('"unit\\u001fsep"');
+
+    // No raw control characters survive inside an emitted string literal.
+    const literals = grammar.match(/"(?:[^"\\\n]|\\.)*"/g) ?? [];
+    expect(literals.length).toBeGreaterThan(0);
+    for (const literal of literals) {
+      expect(literal).not.toMatch(/[\u0000-\u001f\u007f]/);
+    }
+    expect(grammar).not.toMatch(/[\r\t]/);
+  });
+
   it('requires the schema required properties', () => {
     const grammar = buildToolCallGrammar([
       {
@@ -172,24 +213,7 @@ describe('buildToolCallGrammar', () => {
 
 describe('buildToolCallSchema', () => {
   it('builds a JSON schema with one variant per tool', () => {
-    const schema = buildToolCallSchema(tools) as {
-      type: string;
-      properties: {
-        tool_calls: {
-          type: string;
-          items: {
-            oneOf: Array<{
-              properties: {
-                name: { enum: string[] };
-                arguments: unknown;
-              };
-              required: string[];
-            }>;
-          };
-        };
-      };
-      required: string[];
-    };
+    const schema = buildToolCallSchema(tools);
 
     expect(schema.type).toBe('object');
     expect(schema.required).toEqual(['tool_calls']);
