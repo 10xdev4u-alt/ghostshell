@@ -43,6 +43,15 @@ export interface RunnerOptions {
 const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_GRACE_MS = 500;
 const DEFAULT_MAX_OUTPUT_CHARS = 1_000_000;
+/**
+ * How far back to rescan when hunting for the done sentinel.
+ *
+ * Bytes arrive in arbitrary chunks, so a sentinel can straddle a chunk
+ * boundary. The overlap must cover the longest possible sentinel
+ * (`__GS_DONE_<id>__ <code>\n`); 64 chars is comfortably larger than the
+ * 16-char id plus an exit code.
+ */
+const DONE_SCAN_OVERLAP = 64;
 
 /**
  * Prompt marker set while a command runs.
@@ -216,6 +225,13 @@ export function createCommandRunner(
       const donePattern = doneSentinelPattern(id);
       const started = Date.now();
       let output = '';
+      /**
+       * The last DONE_SCAN_OVERLAP chars of `output`, kept as a small flat
+       * string. The done sentinel can straddle a chunk boundary, so each chunk
+       * rescans this tail. Scanning `output` directly would flatten its rope
+       * on every byte, which is O(n²) for large output.
+       */
+      let tail = '';
       let settled = false;
       let timedOut = false;
       let unsubscribe: () => void = () => undefined;
@@ -240,13 +256,20 @@ export function createCommandRunner(
       unsubscribe = transport.onData((chunk) => {
         if (settled) return;
         output += chunk;
-        const found = extractSentinelOutput(output, id, donePattern);
-        if (found) {
-          finish(timedOut, found.exitCode, found.body);
-          return;
+        tail = (tail + chunk).slice(-DONE_SCAN_OVERLAP);
+        if (donePattern.test(tail)) {
+          const found = extractSentinelOutput(output, id, donePattern, wrapped);
+          if (found) {
+            finish(timedOut, found.exitCode, found.body);
+            return;
+          }
         }
         if (output.length > maxOutputChars) {
-          output = output.slice(output.length - maxOutputChars);
+          const removed = output.length - maxOutputChars;
+          output = output.slice(removed);
+          // Dropping the front does not change the tail unless the retained
+          // buffer is shorter than the overlap.
+          if (output.length < DONE_SCAN_OVERLAP) tail = output;
         }
       });
 
