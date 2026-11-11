@@ -213,6 +213,17 @@ describe('builtin tools', () => {
     expect(vm.commands[0]!.cmd).toContain("'/root/workspace'");
   });
 
+  it('search skips binary files and VCS/dependency directories', async () => {
+    const vm = new FakeVM();
+    vm.execResult = { stdout: '', stderr: '', exitCode: 1, durationMs: 1, timedOut: false };
+
+    await tool('search').execute(makeContext(vm), { pattern: 'foo' });
+
+    expect(vm.commands[0]!.cmd).toContain('-rnI');
+    expect(vm.commands[0]!.cmd).toContain('--exclude-dir=.git');
+    expect(vm.commands[0]!.cmd).toContain('--exclude-dir=node_modules');
+  });
+
   it('search passes a glob filter', async () => {
     const vm = new FakeVM();
     vm.execResult = { stdout: '', stderr: '', exitCode: 1, durationMs: 1, timedOut: false };
@@ -249,7 +260,9 @@ describe('builtin tools', () => {
 
     await tool('search').execute(makeContext(vm), { pattern: 'foo', path: '-weird-path' });
 
-    expect(vm.commands[0]!.cmd).toBe("grep -rn -e 'foo' -- '-weird-path'");
+    expect(vm.commands[0]!.cmd).toBe(
+      "grep -rnI --exclude-dir=.git --exclude-dir=node_modules -e 'foo' -- '-weird-path'",
+    );
   });
 
   it('search treats no matches as success', async () => {
