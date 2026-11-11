@@ -65,6 +65,8 @@ class FakeVM implements VMHandle {
     return this.execResult;
   }
 
+  sendSerial(_data: string): void {}
+
   async write(path: string, content: string): Promise<void> {
     this.files.set(path, content);
   }
@@ -80,6 +82,29 @@ class FakeVM implements VMHandle {
   }
 
   onSerial(): void {}
+}
+
+/** A FakeVM whose long-running command resolves only when it gets Ctrl-C. */
+class InterruptibleVM extends FakeVM {
+  serial: string[] = [];
+  private interruptWaiters = new Set<() => void>();
+
+  sendSerial(data: string): void {
+    this.serial.push(data);
+    if (data.includes('\x03')) {
+      for (const resolve of this.interruptWaiters) resolve();
+      this.interruptWaiters.clear();
+    }
+  }
+
+  async exec(cmd: string, timeoutMs?: number): Promise<CommandResult> {
+    this.commands.push({ cmd, timeoutMs });
+    if (cmd === 'sleep 100') {
+      await new Promise<void>((resolve) => this.interruptWaiters.add(resolve));
+      return { stdout: '', stderr: '', exitCode: 130, durationMs: 5, timedOut: false };
+    }
+    return this.execResult;
+  }
 }
 
 function makeConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
@@ -285,6 +310,29 @@ describe('AgentLoop', () => {
     expect(steps[0]!.results[0]!.content).toContain('timed out');
   });
 
+  it('interrupts the guest command and issues no further commands when aborted', async () => {
+    const controller = new AbortController();
+    const vm = new InterruptibleVM();
+    const llm = new FakeLLM();
+    llm.fallback = { text: toolCall('bash', { command: 'sleep 100' }), tokens: 1, finishReason: 'stop' };
+    const loop = new AgentLoop(makeTools(), makeConfig({ maxIterations: 1, toolTimeoutMs: 60_000 }));
+    const steps: AgentStep[] = [];
+    setTimeout(() => controller.abort(), 20);
+
+    const result = await run(
+      loop,
+      makeConversation([makeMessage('user', 'hi')]),
+      makeContext(vm, llm),
+      steps,
+      controller.signal,
+    );
+
+    expect(result.finishReason).toBe('aborted');
+    expect(vm.serial).toContain('\x03');
+    expect(vm.commands).toHaveLength(1);
+    expect(vm.commands[0]!.cmd).toBe('sleep 100');
+  });
+
   it('honors abort during tool execution without reporting a tool failure', async () => {
     const controller = new AbortController();
     const slow: ToolDefinition = {
@@ -385,7 +433,7 @@ describe('AgentLoop', () => {
       { text: 'Done.', tokens: 1, finishReason: 'stop' },
     ];
     const vm = new FakeVM();
-    const loop = new AgentLoop(makeTools(), makeConfig({ contextWindow: 40 }));
+    const loop = new AgentLoop(makeTools(), makeConfig({ contextWindow: 150 }));
     const messages = [
       makeMessage('user', 'x'.repeat(200)),
       makeMessage('assistant', 'y'.repeat(200)),

@@ -194,6 +194,11 @@ export interface VMHandle {
   pause(): Promise<void>;
   resume(): Promise<void>;
   exec(cmd: string, timeoutMs?: number): Promise<CommandResult>;
+  /**
+   * Write raw data to the guest serial console. Used to interrupt a running
+   * command (`\x03`); no-op when the VM is not running.
+   */
+  sendSerial(data: string): void;
   write(path: string, content: string): Promise<void>;
   read(path: string): Promise<string>;
   list(path: string): Promise<DirEntry[]>;

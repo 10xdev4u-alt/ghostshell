@@ -29,6 +29,8 @@ class FakeVM implements VMHandle {
     return this.execResult;
   }
 
+  sendSerial(_data: string): void {}
+
   async write(path: string, content: string): Promise<void> {
     this.files.set(path, content);
   }
@@ -239,6 +241,15 @@ describe('builtin tools', () => {
     await tool('search').execute(makeContext(vm), { pattern: '--include=secret' });
 
     expect(vm.commands[0]!.cmd).toContain("-e '--include=secret'");
+  });
+
+  it('search treats a leading-dash path as an operand', async () => {
+    const vm = new FakeVM();
+    vm.execResult = { stdout: '', stderr: '', exitCode: 1, durationMs: 1, timedOut: false };
+
+    await tool('search').execute(makeContext(vm), { pattern: 'foo', path: '-weird-path' });
+
+    expect(vm.commands[0]!.cmd).toBe("grep -rn -e 'foo' -- '-weird-path'");
   });
 
   it('search treats no matches as success', async () => {

@@ -80,12 +80,41 @@ describe('compaction', () => {
     expect(tokenBudget(result.messages)).toBeLessThanOrEqual(250);
   });
 
-  it('keeps the current request when it is the only droppable-adjacent message', async () => {
+  it('shrinks the current request when it cannot fit with the system prompt', async () => {
     const messages = [message('system', 'x'.repeat(400)), message('user', 'y'.repeat(400))];
     const result = await compactMessages(messages, 100, async () => 'summary');
 
-    expect(result.compacted).toBe(false);
-    expect(result.removed).toBe(0);
+    expect(result.compacted).toBe(true);
+    expect(result.messages[0]!.role).toBe('system');
+    expect(tokenBudget(result.messages)).toBeLessThanOrEqual(100);
+  });
+
+  it('never exceeds a 100-token budget with a 100-token summary and request', async () => {
+    const messages = [
+      message('user', 'a'.repeat(400)), // 100 tokens, droppable
+      message('user', 'b'.repeat(400)), // 100 tokens, current request
+    ];
+
+    const result = await compactMessages(messages, 100, async () => 's'.repeat(400));
+
+    expect(result.compacted).toBe(true);
+    expect(tokenBudget(result.messages)).toBeLessThanOrEqual(100);
+  });
+
+  it('keeps the summary when the budget has room', async () => {
+    const messages = [
+      message('system', 'sys'),
+      message('user', 'a'.repeat(400)),
+      message('assistant', 'b'.repeat(400)),
+      message('user', 'current question'),
+    ];
+
+    const result = await compactMessages(messages, 100, async () => 'summary text');
+
+    expect(result.compacted).toBe(true);
+    expect(tokenBudget(result.messages)).toBeLessThanOrEqual(100);
+    expect(result.messages.some((m) => m.content.includes('Summary of earlier conversation'))).toBe(true);
+    expect(result.messages.some((m) => m.content === 'current question')).toBe(true);
   });
 
   it('summarizes every dropped message exactly once', async () => {

@@ -55,8 +55,16 @@ function renderMessage(message: Message): HTMLElement {
 
   const body = document.createElement('div');
   body.className = 'gs-msg-body';
-  body.textContent = message.content || '(no content)';
   card.appendChild(body);
+
+  // The loop emits tool output as a dedicated `tool` message. Render it with
+  // the same ok/error styling as the legacy `toolResults` path.
+  if (message.role === 'tool') {
+    body.appendChild(renderToolMessage(message));
+    return card;
+  }
+
+  body.textContent = message.content || '(no content)';
 
   if (message.toolCalls?.length) {
     for (const call of message.toolCalls) {
@@ -70,6 +78,39 @@ function renderMessage(message: Message): HTMLElement {
   }
 
   return card;
+}
+
+function renderToolMessage(message: Message): HTMLElement {
+  const el = document.createElement('pre');
+  el.className = `gs-tool-result ${toolMessageOk(message) ? 'is-ok' : 'is-error'}`;
+  el.textContent = truncate(message.content, 4000);
+  return el;
+}
+
+/**
+ * Resolve the ok/error state of a `tool` message. Prefer a structured
+ * `toolResults` entry when one is attached; otherwise derive it from the
+ * markers the built-in tools emit.
+ */
+function toolMessageOk(message: Message): boolean {
+  const structured = message.toolResults?.[0];
+  if (structured) return structured.ok;
+  return deriveToolOk(message.content);
+}
+
+function deriveToolOk(content: string): boolean {
+  // bash appends `[exit N]`; the last marker is the command's own status.
+  const exits = content.match(/\[exit -?\d+\]/g);
+  const lastExit = exits?.[exits.length - 1];
+  if (lastExit !== undefined && lastExit !== '[exit 0]') return false;
+  if (/^(?:bash|read_file|write_file|list_dir|search) failed:/m.test(content)) return false;
+  if (/^Missing required argument:/m.test(content)) return false;
+  if (/appears to be a binary file/i.test(content)) return false;
+  if (/^Unknown tool /m.test(content)) return false;
+  if (/Command timed out/i.test(content)) return false;
+  // grep exits 0 (match) or 1 (no match); anything else is an error.
+  if (/grep exited with code (?!0\b|1\b)\d+/i.test(content)) return false;
+  return true;
 }
 
 function renderToolCall(call: { name: string; arguments: Record<string, unknown> }): HTMLElement {
