@@ -97,12 +97,17 @@ export const FLAGS = {
  * SPDX licenses for the runtime dependencies declared in package.json. The
  * privacy report records what the app actually ships; a new dependency must
  * add its license here.
+ *
+ * Only `dependencies` belong in this map. `devDependencies` are build- and
+ * test-time tooling that never ships in the single-file bundle, so listing
+ * them would misstate what the attestation report covers.
  */
-const DEPENDENCY_LICENSES: Record<string, string> = {
+export const DEPENDENCY_LICENSES: Readonly<Record<string, string>> = {
   '@huggingface/transformers': 'Apache-2.0',
   '@mlc-ai/web-llm': 'Apache-2.0',
   '@xterm/addon-fit': 'MIT',
   '@xterm/xterm': 'MIT',
+  diff: 'BSD-3-Clause',
   dompurify: 'MPL-2.0 OR Apache-2.0',
   fflate: 'MIT',
   idb: 'ISC',
@@ -110,6 +115,15 @@ const DEPENDENCY_LICENSES: Record<string, string> = {
   v86: 'BSD-2-Clause',
   zod: 'MIT',
 };
+
+/**
+ * License for a runtime dependency. A dependency with no curated entry
+ * reports as `unknown` instead of being silently dropped, so a gap is
+ * visible in the attestation report rather than hidden.
+ */
+export function dependencyLicense(name: string): string {
+  return DEPENDENCY_LICENSES[name] ?? 'unknown';
+}
 
 /**
  * Attestation inputs for the privacy report (mounted by `App.init`).
@@ -127,6 +141,6 @@ export const ATTESTATION_CONFIG: AttestationConfig = {
   dependencies: Object.entries(pkg.dependencies).map(([name, version]) => ({
     name,
     version,
-    license: DEPENDENCY_LICENSES[name] ?? 'unknown',
+    license: dependencyLicense(name),
   })),
 };
