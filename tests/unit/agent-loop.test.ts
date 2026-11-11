@@ -336,6 +336,72 @@ describe('AgentLoop', () => {
     expect(steps[0]!.results[0]!.content).toContain('timed out');
   });
 
+  it('aborts a timed-out tool so it stops instead of running to completion', async () => {
+    let toolSignal: AbortSignal | undefined;
+    const watchdog: ToolDefinition = {
+      name: 'watchdog',
+      description: 'records its signal',
+      parameters: { type: 'object', properties: {} },
+      execute: async (ctx) => {
+        toolSignal = ctx.signal;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        return { ok: true, content: 'finished' };
+      },
+    };
+    const llm = new FakeLLM();
+    llm.fallback = { text: toolCall('watchdog', {}), tokens: 1, finishReason: 'stop' };
+    const loop = new AgentLoop(
+      new Map([['watchdog', watchdog]]),
+      makeConfig({ toolTimeoutMs: 20, maxIterations: 1 }),
+    );
+    const steps: AgentStep[] = [];
+
+    const result = await run(loop, makeConversation([makeMessage('user', 'hi')]), makeContext(new FakeVM(), llm), steps);
+
+    expect(result.finishReason).toBe('max-iterations');
+    expect(steps[0]!.results[0]!.ok).toBe(false);
+    expect(toolSignal?.aborted).toBe(true);
+  });
+
+  it('does not start the next tool until a timed-out tool settles', async () => {
+    const order: string[] = [];
+    const hanging: ToolDefinition = {
+      name: 'hanging',
+      description: 'times out, then finishes',
+      parameters: { type: 'object', properties: {} },
+      execute: async () => {
+        order.push('hanging-start');
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        order.push('hanging-end');
+        return { ok: true, content: 'late' };
+      },
+    };
+    const next: ToolDefinition = {
+      name: 'next',
+      description: 'runs after the hanging tool',
+      parameters: { type: 'object', properties: {} },
+      execute: async () => {
+        order.push('next-start');
+        return { ok: true, content: 'ok' };
+      },
+    };
+    const llm = new FakeLLM();
+    llm.queue = [
+      { text: toolCall('hanging', {}), tokens: 1, finishReason: 'stop' },
+      { text: toolCall('next', {}), tokens: 1, finishReason: 'stop' },
+      { text: 'Done.', tokens: 1, finishReason: 'stop' },
+    ];
+    const loop = new AgentLoop(
+      new Map([['hanging', hanging], ['next', next]]),
+      makeConfig({ toolTimeoutMs: 20, maxIterations: 3 }),
+    );
+
+    const result = await run(loop, makeConversation([makeMessage('user', 'hi')]), makeContext(new FakeVM(), llm));
+
+    expect(result.finishReason).toBe('stop');
+    expect(order).toEqual(['hanging-start', 'hanging-end', 'next-start']);
+  });
+
   it('interrupts the guest command and issues no further commands when aborted', async () => {
     const controller = new AbortController();
     const vm = new InterruptibleVM();

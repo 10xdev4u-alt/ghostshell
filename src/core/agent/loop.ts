@@ -69,6 +69,9 @@ function errorMessage(err: unknown): string {
  *    then loop.
  *  - If the model emits a final answer (no tool calls), stop.
  *  - Enforce `maxIterations`, `toolTimeoutMs`, and `maxRetries`.
+ *  - `toolTimeoutMs` bounds the wait for a tool and cancels it: the per-tool
+ *    signal is aborted on timeout, so tools that honor it stop, and the serial
+ *    queue slot is held until the tool settles.
  *  - Every step is emitted via `onStep` so the UI can stream progress.
  */
 export class AgentLoop {
@@ -298,18 +301,34 @@ export class AgentLoop {
       };
     }
 
-    // The tool receives the run's abort signal so long-running guest commands
-    // can interrupt themselves (see `execWithAbort` in tools.ts).
-    const toolCtx: ToolContext = { ...ctx, signal };
+    // Per-execution cancellation: aborted when the run aborts or the tool times
+    // out. Tools that honor `ctx.signal` (bash, search) interrupt their guest
+    // command instead of running to completion after a timeout.
+    const cancellation = new AbortController();
+    const onRunAbort = (): void => cancellation.abort();
+    if (signal.aborted) cancellation.abort();
+    else signal.addEventListener('abort', onRunAbort, { once: true });
+
+    const toolCtx: ToolContext = { ...ctx, signal: cancellation.signal };
     try {
-      return await this.queue.add(() =>
-        this.withTimeout(
-          definition.execute(toolCtx, call.arguments),
-          this.config.toolTimeoutMs,
-          call.name,
-          signal,
-        ),
-      );
+      return await this.queue.add(async () => {
+        const toolPromise = definition.execute(toolCtx, call.arguments);
+        try {
+          return await this.withTimeout(
+            toolPromise,
+            this.config.toolTimeoutMs,
+            call.name,
+            cancellation,
+          );
+        } catch (err) {
+          if (err instanceof ToolTimeoutError) {
+            // Hold the queue slot until the cancelled tool settles, so the next
+            // tool cannot start while the timed-out one is still running.
+            await toolPromise.catch(() => undefined);
+          }
+          throw err;
+        }
+      });
     } catch (err) {
       // An abort is not a tool failure: rethrow so the loop reports `aborted`.
       if (signal.aborted) throw err;
@@ -317,22 +336,25 @@ export class AgentLoop {
         return { ok: false, content: err.message };
       }
       return { ok: false, content: `Tool "${call.name}" failed: ${errorMessage(err)}` };
+    } finally {
+      signal.removeEventListener('abort', onRunAbort);
     }
   }
 
   /**
-   * Race a tool against its timeout and the run's abort signal. Whichever
+   * Race a tool against its timeout and its cancellation signal. Whichever
    * fires first settles the promise; the other listener is removed so a late
-   * tool result cannot leak into a settled run. Tools that talk to the VM
-   * must also honor `ctx.signal` and reject on abort, so the underlying
-   * command is interrupted instead of being orphaned.
+   * tool result cannot leak into a settled run. On timeout the controller is
+   * aborted, so tools that honor `ctx.signal` (see `execWithAbort` in tools.ts)
+   * interrupt the underlying command instead of being orphaned.
    */
   private withTimeout<T>(
     promise: Promise<T>,
     timeoutMs: number,
     toolName: string,
-    signal: AbortSignal,
+    cancellation: AbortController,
   ): Promise<T> {
+    const signal = cancellation.signal;
     if (signal.aborted) {
       return Promise.reject(new ToolAbortedError(toolName));
     }
@@ -357,6 +379,7 @@ export class AgentLoop {
         if (settled) return;
         settled = true;
         cleanup();
+        cancellation.abort();
         reject(new ToolTimeoutError(toolName, timeoutMs));
       }, Math.max(1, timeoutMs));
 
