@@ -2,7 +2,11 @@ import { V86, type V86Image, type V86Options } from 'v86';
 import type { CommandResult, DirEntry, VMHandle, VMImage } from '@/types/index.js';
 import { SerialQueue } from '@/lib/queue.js';
 import { createCommandRunner, type CommandRunner, type SerialTransport } from '@/core/vm/commands.js';
-import { ALPINE_BOOT } from '@/core/vm/image.js';
+import {
+  ALPINE_BOOT,
+  assertImageAvailableForBoot,
+  hasFileSystem,
+} from '@/core/vm/image.js';
 
 /**
  * v86-backed VM handle.
@@ -100,6 +104,11 @@ export class V86VMHandle implements VMHandle {
   }
 
   async start(image: VMImage): Promise<void> {
+    // The browser has no filesystem to probe; fail fast before building v86.
+    // Node already ran the synchronous probe in `getImage`.
+    if (!hasFileSystem()) {
+      await assertImageAvailableForBoot(image);
+    }
     if (this.emu) {
       await this.emu.stop().catch(() => undefined);
       await this.emu.destroy().catch(() => undefined);

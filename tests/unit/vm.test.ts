@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { V86Options } from 'v86';
 import { DEFAULT_IMAGE } from '@/core/vm/image.js';
 import { V86_WASM_URL } from '@/core/vm/wasm.js';
@@ -144,6 +144,10 @@ describe('V86VMHandle', () => {
     instances.length = 0;
     neverReady.value = false;
     failRun.value = false;
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it('boots Alpine with the expected v86 options', async () => {
@@ -401,6 +405,16 @@ describe('V86VMHandle', () => {
     await vm.start(DEFAULT_IMAGE);
     await vm.stop();
     await expect(vm.exec('echo hi')).rejects.toThrow('VM not started');
+  });
+
+  it('fails fast with an actionable message in the browser', async () => {
+    vi.stubGlobal('process', undefined);
+    const fetchMock = vi.fn().mockResolvedValue({ ok: false });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const vm = new V86VMHandle();
+    await expect(vm.start(DEFAULT_IMAGE)).rejects.toThrow(/missing required artifacts/);
+    expect(instances).toHaveLength(0);
   });
 
   it('write creates parent directories and writes the file', async () => {
