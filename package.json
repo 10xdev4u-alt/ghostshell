@@ -37,6 +37,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
+    "coverage:report": "vitest run --coverage --coverage.thresholds.statements=0 --coverage.thresholds.branches=0 --coverage.thresholds.functions=0 --coverage.thresholds.lines=0",
     "test:e2e": "playwright test",
     "lint": "eslint . --ext .ts,.tsx",
     "format": "prettier --write .",
