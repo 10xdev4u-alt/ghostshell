@@ -17,19 +17,18 @@ These are not ideas; they are corrections and upgrades to the engineering plan, 
 
 ### 0.1 v86 networking is not "relay or nothing"
 
-The plan says v86 networking needs a third-party WebSocket relay. Current v86 ships **four** backends (`copy/v86` → `docs/networking.md`) **[VERIFIED]**:
+The plan says v86 networking needs a third-party WebSocket relay. v86 actually selects its adapter from `net_device.relay_url` (`copy/v86` → `docs/networking.md`, `v86.d.ts`) **[VERIFIED]**, and GhostShell exposes three opt-in modes (`src/core/vm/network.ts`):
 
-| Backend | Transport | External internet? | Server required? |
-|---|---|---|---|
-| `inbrowser` | `BroadcastChannel` between tabs/windows | **No** | **None** |
-| `fetch` | Browser `fetch()` | Yes (HTTP only) | No relay; a CORS proxy for arbitrary hosts |
-| `wisp` | WISP protocol over WebSocket | Yes (TCP) | WISP proxy (self-hostable, incl. Cloudflare Workers) |
-| `wsproxy` | Raw Ethernet over WebSocket | Yes (full L2) | Proxy (self-hostable, Docker) |
+| Mode | `relay_url` | Transport | External internet? | Server required? |
+|---|---|---|---|---|
+| `inbrowser` | `"inbrowser"` | `BroadcastChannel` between tabs/windows | **No** | **None** |
+| `fetch` | `"fetch"` | Browser `fetch()` | Yes (HTTP only) | No relay; a CORS proxy for arbitrary hosts |
+| `wisp` | `"wisp://…"` / `"wisps://…"` | WISP protocol over WebSocket | Yes (TCP) | WISP proxy (self-hostable, incl. Cloudflare Workers) |
 
 **Why this matters**
 
 - A **truly serverless** mode exists: `inbrowser` gives multi-VM networking with zero external network and zero servers. `fetch` gives the VM HTTP access with no relay, and can even reach the host's `localhost` via `http://<port>.external` **[VERIFIED]**.
-- The "no server" promise can be **honest and functional**: network off by default, with an opt-in mode that either (a) uses `fetch` for package installs against CORS-friendly mirrors, or (b) uses a **self-hosted** `wisp`/`wsproxy` relay the user runs themselves. The third-party relay becomes an explicitly labelled convenience, not a hidden dependency.
+- The "no server" promise can be **honest and functional**: network off by default, with an opt-in mode that either (a) uses `fetch` for package installs against CORS-friendly mirrors, or (b) uses a **self-hosted** `wisp` relay the user runs themselves. The third-party relay becomes an explicitly labelled convenience, not a hidden dependency.
 - This also unlocks "the VM can talk to your host dev server" — huge for real work.
 
 ### 0.2 v86 is 32-bit only and single-core — a bigger constraint than the plan admits
