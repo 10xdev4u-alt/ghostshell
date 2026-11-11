@@ -233,6 +233,28 @@ function makeOPFSRoot() {
   };
 }
 
+/** Minimal IndexedDB `deleteDatabase` stand-in for the cache-clear tests. */
+function stubIndexedDBDelete(mode: 'success' | 'blocked' | 'error'): void {
+  vi.stubGlobal('indexedDB', {
+    deleteDatabase: vi.fn(() => {
+      const request = {
+        onsuccess: null as (() => void) | null,
+        onerror: null as (() => void) | null,
+        onblocked: null as (() => void) | null,
+        error: new DOMException('delete failed', 'UnknownError'),
+      };
+      // The request handlers are assigned after `deleteDatabase` returns, so
+      // fire the terminal event on the next microtask.
+      queueMicrotask(() => {
+        if (mode === 'blocked') request.onblocked?.();
+        else if (mode === 'error') request.onerror?.();
+        else request.onsuccess?.();
+      });
+      return request;
+    }),
+  });
+}
+
 describe('TransformersEngine', () => {
   beforeEach(() => {
     pipelineMock.mockReset();
@@ -377,6 +399,19 @@ describe('TransformersEngine', () => {
     expect(generator.dispose).toHaveBeenCalled();
   });
 
+  it('disposes the previous generator when load replaces it', async () => {
+    const first = makeGenerator();
+    const second = makeGenerator();
+    pipelineMock.mockResolvedValueOnce(first).mockResolvedValueOnce(second);
+    const engine = new TransformersEngine({ device: 'wasm', cache: 'browser' });
+    await engine.load(getModel('qwen2.5-1.5b'), () => {});
+    await engine.load(getModel('qwen2.5-3b'), () => {});
+
+    expect(first.dispose).toHaveBeenCalledTimes(1);
+    expect(second.dispose).not.toHaveBeenCalled();
+    expect(engine.isLoaded()).toBe(true);
+  });
+
   it('uses an OPFS-backed custom cache when OPFS is available', async () => {
     vi.stubGlobal('navigator', { storage: { getDirectory: vi.fn(async () => makeOPFSRoot()) } });
     pipelineMock.mockResolvedValue(makeGenerator());
@@ -430,6 +465,35 @@ describe('TransformersEngine', () => {
     });
   });
 
+  it('rejects when the IndexedDB cache deletion is blocked (#63)', async () => {
+    stubIndexedDBDelete('blocked');
+    await expect(clearTransformersCache()).rejects.toThrow(/blocked/i);
+  });
+
+  it('still clears the OPFS cache when the IndexedDB deletion is blocked (#63)', async () => {
+    stubIndexedDBDelete('blocked');
+    const root = makeOPFSRoot();
+    vi.stubGlobal('navigator', { storage: { getDirectory: vi.fn(async () => root) } });
+    pipelineMock.mockResolvedValue(makeGenerator());
+    const engine = new TransformersEngine({ device: 'wasm', cache: 'opfs' });
+    await engine.load(getModel('qwen2.5-1.5b'), () => {});
+
+    await expect(clearTransformersCache()).rejects.toThrow(/blocked/i);
+    expect(root.removeEntry).toHaveBeenCalledWith('ghostshell-transformers-cache', {
+      recursive: true,
+    });
+  });
+
+  it('rejects when the IndexedDB cache deletion errors (#63)', async () => {
+    stubIndexedDBDelete('error');
+    await expect(clearTransformersCache()).rejects.toThrow(/delete failed/);
+  });
+
+  it('resolves when the IndexedDB cache deletion succeeds (#63)', async () => {
+    stubIndexedDBDelete('success');
+    await expect(clearTransformersCache()).resolves.toBeUndefined();
+  });
+
   it('uses the filesystem cache for opfs in Node', async () => {
     vi.stubGlobal('navigator', {});
     pipelineMock.mockResolvedValue(makeGenerator());
@@ -468,6 +532,20 @@ describe('TransformersEngine', () => {
     await expect(engine.generate({ messages: [] }, () => {}, controller.signal)).rejects.toThrow(
       /not loaded/,
     );
+  });
+
+  it('propagates generation errors instead of reporting an error finish reason', async () => {
+    pipelineMock.mockResolvedValue(
+      makeGenerator(() => {
+        throw new Error('model exploded');
+      }),
+    );
+    const engine = new TransformersEngine({ device: 'wasm', cache: 'browser' });
+    await engine.load(getModel('qwen2.5-1.5b'), () => {});
+
+    await expect(
+      engine.generate({ messages: [] }, () => {}, new AbortController().signal),
+    ).rejects.toThrow(/model exploded/);
   });
 
   it('passes tool calls and tool messages through to the chat template', async () => {
@@ -615,6 +693,26 @@ describe('TransformersEngine', () => {
 
     options.progress_callback({ status: 'ready', task: 'text-generation', model: 'model' });
     expect(progress.at(-1)).toMatchObject({ phase: 'loading', percent: 100 });
+  });
+
+  it('does not fall back to the registry size for a done event without progress (#63)', async () => {
+    pipelineMock.mockResolvedValue(makeGenerator());
+    const engine = new TransformersEngine({ device: 'wasm', cache: 'browser' });
+    const progress: ModelProgress[] = [];
+    await engine.load(getModel('qwen2.5-1.5b'), (p) => progress.push(p));
+
+    const options = pipelineMock.mock.calls[0]![2] as {
+      progress_callback: (info: unknown) => void;
+    };
+    progress.length = 0;
+
+    options.progress_callback({ status: 'done', name: 'model', file: 'uncounted.onnx' });
+    expect(progress.at(-1)).toMatchObject({
+      phase: 'downloading',
+      loaded: 0,
+      total: 0,
+      percent: null,
+    });
   });
 
   it('reports token progress while generating', async () => {
