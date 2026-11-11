@@ -172,8 +172,9 @@ export function downloadPrivacyReport(report: PrivacyReport): void {
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
-  // Revoke on the next tick so the click has a chance to start the download.
-  setTimeout(() => URL.revokeObjectURL(url), 0);
+  // Revoke well after the click: revoking on the next tick can cancel the
+  // download before the browser has consumed the blob in some engines.
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }
 
 /**
