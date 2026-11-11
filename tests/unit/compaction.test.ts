@@ -98,6 +98,35 @@ describe('compaction', () => {
     const result = await compactMessages(messages, 100, async () => 's'.repeat(400));
 
     expect(result.compacted).toBe(true);
+    expect(result.removed).toBe(1);
+    // The summary cannot fit alongside the request, so it is dropped and the
+    // request is kept whole rather than truncated.
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0]!.content).toBe('b'.repeat(400));
+    expect(result.messages.some((m) => m.content.includes('Summary of earlier conversation'))).toBe(false);
+    expect(tokenBudget(result.messages)).toBeLessThanOrEqual(100);
+  });
+
+  it('drops the current request without regenerating a summary when the system prompt fills the budget', async () => {
+    const messages = [
+      message('system', 'x'.repeat(400)), // 100 tokens
+      message('user', 'y'.repeat(400)), // 100 tokens, current request
+    ];
+    let summarizeCalls = 0;
+
+    const result = await compactMessages(messages, 100, async () => {
+      summarizeCalls += 1;
+      return 's'.repeat(400);
+    });
+
+    expect(result.compacted).toBe(true);
+    expect(result.removed).toBe(1);
+    // The system prompt alone fills the budget, so there is no room for a
+    // summary: the request is dropped and no summarization call is made.
+    expect(summarizeCalls).toBe(0);
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0]!.content).toBe('x'.repeat(400));
+    expect(result.messages.some((m) => m.content.includes('Summary of earlier conversation'))).toBe(false);
     expect(tokenBudget(result.messages)).toBeLessThanOrEqual(100);
   });
 
