@@ -28,18 +28,15 @@ export default defineConfig({
       provider: 'v8',
       reporter: ['text', 'html', 'lcov'],
       include: ['src/**/*.ts'],
-      // The 80% policy from #29 is not met yet. Measured 2026-11-11 on the
-      // v0.1 suite (390 tests): statements 77.53%, branches 80.43%,
-      // functions 86.97%, lines 77.53%. Thresholds sit just below those
-      // numbers so the gate is real and passes today: any drop in coverage
-      // fails CI. Statements and lines are 2.47 points under the 80% target;
-      // a follow-up issue must raise all four thresholds to 80 as coverage
-      // improves.
+      // 80% policy from #29, now met. Measured 2026-11-11 on the v0.1 suite
+      // (599 passing tests): statements 93.91%, branches 85.27%,
+      // functions 92.22%, lines 93.91%. All four thresholds sit at the policy
+      // floor, so any drop below 80% fails CI.
       thresholds: {
-        statements: 77,
+        statements: 80,
         branches: 80,
-        functions: 86,
-        lines: 77,
+        functions: 80,
+        lines: 80,
       },
     },
     testTimeout: 20_000,

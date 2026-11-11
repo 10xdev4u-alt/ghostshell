@@ -36,6 +36,8 @@ class FakeLLM implements LLMEngine {
   requests: GenerateRequest[] = [];
   fallback: GenerateResult = { text: 'All done.', tokens: 1, finishReason: 'stop' };
   onGenerate: ((req: GenerateRequest) => void) | null = null;
+  /** Injected failure: generate() rejects with this error. */
+  throwError: Error | null = null;
   /** When false, an aborted signal yields an aborted result instead of a throw. */
   throwOnAbort = true;
 
@@ -52,6 +54,7 @@ class FakeLLM implements LLMEngine {
   ): Promise<GenerateResult> {
     this.requests.push(req);
     this.onGenerate?.(req);
+    if (this.throwError) throw this.throwError;
     if (signal.aborted) {
       if (this.throwOnAbort) throw new Error('aborted');
       return { text: '', tokens: 0, finishReason: 'aborted' };
@@ -599,6 +602,101 @@ describe('AgentLoop', () => {
     expect(result.messages.filter((m) => m.role === 'system')).toHaveLength(1);
     expect(result.messages[0]!.content).toBe('Custom system prompt.');
   });
+
+  it('reports a tool failure when the tool throws a non-Error', async () => {
+    const llm = new FakeLLM();
+    llm.fallback = { text: toolCall('explode', {}), tokens: 1, finishReason: 'stop' };
+    const exploding: ToolDefinition = {
+      name: 'explode',
+      description: 'throws a string',
+      parameters: { type: 'object', properties: {} },
+      execute: () => {
+        throw 'boom-string';
+      },
+    };
+    const loop = new AgentLoop(
+      new Map([['explode', exploding]]),
+      makeConfig({ maxIterations: 1 }),
+    );
+    const steps: AgentStep[] = [];
+
+    const result = await run(
+      loop,
+      makeConversation([makeMessage('user', 'hi')]),
+      makeContext(new FakeVM(), llm),
+      steps,
+    );
+
+    expect(result.finishReason).toBe('max-iterations');
+    expect(steps[0]!.results[0]!.ok).toBe(false);
+    expect(steps[0]!.results[0]!.content).toBe('Tool "explode" failed: boom-string');
+  });
+
+  it('returns an error when the LLM throws a non-abort error', async () => {
+    const llm = new FakeLLM();
+    llm.throwError = new Error('engine exploded');
+    const loop = new AgentLoop(makeTools(), makeConfig());
+
+    const result = await run(
+      loop,
+      makeConversation([makeMessage('user', 'hi')]),
+      makeContext(new FakeVM(), llm),
+    );
+
+    expect(result.finishReason).toBe('error');
+    expect(result.error).toBe('engine exploded');
+  });
+
+  it('summarizes tool results from dropped messages', async () => {
+    const llm = new FakeLLM();
+    llm.queue = [
+      { text: 'Earlier work summarized.', tokens: 3, finishReason: 'stop' },
+      { text: 'Done.', tokens: 1, finishReason: 'stop' },
+    ];
+    const loop = new AgentLoop(makeTools(), makeConfig({ contextWindow: 100 }));
+    const messages = [
+      makeMessage('system', 'sys'),
+      makeMessage('assistant', 'a'.repeat(200), {
+        toolResults: [{ ok: true, content: 'b'.repeat(200) }],
+      }),
+      makeMessage('user', 'c'.repeat(40)),
+    ];
+
+    const result = await run(loop, makeConversation(messages), makeContext(new FakeVM(), llm));
+
+    expect(result.finishReason).toBe('stop');
+    expect(llm.requests[0]!.messages.some((m) => m.content.includes('[tool result]'))).toBe(true);
+  });
+
+  it('ignores a tool rejection that arrives after the timeout', async () => {
+    const rejecting: ToolDefinition = {
+      name: 'rejecting',
+      description: 'rejects after the timeout',
+      parameters: { type: 'object', properties: {} },
+      execute: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        throw new Error('late failure');
+      },
+    };
+    const llm = new FakeLLM();
+    llm.fallback = { text: toolCall('rejecting', {}), tokens: 1, finishReason: 'stop' };
+    const loop = new AgentLoop(
+      new Map([['rejecting', rejecting]]),
+      makeConfig({ toolTimeoutMs: 20, maxIterations: 1 }),
+    );
+    const steps: AgentStep[] = [];
+
+    const result = await run(
+      loop,
+      makeConversation([makeMessage('user', 'hi')]),
+      makeContext(new FakeVM(), llm),
+      steps,
+    );
+
+    expect(result.finishReason).toBe('max-iterations');
+    expect(steps[0]!.results[0]!.ok).toBe(false);
+    expect(steps[0]!.results[0]!.content).toContain('timed out');
+  });
 });
 
 describe('grammar caching', () => {
@@ -640,5 +738,37 @@ describe('grammar caching', () => {
     });
     await run(loop, makeConversation([makeMessage('user', 'hi')]), makeContext(new FakeVM(), llm));
     expect(vi.mocked(buildToolCallGrammar)).toHaveBeenCalledTimes(2);
+  });
+
+  it('falls back to unconstrained generation when the grammar builder throws', async () => {
+    vi.mocked(buildToolCallGrammar).mockClear();
+    vi.mocked(buildToolCallGrammar).mockImplementationOnce(() => {
+      throw new Error('bad schema');
+    });
+    const llm = new FakeLLM();
+    llm.queue = [{ text: 'Done.', tokens: 1, finishReason: 'stop' }];
+    const loop = new AgentLoop(makeTools(), makeConfig());
+
+    const result = await run(
+      loop,
+      makeConversation([makeMessage('user', 'hi')]),
+      makeContext(new FakeVM(), llm),
+    );
+
+    expect(result.finishReason).toBe('stop');
+    expect(llm.requests[0]!.grammar).toBeUndefined();
+  });
+});
+
+describe('createToolRegistry', () => {
+  it('rejects duplicate tool names', () => {
+    const def: ToolDefinition = {
+      name: 'dup',
+      description: 'duplicate',
+      parameters: { type: 'object', properties: {} },
+      execute: async () => ({ ok: true, content: '' }),
+    };
+
+    expect(() => createToolRegistry([def, def])).toThrow('Duplicate tool name: dup');
   });
 });

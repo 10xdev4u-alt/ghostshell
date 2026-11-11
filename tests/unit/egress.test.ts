@@ -275,6 +275,13 @@ describe('InMemoryEgressLog', () => {
     log.list().pop();
     expect(log.list()).toHaveLength(1);
   });
+
+  it('clears the log', () => {
+    const log = new InMemoryEgressLog();
+    log.record({ url: 'https://example.com', method: 'GET', blocked: false });
+    log.clear();
+    expect(log.list()).toHaveLength(0);
+  });
 });
 
 describe('isEgressAllowed', () => {
@@ -300,6 +307,10 @@ describe('isEgressAllowed', () => {
 
   it('returns false for an empty allowlist', () => {
     expect(isEgressAllowed('https://copy.sh', [])).toBe(false);
+  });
+
+  it('treats an unparseable URL as not allowed', () => {
+    expect(isEgressAllowed('not a url', [{ host: 'example.com' }])).toBe(false);
   });
 });
 

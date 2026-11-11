@@ -173,4 +173,40 @@ describe('compaction', () => {
     // The most recent message is never dropped.
     expect(summarized).not.toContain('fourth');
   });
+
+  it('truncates the current request to the remaining budget', async () => {
+    const messages = [message('system', 'sys'), message('user', 'y'.repeat(400))];
+
+    const result = await compactMessages(messages, 100, async () => 'summary');
+
+    expect(result.compacted).toBe(true);
+    const current = result.messages.at(-1)!;
+    expect(current.content).toHaveLength(396); // 99 tokens
+    expect(tokenBudget(result.messages)).toBeLessThanOrEqual(100);
+  });
+
+  it('truncates an oversized system prompt to the budget', async () => {
+    const messages = [message('system', 'x'.repeat(800)), message('user', 'hi')];
+
+    const result = await compactMessages(messages, 100, async () => 'summary');
+
+    expect(result.compacted).toBe(true);
+    const system = result.messages[0]!;
+    expect(system.content).toHaveLength(400); // 100 tokens
+    expect(tokenBudget(result.messages)).toBeLessThanOrEqual(100);
+  });
+
+  it('drops a system message that cannot fit at all', async () => {
+    const messages = [
+      message('system', 'a'.repeat(400)),
+      message('system', 'b'.repeat(400)),
+      message('user', 'c'.repeat(400)),
+    ];
+
+    const result = await compactMessages(messages, 100, async () => 'summary');
+
+    expect(result.compacted).toBe(true);
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0]!.content).toBe('a'.repeat(400));
+  });
 });

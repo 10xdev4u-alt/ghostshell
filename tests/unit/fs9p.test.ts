@@ -984,3 +984,455 @@ describe('copy-on-write helpers', () => {
     expect(copy.qidVersion).toBe(node.qidVersion);
   });
 });
+
+describe('fs9p 9P2000.L handlers', () => {
+  async function connected(handle: Fs9pHandle): Promise<void> {
+    await request(handle, 100, 1, new FrameWriter().u32(8192).string('9P2000.L').build());
+    await request(handle, 104, 2, attachPayload(1));
+  }
+
+  it('creates a directory with Tmkdir and rejects duplicates', async () => {
+    const { deps } = makeDeps();
+    const handle = create9pHandler(deps, { autoPersist: false });
+    await connected(handle);
+
+    const mkdir = await request(
+      handle,
+      72,
+      3,
+      new FrameWriter().u32(1).string('sub').u32(0o755).u32(0).build(),
+    );
+    expect(mkdir.type).toBe(73);
+    expect(new FrameReader(mkdir.payload).qid().type).toBe(0x40);
+
+    const again = await request(
+      handle,
+      72,
+      4,
+      new FrameWriter().u32(1).string('sub').u32(0o755).u32(0).build(),
+    );
+    expect(again.type).toBe(7);
+    expect(new FrameReader(again.payload).u32()).toBe(17); // EEXIST
+
+    const walk = await request(
+      handle,
+      110,
+      5,
+      new FrameWriter().u32(1).u32(2).u16(1).string('sub').build(),
+    );
+    expect(walk.type).toBe(111);
+    const walkReply = new FrameReader(walk.payload);
+    expect(walkReply.u16()).toBe(1);
+    expect(walkReply.qid().type).toBe(0x40);
+    await handle.flush();
+  });
+
+  it('creates and reads a symlink with Tsymlink and Treadlink', async () => {
+    const { deps } = makeDeps();
+    const handle = create9pHandler(deps, { autoPersist: false });
+    await connected(handle);
+
+    const symlink = await request(
+      handle,
+      16,
+      3,
+      new FrameWriter().u32(1).string('link').string('/etc/hosts').u32(0).build(),
+    );
+    expect(symlink.type).toBe(17);
+    expect(new FrameReader(symlink.payload).qid().type).toBe(0xa0);
+
+    await request(
+      handle,
+      110,
+      4,
+      new FrameWriter().u32(1).u32(2).u16(1).string('link').build(),
+    );
+    const readlink = await request(handle, 22, 5, new FrameWriter().u32(2).build());
+    expect(readlink.type).toBe(23);
+    expect(new FrameReader(readlink.payload).string()).toBe('/etc/hosts');
+
+    const notLink = await request(handle, 22, 6, new FrameWriter().u32(1).build());
+    expect(notLink.type).toBe(7);
+    expect(new FrameReader(notLink.payload).u32()).toBe(22); // EINVAL
+
+    const open = await request(handle, 12, 7, new FrameWriter().u32(2).u32(0).build());
+    expect(open.type).toBe(7);
+    expect(new FrameReader(open.payload).u32()).toBe(2); // ENOENT
+    await handle.flush();
+  });
+
+  it('creates a device node with Tmknod and encodes rdev', async () => {
+    const { deps } = makeDeps();
+    const handle = create9pHandler(deps, { autoPersist: false });
+    await connected(handle);
+
+    const mknod = await request(
+      handle,
+      18,
+      3,
+      new FrameWriter().u32(1).string('dev').u32(0o100644).u32(1).u32(3).u32(0).build(),
+    );
+    expect(mknod.type).toBe(19);
+    const node = findNode(handle.tree, '/dev')!;
+    expect(node?.kind).toBe('file');
+    expect(node.rdev).toBe((1 << 8) | 3);
+    await handle.flush();
+  });
+
+  it('renames a file with Trenameat and reports a missing source', async () => {
+    const { deps } = makeDeps();
+    const handle = create9pHandler(deps, { autoPersist: false });
+    await connected(handle);
+    await request(handle, 104, 3, attachPayload(2));
+    await request(handle, 104, 4, attachPayload(3));
+    await request(handle, 104, 5, attachPayload(4));
+    await request(
+      handle,
+      14,
+      6,
+      new FrameWriter().u32(1).string('a.txt').u32(0x2).u32(0o100644).u32(0).build(),
+    );
+    await request(
+      handle,
+      14,
+      7,
+      new FrameWriter().u32(2).string('b.txt').u32(0x2).u32(0o100644).u32(0).build(),
+    );
+
+    const rename = await request(
+      handle,
+      74,
+      8,
+      new FrameWriter().u32(3).string('a.txt').u32(4).string('b.txt').build(),
+    );
+    expect(rename.type).toBe(75);
+    expect(findNode(handle.tree, '/a.txt')).toBeUndefined();
+    expect(findNode(handle.tree, '/b.txt')).toBeDefined();
+
+    const missing = await request(
+      handle,
+      74,
+      9,
+      new FrameWriter().u32(3).string('nope').u32(4).string('c.txt').build(),
+    );
+    expect(missing.type).toBe(7);
+    expect(new FrameReader(missing.payload).u32()).toBe(2); // ENOENT
+    await handle.flush();
+  });
+
+  it('removes directories with Tunlinkat and AT_REMOVEDIR', async () => {
+    const { deps } = makeDeps();
+    const handle = create9pHandler(deps, { autoPersist: false });
+    await connected(handle);
+    await request(handle, 104, 3, attachPayload(2));
+    await request(handle, 104, 4, attachPayload(3));
+    await request(handle, 72, 5, new FrameWriter().u32(1).string('sub').u32(0o755).u32(0).build());
+    // Walk into the new directory and create a file inside it.
+    await request(
+      handle,
+      110,
+      6,
+      new FrameWriter().u32(2).u32(5).u16(1).string('sub').build(),
+    );
+    await request(
+      handle,
+      14,
+      7,
+      new FrameWriter().u32(5).string('inner.txt').u32(0x2).u32(0o100644).u32(0).build(),
+    );
+    await request(
+      handle,
+      14,
+      8,
+      new FrameWriter().u32(2).string('plain.txt').u32(0x2).u32(0o100644).u32(0).build(),
+    );
+
+    const nonEmpty = await request(
+      handle,
+      76,
+      9,
+      new FrameWriter().u32(3).string('sub').u32(0x200).build(),
+    );
+    expect(nonEmpty.type).toBe(7);
+    expect(new FrameReader(nonEmpty.payload).u32()).toBe(39); // ENOTEMPTY
+
+    const notDir = await request(
+      handle,
+      76,
+      10,
+      new FrameWriter().u32(3).string('plain.txt').u32(0x200).build(),
+    );
+    expect(notDir.type).toBe(7);
+    expect(new FrameReader(notDir.payload).u32()).toBe(20); // ENOTDIR
+
+    const isDir = await request(
+      handle,
+      76,
+      11,
+      new FrameWriter().u32(3).string('sub').u32(0).build(),
+    );
+    expect(isDir.type).toBe(7);
+    expect(new FrameReader(isDir.payload).u32()).toBe(21); // EISDIR
+
+    // Empty the directory, then remove it with AT_REMOVEDIR.
+    await request(handle, 110, 12, new FrameWriter().u32(1).u32(6).u16(1).string('sub').build());
+    await request(handle, 76, 13, new FrameWriter().u32(6).string('inner.txt').u32(0).build());
+    const removed = await request(
+      handle,
+      76,
+      14,
+      new FrameWriter().u32(3).string('sub').u32(0x200).build(),
+    );
+    expect(removed.type).toBe(77);
+    expect(findNode(handle.tree, '/sub')).toBeUndefined();
+    await handle.flush();
+  });
+
+  it('removes a file fid with Tremove', async () => {
+    const { deps } = makeDeps();
+    const handle = create9pHandler(deps, { autoPersist: false });
+    await connected(handle);
+    await request(
+      handle,
+      14,
+      3,
+      new FrameWriter().u32(1).string('gone.txt').u32(0x2).u32(0o100644).u32(0).build(),
+    );
+
+    const remove = await request(handle, 122, 4, new FrameWriter().u32(1).build());
+    expect(remove.type).toBe(123);
+    expect(findNode(handle.tree, '/gone.txt')).toBeUndefined();
+
+    const again = await request(handle, 122, 5, new FrameWriter().u32(1).build());
+    expect(again.type).toBe(7);
+    expect(new FrameReader(again.payload).u32()).toBe(9); // EBADF
+    await handle.flush();
+  });
+
+  it('reports filesystem statistics with Tstatfs', async () => {
+    const { deps } = makeDeps();
+    const handle = create9pHandler(deps, { autoPersist: false });
+    await connected(handle);
+    await request(
+      handle,
+      14,
+      3,
+      new FrameWriter().u32(1).string('a.txt').u32(0x2).u32(0o100644).u32(0).build(),
+    );
+
+    const statfs = await request(handle, 8, 4, new FrameWriter().u32(1).build());
+    expect(statfs.type).toBe(9);
+    const r = new FrameReader(statfs.payload);
+    expect(r.u32()).toBe(0x01021997);
+    expect(r.u32()).toBe(4096);
+    expect(r.u64()).toBe(BigInt(64 * 1024 * 1024)); // blocks
+    expect(r.u64()).toBe(BigInt(64 * 1024 * 1024)); // bfree
+    expect(r.u64()).toBe(BigInt(64 * 1024 * 1024)); // bavail
+    expect(r.u64()).toBe(1n); // files
+    await handle.flush();
+  });
+
+  it('answers Tfsync and Tflush', async () => {
+    const { deps } = makeDeps();
+    const handle = create9pHandler(deps, { autoPersist: false });
+    await connected(handle);
+
+    const fsync = await request(handle, 50, 3, new FrameWriter().u32(1).build());
+    expect(fsync.type).toBe(51);
+    expect(fsync.payload.byteLength).toBe(0);
+
+    const flush = await request(handle, 108, 4, new FrameWriter().u16(9).build());
+    expect(flush.type).toBe(109);
+    expect(flush.payload.byteLength).toBe(0);
+    await handle.flush();
+  });
+
+  it('rejects unknown message types with EOPNOTSUPP', async () => {
+    const { deps } = makeDeps();
+    const handle = create9pHandler(deps, { autoPersist: false });
+    await connected(handle);
+
+    const reply = await request(handle, 999, 3, new Uint8Array());
+    expect(reply.type).toBe(7);
+    expect(new FrameReader(reply.payload).u32()).toBe(95);
+    await handle.flush();
+  });
+
+  it('walks zero names, ".", and ".."', async () => {
+    const { deps } = makeDeps();
+    const handle = create9pHandler(deps, { autoPersist: false });
+    await connected(handle);
+    await request(handle, 72, 3, new FrameWriter().u32(1).string('sub').u32(0o755).u32(0).build());
+
+    const zero = await request(handle, 110, 4, new FrameWriter().u32(1).u32(2).u16(0).build());
+    expect(zero.type).toBe(111);
+    expect(new FrameReader(zero.payload).u16()).toBe(0);
+
+    await request(
+      handle,
+      110,
+      5,
+      new FrameWriter().u32(1).u32(3).u16(1).string('sub').build(),
+    );
+    const dot = await request(
+      handle,
+      110,
+      6,
+      new FrameWriter().u32(3).u32(4).u16(1).string('.').build(),
+    );
+    expect(dot.type).toBe(111);
+    const dotReply = new FrameReader(dot.payload);
+    expect(dotReply.u16()).toBe(1);
+    expect(dotReply.qid().type).toBe(0x40);
+
+    const dotdot = await request(
+      handle,
+      110,
+      7,
+      new FrameWriter().u32(4).u32(5).u16(1).string('..').build(),
+    );
+    expect(dotdot.type).toBe(111);
+    const dotdotReply = new FrameReader(dotdot.payload);
+    expect(dotdotReply.u16()).toBe(1);
+    expect(dotdotReply.qid().path).toBe(0n); // root qid path
+    await handle.flush();
+  });
+
+  it('rejects reads and writes on the wrong node type', async () => {
+    const { deps } = makeDeps();
+    const handle = create9pHandler(deps, { autoPersist: false });
+    await connected(handle);
+    await request(handle, 104, 3, attachPayload(2));
+    await request(
+      handle,
+      14,
+      4,
+      new FrameWriter().u32(1).string('f.txt').u32(0x2).u32(0o100644).u32(0).build(),
+    );
+
+    const readdir = await request(handle, 40, 5, new FrameWriter().u32(1).u64(0).u32(64).build());
+    expect(readdir.type).toBe(7);
+    expect(new FrameReader(readdir.payload).u32()).toBe(20); // ENOTDIR
+
+    await request(handle, 12, 6, new FrameWriter().u32(2).u32(0).build());
+    const write = await request(
+      handle,
+      118,
+      7,
+      new FrameWriter().u32(2).u64(0).u32(1).bytes(text.encode('x')).build(),
+    );
+    expect(write.type).toBe(7);
+    expect(new FrameReader(write.payload).u32()).toBe(21); // EISDIR
+
+    await request(
+      handle,
+      110,
+      8,
+      new FrameWriter().u32(2).u32(3).u16(1).string('f.txt').build(),
+    );
+    const read = await request(handle, 116, 9, new FrameWriter().u32(3).u64(0).u32(1).build());
+    expect(read.type).toBe(7);
+    expect(new FrameReader(read.payload).u32()).toBe(9); // EBADF: not opened
+
+    const walkFile = await request(
+      handle,
+      110,
+      10,
+      new FrameWriter().u32(3).u32(4).u16(1).string('x').build(),
+    );
+    expect(walkFile.type).toBe(7);
+    expect(new FrameReader(walkFile.payload).u32()).toBe(20); // ENOTDIR
+    await handle.flush();
+  });
+
+  it('truncates and extends a file with Tsetattr size', async () => {
+    const { deps } = makeDeps();
+    const handle = create9pHandler(deps, { autoPersist: false });
+    await connected(handle);
+    await request(
+      handle,
+      14,
+      3,
+      new FrameWriter().u32(1).string('f.txt').u32(0x2).u32(0o100644).u32(0).build(),
+    );
+    const data = text.encode('hello world');
+    await request(
+      handle,
+      118,
+      4,
+      new FrameWriter().u32(1).u64(0).u32(data.byteLength).bytes(data).build(),
+    );
+
+    const shrink = await request(handle, 26, 5, setattrPayload(0x8, 5n, 0n, 0n, 0n, 0n));
+    expect(shrink.type).toBe(27);
+    const node = findNode(handle.tree, '/f.txt')!;
+    expect(new TextDecoder().decode(node.data)).toBe('hello');
+
+    await request(handle, 26, 6, setattrPayload(0x8, 8n, 0n, 0n, 0n, 0n));
+    expect(new TextDecoder().decode(node.data)).toBe('hello\u0000\u0000\u0000');
+    await handle.flush();
+  });
+
+  it('auto-persists after the debounce window', async () => {
+    const { deps } = makeDeps();
+    const handle = create9pHandler(deps, { autoPersist: true, persistDebounceMs: 10 });
+    await connected(handle);
+    await request(
+      handle,
+      14,
+      3,
+      new FrameWriter().u32(1).string('auto.txt').u32(0x2).u32(0o100644).u32(0).build(),
+    );
+    await request(
+      handle,
+      118,
+      4,
+      new FrameWriter().u32(1).u64(0).u32(4).bytes(text.encode('auto')).build(),
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    const reloaded = await loadTree(deps, 'test');
+    expect(findNode(reloaded!, '/auto.txt')).toBeDefined();
+    await handle.flush();
+  });
+
+  it('flush persists pending changes before the debounce fires', async () => {
+    const { deps } = makeDeps();
+    const handle = create9pHandler(deps, { autoPersist: true, persistDebounceMs: 5_000 });
+    await connected(handle);
+    await request(
+      handle,
+      14,
+      3,
+      new FrameWriter().u32(1).string('quick.txt').u32(0x2).u32(0o100644).u32(0).build(),
+    );
+    await handle.flush();
+
+    const reloaded = await loadTree(deps, 'test');
+    expect(findNode(reloaded!, '/quick.txt')).toBeDefined();
+  });
+
+  it('answers a malformed frame with an EINVAL error frame', async () => {
+    const { deps } = makeDeps();
+    const handle = create9pHandler(deps, { autoPersist: false });
+
+    const reply = await new Promise<Reply>((resolve) => {
+      handle(new Uint8Array([1, 2, 3]), (buf) => resolve(decodeReply(buf)));
+    });
+    expect(reply.type).toBe(7);
+    expect(reply.tag).toBe(0);
+    expect(new FrameReader(reply.payload).u32()).toBe(22);
+  });
+
+  it('answers a truncated request payload with EINVAL', async () => {
+    const { deps } = makeDeps();
+    const handle = create9pHandler(deps, { autoPersist: false });
+    await request(handle, 100, 1, new FrameWriter().u32(8192).string('9P2000.L').build());
+
+    // Tattach with only the fid: the afid read runs off the end.
+    const reply = await request(handle, 104, 2, new FrameWriter().u32(1).build());
+    expect(reply.type).toBe(7);
+    expect(new FrameReader(reply.payload).u32()).toBe(22);
+    await handle.flush();
+  });
+});
