@@ -15,6 +15,10 @@
  *   PR_NUMBER      PR number when --pr is omitted (gh infers from the branch)
  *   GITHUB_EVENT_NAME  event name; a `push` value skips the check
  *   GH_TOKEN       token for `gh pr view` (set automatically in Actions)
+ *
+ * If gh is missing or not authenticated, the check prints a warning and exits
+ * 0: an environment problem should not fail every PR. Invalid payloads and
+ * over-limit PRs still exit non-zero.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -31,6 +35,7 @@ export interface PrSizeInput {
   additions: number;
   deletions: number;
   files: PrFileChange[];
+  /** Derived from `state`; gh has no `merged` field. */
   merged: boolean | undefined;
 }
 
@@ -74,7 +79,21 @@ function readCount(value: unknown, field: string): number {
   return value;
 }
 
-/** Parse the JSON payload from `gh pr view --json additions,deletions,files,merged`. */
+type PrState = 'OPEN' | 'MERGED' | 'CLOSED';
+
+function readState(value: unknown): PrState {
+  if (value !== 'OPEN' && value !== 'MERGED' && value !== 'CLOSED') {
+    throw new Error(
+      `gh pr view returned an invalid state: ${String(value)} (expected OPEN, MERGED, or CLOSED)`,
+    );
+  }
+  return value;
+}
+
+/**
+ * Parse the JSON payload from `gh pr view --json additions,deletions,files,state`.
+ * gh has no `merged` field, so `merged` is derived from `state`.
+ */
 export function parsePrViewJson(raw: string): PrSizeInput {
   let data: unknown;
   try {
@@ -86,6 +105,7 @@ export function parsePrViewJson(raw: string): PrSizeInput {
     throw new Error('gh pr view returned a non-object payload');
   }
   const record = data as Record<string, unknown>;
+  const state = readState(record.state);
   const rawFiles = record.files;
   if (!Array.isArray(rawFiles)) {
     throw new Error('gh pr view payload is missing the files array');
@@ -105,7 +125,7 @@ export function parsePrViewJson(raw: string): PrSizeInput {
     additions: readCount(record.additions, 'additions'),
     deletions: readCount(record.deletions, 'deletions'),
     files,
-    merged: typeof record.merged === 'boolean' ? record.merged : undefined,
+    merged: state === 'MERGED',
   };
 }
 
@@ -168,11 +188,53 @@ export function formatReport(report: PrSizeReport): string {
   return lines.join('\n');
 }
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isEnoent(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    (error as { code?: unknown }).code === 'ENOENT'
+  );
+}
+
+/**
+ * Return an actionable message when gh cannot run the check at all (not
+ * installed, or not authenticated). `null` means gh is usable.
+ */
+export function ghEnvironmentProblem(): string | null {
+  try {
+    execFileSync('gh', ['--version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (error) {
+    if (isEnoent(error)) {
+      return (
+        'gh CLI is not installed or not on PATH. ' +
+        'Install it from https://cli.github.com/ or fix your PATH.'
+      );
+    }
+    return `Could not run \`gh --version\`: ${errorMessage(error)}.`;
+  }
+
+  try {
+    execFileSync('gh', ['auth', 'status'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch {
+    return 'gh is not authenticated. Run `gh auth login` or set GH_TOKEN.';
+  }
+
+  return null;
+}
+
 /** Run `gh pr view` and return the parsed payload. `null` lets gh infer the PR. */
 export function fetchPrSize(prNumber: number | null): PrSizeInput {
   const args = ['pr', 'view'];
   if (prNumber !== null) args.push(String(prNumber));
-  args.push('--json', 'additions,deletions,files,merged');
+  args.push('--json', 'additions,deletions,files,state');
   const raw = execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
   return parsePrViewJson(raw);
 }
@@ -244,6 +306,7 @@ Environment:
   GH_TOKEN           Token for gh pr view
 
 Exits non-zero when the PR is over the limit and --warn is not set.
+Exits 0 with a warning when gh is missing or not authenticated.
 `);
 }
 
@@ -255,20 +318,25 @@ if (invokedDirectly) {
     if (args.help) {
       printHelp();
     } else {
-      const data = fetchPrSize(args.prNumber);
-      const report = buildReport({
-        number: args.prNumber,
-        data,
-        limit: args.limit,
-        eventName: process.env.GITHUB_EVENT_NAME,
-      });
-      process.stdout.write(`${formatReport(report)}\n`);
-      if (!report.skipped && report.overLimit && !args.warnOnly) {
-        process.exitCode = 1;
+      const ghProblem = ghEnvironmentProblem();
+      if (ghProblem !== null) {
+        process.stderr.write(`⚠ PR size check skipped: ${ghProblem}\n`);
+      } else {
+        const data = fetchPrSize(args.prNumber);
+        const report = buildReport({
+          number: args.prNumber,
+          data,
+          limit: args.limit,
+          eventName: process.env.GITHUB_EVENT_NAME,
+        });
+        process.stdout.write(`${formatReport(report)}\n`);
+        if (!report.skipped && report.overLimit && !args.warnOnly) {
+          process.exitCode = 1;
+        }
       }
     }
   } catch (error) {
-    process.stderr.write(`✗ ${error instanceof Error ? error.message : String(error)}\n`);
+    process.stderr.write(`✗ ${errorMessage(error)}\n`);
     process.exitCode = 1;
   }
 }
