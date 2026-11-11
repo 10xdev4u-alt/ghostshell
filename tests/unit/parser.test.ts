@@ -42,6 +42,27 @@ describe('parseToolCalls', () => {
     const result = parseToolCalls('{"name":"bash","arguments":"{\\"command\\":\\"ls\\"}"}');
     expect(result.toolCalls[0]!.arguments).toEqual({ command: 'ls' });
   });
+
+  it('skips malformed fenced blocks and parses the valid one', () => {
+    const result = parseToolCalls(
+      '```json\nnot json\n```\n```json\n{"name":"bash","arguments":{"command":"ls"}}\n```',
+    );
+    expect(result.strategy).toBe('fenced');
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls[0]!.name).toBe('bash');
+  });
+
+  it('parses a calls array with an args payload', () => {
+    const result = parseToolCalls('{"calls":[{"name":"bash","args":{"command":"ls"}}]}');
+    expect(result.strategy).toBe('grammar');
+    expect(result.toolCalls[0]!.name).toBe('bash');
+    expect(result.toolCalls[0]!.arguments).toEqual({ command: 'ls' });
+  });
+
+  it('falls back to empty arguments when a string payload is malformed', () => {
+    const result = parseToolCalls('{"name":"bash","arguments":"not json"}');
+    expect(result.toolCalls[0]!.arguments).toEqual({});
+  });
 });
 
 describe('retryWithCorrection', () => {
@@ -69,5 +90,15 @@ describe('retryWithCorrection', () => {
     expect(result.aborted).toBe(true);
     expect(result.attempts).toBe(1);
     expect(generate).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns exhausted without generating when maxRetries is negative', async () => {
+    const generate = vi.fn(async () => ({ text: 'hello' }));
+
+    const result = await retryWithCorrection(generate, [], -1);
+
+    expect(result.exhausted).toBe(true);
+    expect(result.attempts).toBe(0);
+    expect(generate).not.toHaveBeenCalled();
   });
 });
