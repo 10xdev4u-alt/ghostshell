@@ -101,6 +101,7 @@ export class AgentLoop {
           (requestMessages) => this.generate(requestMessages, ctx, signal),
           messages,
           this.config.maxRetries,
+          signal,
         );
 
         if (outcome.aborted || signal.aborted) {

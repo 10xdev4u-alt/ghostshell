@@ -27,6 +27,8 @@ class FakeLLM implements LLMEngine {
   requests: GenerateRequest[] = [];
   fallback: GenerateResult = { text: 'All done.', tokens: 1, finishReason: 'stop' };
   onGenerate: ((req: GenerateRequest) => void) | null = null;
+  /** When false, an aborted signal yields an aborted result instead of a throw. */
+  throwOnAbort = true;
 
   async load(): Promise<void> {}
   async unload(): Promise<void> {}
@@ -41,7 +43,10 @@ class FakeLLM implements LLMEngine {
   ): Promise<GenerateResult> {
     this.requests.push(req);
     this.onGenerate?.(req);
-    if (signal.aborted) throw new Error('aborted');
+    if (signal.aborted) {
+      if (this.throwOnAbort) throw new Error('aborted');
+      return { text: '', tokens: 0, finishReason: 'aborted' };
+    }
     const next = this.queue.length > 0 ? this.queue.shift()! : this.fallback;
     for (const token of next.text) onToken(token);
     return next;
@@ -273,6 +278,26 @@ describe('AgentLoop', () => {
     const result = await run(loop, makeConversation([makeMessage('user', 'hi')]), makeContext(vm, llm), [], controller.signal);
 
     expect(result.finishReason).toBe('aborted');
+  });
+
+  it('stops retrying when the signal aborts between corrective attempts', async () => {
+    const controller = new AbortController();
+    const llm = new FakeLLM();
+    llm.throwOnAbort = false;
+    llm.fallback = { text: '<tool_call>not json</tool_call>', tokens: 1, finishReason: 'stop' };
+    llm.onGenerate = () => controller.abort();
+    const loop = new AgentLoop(makeTools(), makeConfig({ maxRetries: 5 }));
+
+    const result = await run(
+      loop,
+      makeConversation([makeMessage('user', 'hi')]),
+      makeContext(new FakeVM(), llm),
+      [],
+      controller.signal,
+    );
+
+    expect(result.finishReason).toBe('aborted');
+    expect(llm.requests).toHaveLength(1);
   });
 
   it('returns aborted when the signal is already aborted', async () => {
