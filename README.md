@@ -4,8 +4,15 @@
 > Real Linux VM. Local LLM. No server. No account. $0.
 
 [![CI](https://github.com/10xdev4u-alt/ghostshell/actions/workflows/ci.yml/badge.svg)](https://github.com/10xdev4u-alt/ghostshell/actions/workflows/ci.yml)
+[![Coverage: >= 80% policy](https://img.shields.io/badge/coverage-%3E%3D80%25-green)](https://github.com/10xdev4u-alt/ghostshell/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+
+<!-- The coverage badge above states the project policy (>= 80%), not a
+     measured number: publishing real coverage needs a Codecov token. To
+     regenerate the real number locally, run `bun run coverage:report`; the
+     gated run that CI enforces is `bun run test -- --coverage` (see the Test
+     job in .github/workflows/ci.yml). -->
 
 ---
 
