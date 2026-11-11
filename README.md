@@ -111,6 +111,22 @@ bun run test        # vitest
 bun run build       # vite build
 ```
 
+### End-to-end VM test
+
+`tests/e2e/vm-boot.spec.ts` boots the real v86 emulator in headless Chromium
+and runs `echo hello` through the app's serial command path.
+
+```bash
+bun run image:build # build images/alpine-fs.json (requires Docker)
+bun run test:e2e
+```
+
+The test needs the Alpine 9p rootfs, the v86 WASM, and reachability of
+`copy.sh` for the BIOS. If any of those is absent it skips with a message;
+a boot failure with all prerequisites present is a real test failure. CI runs
+the suite headless in a separate job, so a slow VM boot cannot fail the fast
+unit-test gate.
+
 ## License
 
 [MIT](LICENSE).
