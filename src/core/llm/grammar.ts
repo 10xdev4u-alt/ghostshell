@@ -53,6 +53,12 @@ interface ToolSchema {
 /**
  * Shared GBNF rules for JSON. Kept in `String.raw` so the escape sequences
  * (`\x7F`, `\n`, `\t`, `\"`, `\\`) survive verbatim into the emitted grammar.
+ *
+ * The `number` rule is copied verbatim from llama.cpp's `json.gbnf`,
+ * including its exponent quirk: `[eE] [-+]? [0-9] [1-9]{0,15}` rejects
+ * exponents with a `0` after the first digit (e.g. `1e10`). That is
+ * intentional. Do not "fix" it here without changing llama.cpp too, or
+ * grammar-constrained output will diverge from the reference runtime.
  */
 const COMMON_RULES = String.raw`
 char ::= [^"\\\x7F\x00-\x1F] | [\\] (["\\bfnrt] | "u" [0-9a-fA-F]{4})
@@ -148,6 +154,30 @@ export function buildToolCallGrammar(tools: GrammarTool[]): string {
   return lines.join('\n');
 }
 
+/** One tool variant inside the `tool_calls` array. */
+export interface ToolCallSchemaVariant {
+  type: 'object';
+  properties: {
+    name: { type: 'string'; enum: string[] };
+    arguments: unknown;
+  };
+  required: string[];
+  additionalProperties: false;
+}
+
+/** JSON Schema for the tool-call envelope `buildToolCallSchema` emits. */
+export interface ToolCallSchema {
+  type: 'object';
+  properties: {
+    tool_calls: {
+      type: 'array';
+      items: { oneOf: ToolCallSchemaVariant[] };
+    };
+  };
+  required: string[];
+  additionalProperties: false;
+}
+
 /**
  * Build a JSON Schema for the same tool-call shape.
  *
@@ -155,8 +185,11 @@ export function buildToolCallGrammar(tools: GrammarTool[]): string {
  * take a schema instead of a GBNF string. `oneOf` ties each tool name to its
  * own argument schema, which is the closest JSON Schema equivalent of the
  * GBNF dispatch in `buildToolCallGrammar`.
+ *
+ * This is a v1.0 API: it is exported and tested, but no caller in `src/`
+ * uses it yet.
  */
-export function buildToolCallSchema(tools: GrammarTool[]): unknown {
+export function buildToolCallSchema(tools: GrammarTool[]): ToolCallSchema {
   if (!Array.isArray(tools) || tools.length === 0) {
     throw new Error('buildToolCallSchema: at least one tool is required');
   }
@@ -285,7 +318,47 @@ class SlugAllocator {
   }
 }
 
-/** Quote a string as a GBNF terminal. */
+/**
+ * Quote a string as a GBNF terminal.
+ *
+ * The `char` rule in `COMMON_RULES` excludes `"` and `\` (which must be
+ * escaped) plus `\x00-\x1F` and `\x7F`. The named escapes cover the common
+ * whitespace controls; every other control character uses `\uXXXX`.
+ */
 function gbnfLiteral(value: string): string {
-  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  let escaped = '';
+  for (const char of value) {
+    switch (char) {
+      case '\\':
+        escaped += '\\\\';
+        break;
+      case '"':
+        escaped += '\\"';
+        break;
+      case '\b':
+        escaped += '\\b';
+        break;
+      case '\f':
+        escaped += '\\f';
+        break;
+      case '\n':
+        escaped += '\\n';
+        break;
+      case '\r':
+        escaped += '\\r';
+        break;
+      case '\t':
+        escaped += '\\t';
+        break;
+      default: {
+        const code = char.charCodeAt(0);
+        if (code < 0x20 || code === 0x7f) {
+          escaped += `\\u${code.toString(16).padStart(4, '0')}`;
+        } else {
+          escaped += char;
+        }
+      }
+    }
+  }
+  return `"${escaped}"`;
 }
