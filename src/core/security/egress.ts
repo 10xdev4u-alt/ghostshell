@@ -172,9 +172,11 @@ function patchFetch(log: EgressLog, blockAll: boolean, allowlist: EgressAllowlis
   const patched = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url =
       typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    // Duck-type the Request method: a Request from another realm is not
+    // `instanceof Request`, and the logged method would fall back to GET.
     const method =
       init?.method ??
-      (typeof Request !== 'undefined' && input instanceof Request ? input.method : 'GET');
+      (typeof input === 'object' && input !== null && 'method' in input ? input.method : 'GET');
     const blocked = isBlocked(url, blockAll, allowlist);
     record(log, blocked, url, method);
     if (blocked) {
