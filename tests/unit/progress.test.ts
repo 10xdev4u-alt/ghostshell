@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { ModelProgress } from '@/types/index.js';
-import { createModelProgress } from '@/ui/progress.js';
+import { MODEL_PROGRESS_PHASES, type ModelProgress } from '@/types/index.js';
+import { PHASE_LABELS, createModelProgress } from '@/ui/progress.js';
 import { FakeElement, findByClass, installFakeDocument } from './helpers/dom.js';
 
 function mount(): { container: FakeElement; handle: ReturnType<typeof createModelProgress> } {
@@ -78,5 +78,21 @@ describe('model progress panel', () => {
 
     handle.hide();
     expect(container.hidden).toBe(true);
+  });
+
+  it('labels exactly the emitted phases, with no dead entries (#102)', () => {
+    const labelled = Object.keys(PHASE_LABELS).sort();
+    expect(labelled).toEqual([...MODEL_PROGRESS_PHASES].sort());
+    expect(labelled).not.toContain('compiling');
+  });
+
+  it('renders the label for every phase in the union (#102)', () => {
+    for (const phase of MODEL_PROGRESS_PHASES) {
+      const { container, handle } = mount();
+      handle.show({ phase, loaded: 0, total: 0, percent: null });
+      expect(findByClass(container, 'gs-model-progress__label')?.textContent).toBe(
+        PHASE_LABELS[phase],
+      );
+    }
   });
 });

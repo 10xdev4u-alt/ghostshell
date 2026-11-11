@@ -23,10 +23,9 @@ export interface ModelProgressHandle {
   dispose(): void;
 }
 
-const PHASE_LABELS: Record<ModelProgressPhase, string> = {
+export const PHASE_LABELS: Record<ModelProgressPhase, string> = {
   downloading: 'Downloading',
   loading: 'Loading',
-  compiling: 'Compiling',
   generating: 'Generating',
 };
 

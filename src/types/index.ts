@@ -39,14 +39,17 @@ export interface ModelCard {
 // ---------------------------------------------------------------------------
 
 /**
- * The stages a model run moves through.
+ * The phases a model run actually reports.
  *
- * `downloading`, `loading`, and `compiling` are load phases; `generating` is
- * the token stream. Transformers.js only reports the first two (plus
- * per-file download bytes); `compiling` is reserved for engines that expose a
- * session-compile step.
+ * Transformers.js exposes file download progress (`initiate` / `download` /
+ * `progress` / `done`) and a `ready` status, which map to `downloading` and
+ * `loading`; `generating` is the token stream. The library has no callback
+ * for ONNX session creation, so a `compiling` phase would have no emitter.
+ * A phase in this list must be genuinely emitted — issue #102.
  */
-export type ModelProgressPhase = 'downloading' | 'loading' | 'compiling' | 'generating';
+export const MODEL_PROGRESS_PHASES = ['downloading', 'loading', 'generating'] as const;
+
+export type ModelProgressPhase = (typeof MODEL_PROGRESS_PHASES)[number];
 
 /**
  * Progress for a model load or generation run.

@@ -198,6 +198,41 @@ export function renderPrivacyReport(report: PrivacyReport, container?: HTMLEleme
   appendRow(summary, 'Generated', new Date(report.generatedAt).toISOString());
   section.appendChild(summary);
 
+  // Per-dependency rows. The count above says how many; this table says what
+  // they are, which is what the user needs to audit the licenses they run.
+  // `downloadPrivacyReport` serializes the same `report.dependencies` array,
+  // so the export and the screen cannot drift apart.
+  const table = document.createElement('table');
+  table.className = 'privacy-report__dependencies';
+
+  const caption = document.createElement('caption');
+  caption.textContent = 'Runtime dependencies';
+  table.appendChild(caption);
+
+  const head = document.createElement('thead');
+  const headerRow = document.createElement('tr');
+  for (const column of ['Name', 'Version', 'License']) {
+    const cell = document.createElement('th');
+    cell.textContent = column;
+    headerRow.appendChild(cell);
+  }
+  head.appendChild(headerRow);
+  table.appendChild(head);
+
+  const body = document.createElement('tbody');
+  for (const dependency of report.dependencies) {
+    const row = document.createElement('tr');
+    row.className = 'privacy-report__dependency';
+    for (const value of [dependency.name, dependency.version, dependency.license]) {
+      const cell = document.createElement('td');
+      cell.textContent = value;
+      row.appendChild(cell);
+    }
+    body.appendChild(row);
+  }
+  table.appendChild(body);
+  section.appendChild(table);
+
   const signature = document.createElement('p');
   signature.className = 'privacy-report__signature';
   signature.textContent = report.signature
