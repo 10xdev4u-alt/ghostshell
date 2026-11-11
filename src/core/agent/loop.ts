@@ -73,6 +73,16 @@ function errorMessage(err: unknown): string {
  *    signal is aborted on timeout, so tools that honor it stop, and the serial
  *    queue slot is held until the tool settles.
  *  - Every step is emitted via `onStep` so the UI can stream progress.
+ *
+ * Abort semantics (single source of truth: the run `signal`):
+ *  - Checked at the top of each iteration, after generation, and between
+ *    corrective retries (see `retryWithCorrection` in parser.ts).
+ *  - `executeTool` mirrors it into a per-tool cancellation controller, so an
+ *    abort before or during a tool rejects that tool with `ToolAbortedError`;
+ *    the run-level catch reports `finishReason: 'aborted'`.
+ *  - There is deliberately no separate check between tool calls: the per-tool
+ *    cancellation covers that window, and the next iteration's top-of-loop
+ *    check covers the gap after the last tool result.
  */
 export class AgentLoop {
   private readonly queue: SerialQueue;
@@ -148,9 +158,6 @@ export class AgentLoop {
         const calls = outcome.parse.toolCalls;
         const results: ToolResult[] = [];
         for (const call of calls) {
-          if (signal.aborted) {
-            return this.finish(messages, steps, completed, 'aborted');
-          }
           results.push(await this.executeTool(call, ctx, signal));
         }
 

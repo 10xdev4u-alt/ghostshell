@@ -65,6 +65,30 @@ class FakeLLM implements LLMEngine {
   }
 }
 
+/**
+ * A FakeLLM that aborts the run only after the engine has produced a turn.
+ * Used to pin the "abort after generation, before the tool runs" window.
+ */
+class AbortAfterTurnLLM extends FakeLLM {
+  constructor(
+    private readonly controller: AbortController,
+    result: GenerateResult,
+  ) {
+    super();
+    this.fallback = result;
+  }
+
+  async generate(
+    req: GenerateRequest,
+    onToken: (token: string) => void,
+    signal: AbortSignal,
+  ): Promise<GenerateResult> {
+    const result = await super.generate(req, onToken, signal);
+    this.controller.abort();
+    return result;
+  }
+}
+
 class FakeVM implements VMHandle {
   readonly id = 'fake-vm';
   running = true;
@@ -467,6 +491,116 @@ describe('AgentLoop', () => {
     expect(result.iterations).toBe(0);
     expect(steps).toHaveLength(0);
     expect(Date.now() - start).toBeLessThan(300);
+  });
+
+  it('aborts after the model emits a tool call but before the tool runs', async () => {
+    const controller = new AbortController();
+    const invoked: string[] = [];
+    const tool: ToolDefinition = {
+      name: 'bash',
+      description: 'must not run',
+      parameters: { type: 'object', properties: {} },
+      execute: async () => {
+        invoked.push('bash');
+        return { ok: true, content: 'should not run' };
+      },
+    };
+    const llm = new AbortAfterTurnLLM(controller, {
+      text: toolCall('bash', { command: 'ls' }),
+      tokens: 1,
+      finishReason: 'stop',
+    });
+    const loop = new AgentLoop(new Map([['bash', tool]]), makeConfig());
+    const steps: AgentStep[] = [];
+
+    const result = await run(
+      loop,
+      makeConversation([makeMessage('user', 'list files')]),
+      makeContext(new FakeVM(), llm),
+      steps,
+      controller.signal,
+    );
+
+    expect(result.finishReason).toBe('aborted');
+    expect(invoked).toEqual([]);
+    expect(steps).toHaveLength(0);
+  });
+
+  it('aborts during a tool call and issues no further tool calls', async () => {
+    const controller = new AbortController();
+    const invoked: string[] = [];
+    const first: ToolDefinition = {
+      name: 'first',
+      description: 'slow',
+      parameters: { type: 'object', properties: {} },
+      execute: async () => {
+        invoked.push('first');
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        return { ok: true, content: 'never' };
+      },
+    };
+    const second: ToolDefinition = {
+      name: 'second',
+      description: 'must not run',
+      parameters: { type: 'object', properties: {} },
+      execute: async () => {
+        invoked.push('second');
+        return { ok: true, content: 'never' };
+      },
+    };
+    const llm = new FakeLLM();
+    llm.queue = [
+      { text: `${toolCall('first', {})}${toolCall('second', {})}`, tokens: 1, finishReason: 'stop' },
+    ];
+    llm.fallback = { text: 'Done.', tokens: 1, finishReason: 'stop' };
+    const loop = new AgentLoop(new Map([['first', first], ['second', second]]), makeConfig());
+    const steps: AgentStep[] = [];
+    setTimeout(() => controller.abort(), 20);
+
+    const result = await run(
+      loop,
+      makeConversation([makeMessage('user', 'hi')]),
+      makeContext(new FakeVM(), llm),
+      steps,
+      controller.signal,
+    );
+
+    expect(result.finishReason).toBe('aborted');
+    expect(invoked).toEqual(['first']);
+    expect(steps).toHaveLength(0);
+  });
+
+  it('aborts during generation and issues no tool calls', async () => {
+    const controller = new AbortController();
+    const invoked: string[] = [];
+    const tool: ToolDefinition = {
+      name: 'bash',
+      description: 'must not run',
+      parameters: { type: 'object', properties: {} },
+      execute: async () => {
+        invoked.push('bash');
+        return { ok: true, content: 'should not run' };
+      },
+    };
+    const llm = new FakeLLM();
+    llm.throwOnAbort = false;
+    llm.onGenerate = () => controller.abort();
+    llm.fallback = { text: toolCall('bash', { command: 'ls' }), tokens: 1, finishReason: 'stop' };
+    const loop = new AgentLoop(new Map([['bash', tool]]), makeConfig());
+    const steps: AgentStep[] = [];
+
+    const result = await run(
+      loop,
+      makeConversation([makeMessage('user', 'list files')]),
+      makeContext(new FakeVM(), llm),
+      steps,
+      controller.signal,
+    );
+
+    expect(result.finishReason).toBe('aborted');
+    expect(invoked).toEqual([]);
+    expect(steps).toHaveLength(0);
+    expect(llm.requests).toHaveLength(1);
   });
 
   it('counts a retries-exhausted iteration as completed', async () => {
