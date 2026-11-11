@@ -303,8 +303,12 @@ export interface Recipe {
 export interface MCPServer {
   name: string;
   transport: 'stdio' | 'sse' | 'http';
-  command?: string;
-  url?: string;
+  /** Executable for stdio servers (run inside the VM). */
+  command?: string | undefined;
+  /** Arguments passed to `command` for stdio servers. */
+  args?: string[] | undefined;
+  /** Endpoint for `http` (Streamable HTTP) and `sse` servers. */
+  url?: string | undefined;
   enabled: boolean;
 }
 
