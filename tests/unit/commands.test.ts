@@ -5,6 +5,7 @@ import {
   createCommandRunner,
   extractSentinelOutput,
   stripAnsi,
+  stripSentinels,
   type SerialTransport,
 } from '@/core/vm/commands.js';
 
@@ -87,6 +88,22 @@ describe('extractSentinelOutput', () => {
     const raw =
       '__GS_BEGIN_abc__\n__GS_PROMPT_abc__hello\n__GS_PROMPT_abc____GS_DONE_abc__ 0\n';
     expect(extractSentinelOutput(raw, 'abc')).toEqual({ body: '\nhello\n', exitCode: 0 });
+  });
+});
+
+describe('stripSentinels', () => {
+  it('drops output before the begin marker and strips prompts and the echo', () => {
+    const wrapped = buildSentinelCommand('sleep 100', 'abc');
+    const raw =
+      `localhost:~# ${wrapped}` +
+      '__GS_BEGIN_abc__\n' +
+      '__GS_PROMPT_abc__sleep 100\n' +
+      '__GS_PROMPT_abc__partial output\n';
+    expect(cleanOutput(stripSentinels(raw, 'abc', wrapped), wrapped)).toBe('partial output');
+  });
+
+  it('keeps output when no begin marker has arrived', () => {
+    expect(cleanOutput(stripSentinels('__GS_PROMPT_abc__hello\n', 'abc'))).toBe('hello');
   });
 });
 
@@ -216,6 +233,31 @@ describe('createCommandRunner', () => {
     expect(result.timedOut).toBe(true);
     expect(result.exitCode).toBe(-1);
     expect(transport.sent).toContain('\x03');
+  }, 2_000);
+
+  it('strips prompts and the echoed wrapper from timeout output', async () => {
+    const transport = new FakeTransport();
+    const runner = createCommandRunner(transport, { graceMs: 10 });
+
+    const pending = runner.run('sleep 100', 30);
+    await tick();
+    const id = sentinelId(transport.sent[0]!);
+    const prompt = `__GS_PROMPT_${id}__`;
+
+    // The tty echoes the wrapper, then the guest prints the begin marker and
+    // interleaves the prompt sentinel between the echoed command and output.
+    transport.emit(`localhost:~# ${transport.sent[0]}`);
+    transport.emit(`__GS_BEGIN_${id}__\n`);
+    transport.emit(`${prompt}sleep 100\n`);
+    transport.emit(`${prompt}sleeping...\n`);
+
+    const result = await pending;
+    expect(result.timedOut).toBe(true);
+    expect(result.stdout).not.toContain('__GS_PROMPT_');
+    expect(result.stdout).not.toContain('__GS_BEGIN_');
+    expect(result.stdout).not.toContain('sleep 100');
+    expect(result.stdout).not.toContain('localhost:~#');
+    expect(result.stdout).toContain('sleeping...');
   }, 2_000);
 
   it('uses the exit code when the sentinel arrives during the grace period', async () => {
