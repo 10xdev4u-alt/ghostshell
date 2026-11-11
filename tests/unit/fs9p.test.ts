@@ -21,8 +21,17 @@ import {
 // Fake OPFS
 // ---------------------------------------------------------------------------
 
+/** Model OPFS's `DOMException(msg, 'NotFoundError')` for a missing entry. */
+function notFoundError(name: string): Error {
+  return Object.assign(new Error(`not found: ${name}`), { name: 'NotFoundError' });
+}
+
 class FakeFileHandle {
   data = new Uint8Array();
+  /** Injected read failure: `getFile()` rejects with this error. */
+  readError?: Error;
+  /** Injected write failure: `createWritable()` rejects with this error. */
+  writeError?: Error;
 
   constructor(
     private readonly dir: FakeDirHandle,
@@ -30,6 +39,7 @@ class FakeFileHandle {
   ) {}
 
   async createWritable() {
+    if (this.writeError) throw this.writeError;
     const handle = this;
     return {
       async write(chunk: Uint8Array) {
@@ -41,6 +51,7 @@ class FakeFileHandle {
   }
 
   async getFile() {
+    if (this.readError) throw this.readError;
     const data = this.data;
     return {
       async arrayBuffer() {
@@ -59,7 +70,7 @@ class FakeDirHandle {
   async getDirectoryHandle(name: string, options?: { create?: boolean }) {
     const existing = this.dirs.get(name);
     if (existing) return existing;
-    if (!options?.create) throw new Error(`not found: ${name}`);
+    if (!options?.create) throw notFoundError(name);
     const dir = new FakeDirHandle(name);
     this.dirs.set(name, dir);
     return dir;
@@ -68,7 +79,7 @@ class FakeDirHandle {
   async getFileHandle(name: string, options?: { create?: boolean }) {
     const existing = this.files.get(name);
     if (existing) return existing;
-    if (!options?.create) throw new Error(`not found: ${name}`);
+    if (!options?.create) throw notFoundError(name);
     const handle = new FakeFileHandle(this, name);
     this.files.set(name, handle);
     return handle;
@@ -708,8 +719,9 @@ describe('fs9p handler', () => {
 
     const handle = create9pHandler(deps, { autoPersist: false });
     await expect(handle.ready()).rejects.toBeInstanceOf(ManifestError);
-    // An explicit persist must not replace the corrupt manifest with an empty tree.
-    await handle.persist();
+    // An explicit persist must reject and must not replace the corrupt
+    // manifest with an empty tree.
+    await expect(handle.persist()).rejects.toBeInstanceOf(ManifestError);
 
     expect(Array.from(await readOpfsFile(root, 'test', 'manifest.json'))).toEqual(
       Array.from(corrupt),
@@ -725,11 +737,186 @@ describe('fs9p handler', () => {
 
     const handle = create9pHandler(deps, { autoPersist: false });
     await expect(handle.ready()).rejects.toBeInstanceOf(ManifestError);
-    await handle.persist();
+    await expect(handle.persist()).rejects.toBeInstanceOf(ManifestError);
 
     expect(Array.from(await readOpfsFile(root, 'test', 'manifest.json'))).toEqual(
       Array.from(raw),
     );
+  });
+
+  it('propagates a non-NotFound manifest read error instead of resetting the tree', async () => {
+    const { deps, root } = makeDeps();
+    const original = text.encode(manifestJson('1'));
+    await writeOpfsFile(root, 'test', 'manifest.json', original);
+
+    const dir = await root.getDirectoryHandle('test');
+    const manifestHandle = await dir.getFileHandle('manifest.json');
+    (manifestHandle as FakeFileHandle).readError = Object.assign(
+      new Error('transient I/O failure'),
+      { name: 'SecurityError' },
+    );
+
+    await expect(loadTree(deps, 'test')).rejects.toMatchObject({ name: 'SecurityError' });
+
+    const handle = create9pHandler(deps, { autoPersist: false });
+    await expect(handle.ready()).rejects.toMatchObject({ name: 'SecurityError' });
+    await expect(handle.persist()).rejects.toMatchObject({ name: 'SecurityError' });
+
+    // The failed read must not be mistaken for "nothing stored": the real
+    // manifest has to survive. Read the fake's stored bytes directly so the
+    // injected read error does not interfere with the assertion.
+    expect(Array.from((manifestHandle as FakeFileHandle).data)).toEqual(
+      Array.from(original),
+    );
+  });
+
+  it('propagates a non-NotFound directory lookup error', async () => {
+    const { deps } = makeDeps();
+    const root = deps.storage as unknown as FakeDirHandle;
+    // Force getDirectoryHandle to fail for the prefix without a NotFound signal.
+    root.getDirectoryHandle = async () => {
+      throw Object.assign(new Error('storage unreachable'), { name: 'UnknownError' });
+    };
+
+    await expect(loadTree(deps, 'test')).rejects.toMatchObject({ name: 'UnknownError' });
+  });
+
+  it('rejects persist() and flush() when a write fails', async () => {
+    const { deps, root } = makeDeps();
+    const logs: string[] = [];
+    const handle = create9pHandler(
+      { ...deps, onLog: (message) => logs.push(message) },
+      { autoPersist: false },
+    );
+    await request(handle, 100, 1, new FrameWriter().u32(8192).string('9P2000.L').build());
+    await request(handle, 104, 2, attachPayload(1));
+    await request(
+      handle,
+      14,
+      3,
+      new FrameWriter().u32(1).string('note.txt').u32(0x2).u32(0o100644).u32(0).build(),
+    );
+    await handle.flush();
+    expect(logs.some((line) => line.includes('persist failed'))).toBe(false);
+
+    // Force the next manifest write to fail.
+    const dir = await root.getDirectoryHandle('test');
+    const manifestHandle = await dir.getFileHandle('manifest.json');
+    (manifestHandle as FakeFileHandle).writeError = new Error('disk full');
+
+    await request(
+      handle,
+      14,
+      4,
+      new FrameWriter().u32(1).string('other.txt').u32(0x2).u32(0o100644).u32(0).build(),
+    );
+    await expect(handle.persist()).rejects.toThrow('disk full');
+    expect(logs.some((line) => line.includes('persist failed'))).toBe(true);
+
+    // The failure is sticky: a later flush must not resolve as if it wrote.
+    await expect(handle.flush()).rejects.toThrow('disk full');
+  });
+
+  it('restores nextQidPath from the manifest instead of reusing a deleted qid', async () => {
+    const { deps } = makeDeps();
+    const first = create9pHandler(deps, { autoPersist: false });
+    await request(first, 100, 1, new FrameWriter().u32(8192).string('9P2000.L').build());
+    await request(first, 104, 2, attachPayload(1));
+    await request(
+      first,
+      14,
+      3,
+      new FrameWriter().u32(1).string('a.txt').u32(0x2).u32(0o100644).u32(0).build(),
+    );
+    await request(first, 104, 4, attachPayload(2));
+    await request(
+      first,
+      14,
+      5,
+      new FrameWriter().u32(2).string('b.txt').u32(0x2).u32(0o100644).u32(0).build(),
+    );
+    await first.flush();
+
+    expect(findNode(first.tree, '/a.txt')!.qidPath).toBe(1n);
+    const deletedQid = findNode(first.tree, '/b.txt')!.qidPath;
+    expect(deletedQid).toBe(2n);
+
+    // Delete the highest-qid file and persist.
+    await request(first, 104, 6, attachPayload(3));
+    await request(first, 76, 7, new FrameWriter().u32(3).string('b.txt').u32(0).build());
+    await first.flush();
+
+    // Reload: the manifest must restore nextQidPath = 3, not max(live) + 1 = 2.
+    const second = create9pHandler(deps, { autoPersist: false });
+    await second.ready();
+    await request(second, 100, 1, new FrameWriter().u32(8192).string('9P2000.L').build());
+    await request(second, 104, 2, attachPayload(1));
+    await request(
+      second,
+      14,
+      3,
+      new FrameWriter().u32(1).string('c.txt').u32(0x2).u32(0o100644).u32(0).build(),
+    );
+
+    const created = findNode(second.tree, '/c.txt')!;
+    expect(created.qidPath).toBe(3n);
+    expect(created.qidPath).not.toBe(deletedQid);
+  });
+
+  it('bumps a stale manifest nextQidPath past every live qid', async () => {
+    const { deps, root } = makeDeps();
+    const stale = text.encode(
+      JSON.stringify({
+        version: 1,
+        nextQidPath: '1',
+        root: {
+          name: '/',
+          kind: 'dir',
+          mode: 0o40755,
+          uid: 0,
+          gid: 0,
+          nlink: 1,
+          rdev: 0,
+          size: 0,
+          atime: 0,
+          mtime: 0,
+          ctime: 0,
+          qidPath: '0',
+          qidVersion: 0,
+          children: [
+            {
+              name: 'a.txt',
+              kind: 'file',
+              mode: 0o100644,
+              uid: 0,
+              gid: 0,
+              nlink: 1,
+              rdev: 0,
+              size: 0,
+              atime: 0,
+              mtime: 0,
+              ctime: 0,
+              qidPath: '1',
+              qidVersion: 0,
+            },
+          ],
+        },
+      }),
+    );
+    await writeOpfsFile(root, 'test', 'manifest.json', stale);
+
+    const handle = create9pHandler(deps, { autoPersist: false });
+    await handle.ready();
+    await request(handle, 100, 1, new FrameWriter().u32(8192).string('9P2000.L').build());
+    await request(handle, 104, 2, attachPayload(1));
+    await request(
+      handle,
+      14,
+      3,
+      new FrameWriter().u32(1).string('b.txt').u32(0x2).u32(0o100644).u32(0).build(),
+    );
+
+    expect(findNode(handle.tree, '/b.txt')!.qidPath).toBe(2n);
   });
 });
 

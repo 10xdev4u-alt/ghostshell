@@ -36,12 +36,14 @@
  *
  * Persistence: the tree is written to OPFS as `manifest.json` plus one
  * `<qidPath>.bin` blob per file. When OPFS is unavailable the tree stays in
- * memory and every load/persist is skipped with a log message.
+ * memory; loads return undefined and persists reject so the host can see the
+ * failure instead of silently dropping writes.
  *
- * A manifest that exists but cannot be parsed, or whose nodes are not valid,
- * is a corruption signal: {@link loadTree} throws {@link ManifestError} and
- * the handler refuses to persist, so a corrupt manifest is never overwritten
- * with an empty tree. A missing manifest is not an error (fresh storage).
+ * A manifest that exists but cannot be parsed, whose nodes are not valid, or
+ * whose bytes cannot be read is a corruption signal: {@link loadTree} throws
+ * {@link ManifestError} (or propagates the storage error) and the handler
+ * refuses to persist, so a corrupt manifest is never overwritten with an empty
+ * tree. A missing manifest is not an error (fresh storage).
  */
 
 import type { V86Options } from 'v86';
@@ -105,7 +107,10 @@ export interface Fs9pHandle {
   ready(): Promise<void>;
   /** Flush any pending automatic persistence and persist immediately. */
   flush(): Promise<void>;
-  /** Persist the current tree now. */
+  /**
+   * Persist the current tree now. Rejects when the stored manifest could not
+   * be loaded or the write failed; `onLog` carries the diagnostic.
+   */
   persist(): Promise<void>;
 }
 
@@ -595,11 +600,31 @@ interface Manifest {
   root: ManifestNode;
 }
 
-async function opfsRoot(deps: Fs9pDeps): Promise<FileSystemDirectoryHandle> {
+/**
+ * OPFS signals a missing entry with a `DOMException` named `NotFoundError`.
+ * That is the only error that means "nothing is stored here"; every other
+ * error (transient I/O failure, `SecurityError`, quota, ...) is a real
+ * storage failure and must propagate so the caller cannot mistake it for an
+ * empty tree.
+ */
+function isNotFoundError(err: unknown): boolean {
+  return (
+    typeof err === 'object' &&
+    err !== null &&
+    (err as { name?: unknown }).name === 'NotFoundError'
+  );
+}
+
+/**
+ * Resolve the OPFS root, or undefined when the platform has no OPFS at all.
+ * A `getDirectory()` rejection is not "unavailable" and is allowed to
+ * propagate: it means storage exists but cannot be reached.
+ */
+async function opfsRoot(deps: Fs9pDeps): Promise<FileSystemDirectoryHandle | undefined> {
   if (deps.storage) return deps.storage;
   const navigator = (globalThis as { navigator?: Navigator }).navigator;
   if (!navigator?.storage || typeof navigator.storage.getDirectory !== 'function') {
-    throw new Error('OPFS is not available');
+    return undefined;
   }
   return navigator.storage.getDirectory();
 }
@@ -616,16 +641,29 @@ async function ensureDir(
   return dir;
 }
 
+/**
+ * Read a file from OPFS. Returns undefined only when the file is genuinely
+ * absent (`NotFoundError`); any other failure propagates. Treating a read
+ * failure as "missing" would let a transient I/O error masquerade as a fresh
+ * tree, and the next persist would overwrite the real manifest.
+ */
 async function readOpfsFile(
   dir: FileSystemDirectoryHandle,
   name: string,
 ): Promise<Uint8Array | undefined> {
+  let handle: FileSystemFileHandle;
   try {
-    const handle = await dir.getFileHandle(name);
+    handle = await dir.getFileHandle(name);
+  } catch (err) {
+    if (isNotFoundError(err)) return undefined;
+    throw err;
+  }
+  try {
     const file = await handle.getFile();
     return new Uint8Array(await file.arrayBuffer());
-  } catch {
-    return undefined;
+  } catch (err) {
+    if (isNotFoundError(err)) return undefined;
+    throw err;
   }
 }
 
@@ -639,6 +677,25 @@ async function writeOpfsFile(
   // Copy: DOM write() rejects views over SharedArrayBuffer.
   await writable.write(data.slice());
   await writable.close();
+}
+
+/**
+ * Best-effort copy of a corrupt manifest to `manifest.json.corrupt`.
+ *
+ * The original `manifest.json` is left untouched, so this never masks the
+ * failure or overwrites evidence; it only gives the operator a second copy
+ * with a stable name to inspect. Any failure here is logged by the caller.
+ */
+async function backupCorruptManifest(
+  deps: Fs9pDeps,
+  prefix: string,
+): Promise<void> {
+  const storage = await opfsRoot(deps);
+  if (!storage) return;
+  const dir = await ensureDir(storage, prefix, false);
+  const bytes = await readOpfsFile(dir, 'manifest.json');
+  if (!bytes) return;
+  await writeOpfsFile(dir, 'manifest.json.corrupt', bytes);
 }
 
 function toManifestNode(node: P9Node): ManifestNode {
@@ -693,7 +750,18 @@ async function readManifest(
   ) {
     throw new ManifestError('manifest.json has an unrecognized schema');
   }
+  // Fail closed on a bad qid counter too: a reused qidPath would confuse the
+  // guest's 9P inode cache.
+  parseNextQidPath((parsed as Manifest).nextQidPath);
   return parsed as Manifest;
+}
+
+/** Parse and validate the manifest's `nextQidPath` (serialized as a string). */
+function parseNextQidPath(raw: unknown): bigint {
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw)) {
+    throw new ManifestError('manifest.json has an invalid nextQidPath');
+  }
+  return BigInt(raw);
 }
 
 /**
@@ -707,6 +775,7 @@ export async function persistTree(
   nextQidPath = 0n,
 ): Promise<void> {
   const storage = await opfsRoot(deps);
+  if (!storage) throw new Error('OPFS is not available');
   const dir = await ensureDir(storage, prefix, true);
 
   let maxQid = 0n;
@@ -738,6 +807,45 @@ export async function persistTree(
   deps.onLog?.(`fs9p: persisted ${written}/${total} file(s)`);
 }
 
+interface LoadedTree {
+  root: P9Node;
+  /**
+   * The manifest's qid counter, bumped past every live qid when the stored
+   * value is stale. Recomputing `max(live qid) + 1` on its own would reuse the
+   * qidPath of a deleted file and confuse the guest's 9P inode cache.
+   */
+  nextQidPath: bigint;
+}
+
+/**
+ * Load a persisted tree and its qid counter from OPFS. Returns undefined when
+ * nothing is stored or OPFS is unavailable. A missing prefix directory and a
+ * missing manifest are both "fresh storage"; every other storage error
+ * propagates.
+ */
+async function loadTreeState(
+  deps: Fs9pDeps,
+  prefix = DEFAULT_FS_PREFIX,
+): Promise<LoadedTree | undefined> {
+  const storage = await opfsRoot(deps);
+  if (!storage) return undefined;
+  let dir: FileSystemDirectoryHandle;
+  try {
+    dir = await ensureDir(storage, prefix, false);
+  } catch (err) {
+    if (isNotFoundError(err)) return undefined;
+    throw err;
+  }
+  const manifest = await readManifest(dir);
+  if (!manifest) return undefined;
+  const root = await rebuildNode(manifest.root, '/', dir);
+  let nextQidPath = parseNextQidPath(manifest.nextQidPath);
+  let max = 0n;
+  for (const node of walk(root)) if (node.qidPath > max) max = node.qidPath;
+  if (nextQidPath <= max) nextQidPath = max + 1n;
+  return { root, nextQidPath };
+}
+
 /**
  * Load a persisted tree from OPFS. Returns undefined when nothing is stored
  * or OPFS is unavailable.
@@ -746,21 +854,7 @@ export async function loadTree(
   deps: Fs9pDeps,
   prefix = DEFAULT_FS_PREFIX,
 ): Promise<P9Node | undefined> {
-  let storage: FileSystemDirectoryHandle;
-  try {
-    storage = await opfsRoot(deps);
-  } catch {
-    return undefined;
-  }
-  let dir: FileSystemDirectoryHandle;
-  try {
-    dir = await ensureDir(storage, prefix, false);
-  } catch {
-    return undefined;
-  }
-  const manifest = await readManifest(dir);
-  if (!manifest) return undefined;
-  return rebuildNode(manifest.root, '/', dir);
+  return (await loadTreeState(deps, prefix))?.root;
 }
 
 /** Parse and validate a manifest node's `qidPath` (serialized as a string). */
@@ -846,16 +940,15 @@ export function create9pHandler(deps: Fs9pDeps, options: Fs9pOptions = {}): Fs9p
     if (loaded) return Promise.resolve();
     if (!loadPromise) {
       loadPromise = (async () => {
-        // loadTree returns undefined when nothing is stored or OPFS is absent.
-        // It throws ManifestError when a stored manifest is corrupt; that must
-        // propagate. Falling back to an empty tree here would let the next
-        // persist overwrite the user's snapshot.
-        const persisted = await loadTree(deps, prefix);
+        // loadTreeState returns undefined when nothing is stored or OPFS is
+        // absent. It throws ManifestError when a stored manifest is corrupt
+        // and propagates real storage errors; both must propagate. Falling
+        // back to an empty tree here would let the next persist overwrite the
+        // user's snapshot.
+        const persisted = await loadTreeState(deps, prefix);
         if (persisted) {
-          root = persisted;
-          let max = 0n;
-          for (const node of walk(root)) if (node.qidPath > max) max = node.qidPath;
-          nextQidPath = max + 1n;
+          root = persisted.root;
+          nextQidPath = persisted.nextQidPath;
         }
         loaded = true;
       })();
@@ -869,7 +962,9 @@ export function create9pHandler(deps: Fs9pDeps, options: Fs9pOptions = {}): Fs9p
     if (persistTimer) clearTimeout(persistTimer);
     persistTimer = setTimeout(() => {
       persistTimer = null;
-      void persist();
+      // persist() logs the failure itself; the timer must not leave an
+      // unhandled rejection behind.
+      void persist().catch(() => {});
     }, options.persistDebounceMs ?? 250);
   }
 
@@ -884,6 +979,17 @@ export function create9pHandler(deps: Fs9pDeps, options: Fs9pOptions = {}): Fs9p
       } catch (err) {
         deps.onLog?.(`fs9p: persist failed (${String(err)})`);
         dirty = true;
+        // Preserve a corrupt manifest under a stable name before giving up.
+        // This is best-effort: a read/write failure here must not replace the
+        // original error.
+        if (err instanceof ManifestError) {
+          try {
+            await backupCorruptManifest(deps, prefix);
+          } catch (backupErr) {
+            deps.onLog?.(`fs9p: manifest backup failed (${String(backupErr)})`);
+          }
+        }
+        throw err;
       } finally {
         persisting = null;
       }
