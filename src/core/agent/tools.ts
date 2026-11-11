@@ -231,7 +231,9 @@ export function builtinTools(): ToolDefinition[] {
         const commandParts = ['grep', '-rn'];
         if (glob) commandParts.push(`--include=${shellQuote(glob)}`);
         // `-e` keeps a leading-dash pattern from being parsed as an option.
-        commandParts.push('-e', shellQuote(pattern), shellQuote(path));
+        commandParts.push('-e', shellQuote(pattern));
+        // `--` keeps a leading-dash path from being parsed as an option.
+        commandParts.push('--', shellQuote(path));
 
         try {
           const result = await ctx.vm.exec(commandParts.join(' '), DEFAULT_TIMEOUT_MS);
