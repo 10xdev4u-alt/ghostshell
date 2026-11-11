@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type {
   AgentConfig,
   CommandResult,
@@ -18,7 +18,16 @@ import type {
 import { uuid } from '@/lib/utils.js';
 import { AgentLoop, createToolRegistry, type AgentStep } from '@/core/agent/loop.js';
 import { builtinTools } from '@/core/agent/tools.js';
+import { buildToolCallGrammar } from '@/core/llm/grammar.js';
 import { CORRECTIVE_RETRY_PROMPT, CONTINUE_PROMPT } from '@/core/agent/prompts.js';
+
+vi.mock('@/core/llm/grammar.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/core/llm/grammar.js')>();
+  return {
+    ...actual,
+    buildToolCallGrammar: vi.fn(actual.buildToolCallGrammar),
+  };
+});
 
 class FakeLLM implements LLMEngine {
   readonly id = 'fake-llm';
@@ -589,5 +598,47 @@ describe('AgentLoop', () => {
 
     expect(result.messages.filter((m) => m.role === 'system')).toHaveLength(1);
     expect(result.messages[0]!.content).toBe('Custom system prompt.');
+  });
+});
+
+describe('grammar caching', () => {
+  it('builds the tool-call grammar once per tool set', async () => {
+    vi.mocked(buildToolCallGrammar).mockClear();
+    const llm = new FakeLLM();
+    llm.queue = [
+      { text: toolCall('bash', { command: 'ls' }), tokens: 1, finishReason: 'stop' },
+      { text: toolCall('bash', { command: 'pwd' }), tokens: 1, finishReason: 'stop' },
+      { text: 'Done.', tokens: 1, finishReason: 'stop' },
+    ];
+    const loop = new AgentLoop(makeTools(), makeConfig());
+
+    const result = await run(loop, makeConversation([makeMessage('user', 'hi')]), makeContext(new FakeVM(), llm));
+
+    expect(result.finishReason).toBe('stop');
+    expect(llm.requests).toHaveLength(3);
+    expect(vi.mocked(buildToolCallGrammar)).toHaveBeenCalledTimes(1);
+  });
+
+  it('rebuilds the grammar when the tool set changes', async () => {
+    vi.mocked(buildToolCallGrammar).mockClear();
+    const tools = makeTools();
+    const llm = new FakeLLM();
+    llm.queue = [
+      { text: 'Done.', tokens: 1, finishReason: 'stop' },
+      { text: 'Done again.', tokens: 1, finishReason: 'stop' },
+    ];
+    const loop = new AgentLoop(tools, makeConfig());
+
+    await run(loop, makeConversation([makeMessage('user', 'hi')]), makeContext(new FakeVM(), llm));
+    expect(vi.mocked(buildToolCallGrammar)).toHaveBeenCalledTimes(1);
+
+    tools.set('extra', {
+      name: 'extra',
+      description: 'extra tool',
+      parameters: { type: 'object', properties: {} },
+      execute: async () => ({ ok: true, content: 'ok' }),
+    });
+    await run(loop, makeConversation([makeMessage('user', 'hi')]), makeContext(new FakeVM(), llm));
+    expect(vi.mocked(buildToolCallGrammar)).toHaveBeenCalledTimes(2);
   });
 });

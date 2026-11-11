@@ -76,6 +76,8 @@ function errorMessage(err: unknown): string {
  */
 export class AgentLoop {
   private readonly queue: SerialQueue;
+  private grammar: string | undefined;
+  private grammarKey: string | undefined;
 
   constructor(
     private readonly tools: Map<string, ToolDefinition>,
@@ -202,18 +204,33 @@ export class AgentLoop {
    * Grammar-constrained decoding is provided by the LLM module (issue #18).
    * Until that lands, the loop runs unconstrained and relies on the parser's
    * fallback chain plus corrective retries.
+   *
+   * The grammar depends only on the tool set, so it is cached and rebuilt only
+   * when a tool's name or parameters change.
    */
   private buildGrammar(): string | undefined {
+    const key = this.grammarKeyForTools();
+    if (this.grammarKey === key) return this.grammar;
+    this.grammarKey = key;
     try {
-      return buildToolCallGrammar(
+      this.grammar = buildToolCallGrammar(
         [...this.tools.values()].map((tool) => ({
           name: tool.name,
           parameters: tool.parameters,
         })),
       );
     } catch {
-      return undefined;
+      this.grammar = undefined;
     }
+    return this.grammar;
+  }
+
+  /** Stable identity for the tool set, used to invalidate the grammar cache. */
+  private grammarKeyForTools(): string {
+    return [...this.tools.values()]
+      .map((tool) => `${tool.name}:${JSON.stringify(tool.parameters)}`)
+      .sort()
+      .join('\n');
   }
 
   private async generate(
