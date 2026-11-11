@@ -9,7 +9,7 @@ import type {
   ToolDefinition,
   VMHandle,
 } from '@/types/index.js';
-import { builtinTools, MAX_OUTPUT_CHARS } from '@/core/agent/tools.js';
+import { builtinTools, MAX_OUTPUT_CHARS, truncateOutput } from '@/core/agent/tools.js';
 
 class FakeVM implements VMHandle {
   readonly id = 'fake-vm';
@@ -285,5 +285,28 @@ describe('builtin tools', () => {
       expect(typeof result.content).toBe('string');
       expect(typeof result.ok).toBe('boolean');
     }
+  });
+});
+
+describe('truncateOutput', () => {
+  it('leaves text within the limit untouched', () => {
+    expect(truncateOutput('hello', 10)).toBe('hello');
+    expect(truncateOutput('', 10)).toBe('');
+  });
+
+  it('never exceeds max when the marker is longer than max', () => {
+    const result = truncateOutput('x'.repeat(100), 10);
+    expect(result.length).toBeLessThanOrEqual(10);
+  });
+
+  it('reports the number of characters actually removed', () => {
+    const text = 'x'.repeat(100);
+    const result = truncateOutput(text, 50);
+    const marker = /…\[truncated (\d+) chars\]$/.exec(result);
+    expect(marker).not.toBeNull();
+    const reported = Number(marker![1]);
+    const kept = result.length - marker![0].length;
+    expect(reported).toBe(text.length - kept);
+    expect(result.length).toBeLessThanOrEqual(50);
   });
 });
