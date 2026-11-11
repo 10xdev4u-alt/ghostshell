@@ -252,6 +252,8 @@ describe('built-in tools integration', () => {
 
     expect(result.ok).toBe(true);
     expect(result.content).toBe('No matches found.');
-    expect(vm.commands[0]!.cmd).toBe("grep -rn -e 'needle' -- '-weird-path'");
+    expect(vm.commands[0]!.cmd).toBe(
+      "grep -rnI --exclude-dir=.git --exclude-dir=node_modules -e 'needle' -- '-weird-path'",
+    );
   });
 });

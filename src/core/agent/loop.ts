@@ -25,6 +25,10 @@ export interface AgentStep {
 export interface AgentRunResult {
   messages: Message[];
   steps: AgentStep[];
+  /**
+   * Number of loop iterations that ran to completion. An iteration aborted or
+   * thrown mid-flight is not counted; one that exhausts its retries is.
+   */
   iterations: number;
   finishReason: 'stop' | 'max-iterations' | 'error' | 'aborted';
   error?: string | undefined;
@@ -65,10 +69,15 @@ function errorMessage(err: unknown): string {
  *    then loop.
  *  - If the model emits a final answer (no tool calls), stop.
  *  - Enforce `maxIterations`, `toolTimeoutMs`, and `maxRetries`.
+ *  - `toolTimeoutMs` bounds the wait for a tool and cancels it: the per-tool
+ *    signal is aborted on timeout, so tools that honor it stop, and the serial
+ *    queue slot is held until the tool settles.
  *  - Every step is emitted via `onStep` so the UI can stream progress.
  */
 export class AgentLoop {
   private readonly queue: SerialQueue;
+  private grammar: string | undefined;
+  private grammarKey: string | undefined;
 
   constructor(
     private readonly tools: Map<string, ToolDefinition>,
@@ -88,11 +97,11 @@ export class AgentLoop {
     const steps: AgentStep[] = [];
     this.ensureSystemMessage(messages);
 
-    let iterations = 0;
+    let completed = 0;
     try {
-      for (iterations = 0; iterations < this.config.maxIterations; iterations += 1) {
+      for (let iteration = 0; iteration < this.config.maxIterations; iteration += 1) {
         if (signal.aborted) {
-          return this.finish(messages, steps, iterations, 'aborted');
+          return this.finish(messages, steps, completed, 'aborted');
         }
 
         await this.compactIfNeeded(messages, ctx, signal);
@@ -101,10 +110,11 @@ export class AgentLoop {
           (requestMessages) => this.generate(requestMessages, ctx, signal),
           messages,
           this.config.maxRetries,
+          signal,
         );
 
         if (outcome.aborted || signal.aborted) {
-          return this.finish(messages, steps, iterations, 'aborted');
+          return this.finish(messages, steps, completed, 'aborted');
         }
 
         // Keep any corrective messages the retry helper appended.
@@ -113,10 +123,11 @@ export class AgentLoop {
         if (outcome.finalAnswer !== undefined) {
           const message = this.assistantMessage(outcome.finalAnswer, []);
           messages.push(message);
-          const step: AgentStep = { iteration: iterations, message, toolCalls: [], results: [] };
+          const step: AgentStep = { iteration, message, toolCalls: [], results: [] };
           steps.push(step);
           onStep(step);
-          return this.finish(messages, steps, iterations + 1, 'stop');
+          completed += 1;
+          return this.finish(messages, steps, completed, 'stop');
         }
 
         if (outcome.parse.toolCalls.length === 0) {
@@ -127,17 +138,18 @@ export class AgentLoop {
             [],
           );
           messages.push(message);
-          const step: AgentStep = { iteration: iterations, message, toolCalls: [], results: [] };
+          const step: AgentStep = { iteration, message, toolCalls: [], results: [] };
           steps.push(step);
           onStep(step);
-          return this.finish(messages, steps, iterations + 1, 'error', error);
+          completed += 1;
+          return this.finish(messages, steps, completed, 'error', error);
         }
 
         const calls = outcome.parse.toolCalls;
         const results: ToolResult[] = [];
         for (const call of calls) {
           if (signal.aborted) {
-            return this.finish(messages, steps, iterations, 'aborted');
+            return this.finish(messages, steps, completed, 'aborted');
           }
           results.push(await this.executeTool(call, ctx, signal));
         }
@@ -147,9 +159,10 @@ export class AgentLoop {
         for (const result of results) {
           messages.push(this.toolMessage(result));
         }
-        const step: AgentStep = { iteration: iterations, message, toolCalls: calls, results };
+        const step: AgentStep = { iteration, message, toolCalls: calls, results };
         steps.push(step);
         onStep(step);
+        completed += 1;
       }
 
       const note =
@@ -157,15 +170,15 @@ export class AgentLoop {
         'Here is where things stand; send another message to continue.';
       const message = this.assistantMessage(note, []);
       messages.push(message);
-      const step: AgentStep = { iteration: iterations, message, toolCalls: [], results: [] };
+      const step: AgentStep = { iteration: completed, message, toolCalls: [], results: [] };
       steps.push(step);
       onStep(step);
-      return this.finish(messages, steps, iterations, 'max-iterations');
+      return this.finish(messages, steps, completed, 'max-iterations');
     } catch (err) {
       if (signal.aborted) {
-        return this.finish(messages, steps, iterations, 'aborted');
+        return this.finish(messages, steps, completed, 'aborted');
       }
-      return this.finish(messages, steps, iterations, 'error', errorMessage(err));
+      return this.finish(messages, steps, completed, 'error', errorMessage(err));
     }
   }
 
@@ -191,18 +204,33 @@ export class AgentLoop {
    * Grammar-constrained decoding is provided by the LLM module (issue #18).
    * Until that lands, the loop runs unconstrained and relies on the parser's
    * fallback chain plus corrective retries.
+   *
+   * The grammar depends only on the tool set, so it is cached and rebuilt only
+   * when a tool's name or parameters change.
    */
   private buildGrammar(): string | undefined {
+    const key = this.grammarKeyForTools();
+    if (this.grammarKey === key) return this.grammar;
+    this.grammarKey = key;
     try {
-      return buildToolCallGrammar(
+      this.grammar = buildToolCallGrammar(
         [...this.tools.values()].map((tool) => ({
           name: tool.name,
           parameters: tool.parameters,
         })),
       );
     } catch {
-      return undefined;
+      this.grammar = undefined;
     }
+    return this.grammar;
+  }
+
+  /** Stable identity for the tool set, used to invalidate the grammar cache. */
+  private grammarKeyForTools(): string {
+    return [...this.tools.values()]
+      .map((tool) => `${tool.name}:${JSON.stringify(tool.parameters)}`)
+      .sort()
+      .join('\n');
   }
 
   private async generate(
@@ -231,8 +259,11 @@ export class AgentLoop {
     const budget = Math.floor(this.config.contextWindow * CONTEXT_BUDGET_RATIO);
     if (tokenBudget(messages) <= budget) return;
 
-    const result = await compactMessages(messages, budget, (dropped) =>
-      this.summarize(dropped, ctx, signal),
+    const result = await compactMessages(
+      messages,
+      budget,
+      (dropped) => this.summarize(dropped, ctx, signal),
+      signal,
     );
     if (result.compacted) {
       messages.splice(0, messages.length, ...result.messages);
@@ -287,18 +318,34 @@ export class AgentLoop {
       };
     }
 
-    // The tool receives the run's abort signal so long-running guest commands
-    // can interrupt themselves (see `execWithAbort` in tools.ts).
-    const toolCtx: ToolContext = { ...ctx, signal };
+    // Per-execution cancellation: aborted when the run aborts or the tool times
+    // out. Tools that honor `ctx.signal` (bash, search) interrupt their guest
+    // command instead of running to completion after a timeout.
+    const cancellation = new AbortController();
+    const onRunAbort = (): void => cancellation.abort();
+    if (signal.aborted) cancellation.abort();
+    else signal.addEventListener('abort', onRunAbort, { once: true });
+
+    const toolCtx: ToolContext = { ...ctx, signal: cancellation.signal };
     try {
-      return await this.queue.add(() =>
-        this.withTimeout(
-          definition.execute(toolCtx, call.arguments),
-          this.config.toolTimeoutMs,
-          call.name,
-          signal,
-        ),
-      );
+      return await this.queue.add(async () => {
+        const toolPromise = definition.execute(toolCtx, call.arguments);
+        try {
+          return await this.withTimeout(
+            toolPromise,
+            this.config.toolTimeoutMs,
+            call.name,
+            cancellation,
+          );
+        } catch (err) {
+          if (err instanceof ToolTimeoutError) {
+            // Hold the queue slot until the cancelled tool settles, so the next
+            // tool cannot start while the timed-out one is still running.
+            await toolPromise.catch(() => undefined);
+          }
+          throw err;
+        }
+      });
     } catch (err) {
       // An abort is not a tool failure: rethrow so the loop reports `aborted`.
       if (signal.aborted) throw err;
@@ -306,22 +353,25 @@ export class AgentLoop {
         return { ok: false, content: err.message };
       }
       return { ok: false, content: `Tool "${call.name}" failed: ${errorMessage(err)}` };
+    } finally {
+      signal.removeEventListener('abort', onRunAbort);
     }
   }
 
   /**
-   * Race a tool against its timeout and the run's abort signal. Whichever
+   * Race a tool against its timeout and its cancellation signal. Whichever
    * fires first settles the promise; the other listener is removed so a late
-   * tool result cannot leak into a settled run. Tools that talk to the VM
-   * must also honor `ctx.signal` and reject on abort, so the underlying
-   * command is interrupted instead of being orphaned.
+   * tool result cannot leak into a settled run. On timeout the controller is
+   * aborted, so tools that honor `ctx.signal` (see `execWithAbort` in tools.ts)
+   * interrupt the underlying command instead of being orphaned.
    */
   private withTimeout<T>(
     promise: Promise<T>,
     timeoutMs: number,
     toolName: string,
-    signal: AbortSignal,
+    cancellation: AbortController,
   ): Promise<T> {
+    const signal = cancellation.signal;
     if (signal.aborted) {
       return Promise.reject(new ToolAbortedError(toolName));
     }
@@ -346,6 +396,7 @@ export class AgentLoop {
         if (settled) return;
         settled = true;
         cleanup();
+        cancellation.abort();
         reject(new ToolTimeoutError(toolName, timeoutMs));
       }, Math.max(1, timeoutMs));
 

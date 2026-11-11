@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type {
   AgentConfig,
   CommandResult,
@@ -18,7 +18,16 @@ import type {
 import { uuid } from '@/lib/utils.js';
 import { AgentLoop, createToolRegistry, type AgentStep } from '@/core/agent/loop.js';
 import { builtinTools } from '@/core/agent/tools.js';
+import { buildToolCallGrammar } from '@/core/llm/grammar.js';
 import { CORRECTIVE_RETRY_PROMPT, CONTINUE_PROMPT } from '@/core/agent/prompts.js';
+
+vi.mock('@/core/llm/grammar.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/core/llm/grammar.js')>();
+  return {
+    ...actual,
+    buildToolCallGrammar: vi.fn(actual.buildToolCallGrammar),
+  };
+});
 
 class FakeLLM implements LLMEngine {
   readonly id = 'fake-llm';
@@ -27,6 +36,8 @@ class FakeLLM implements LLMEngine {
   requests: GenerateRequest[] = [];
   fallback: GenerateResult = { text: 'All done.', tokens: 1, finishReason: 'stop' };
   onGenerate: ((req: GenerateRequest) => void) | null = null;
+  /** When false, an aborted signal yields an aborted result instead of a throw. */
+  throwOnAbort = true;
 
   async load(): Promise<void> {}
   async unload(): Promise<void> {}
@@ -41,7 +52,10 @@ class FakeLLM implements LLMEngine {
   ): Promise<GenerateResult> {
     this.requests.push(req);
     this.onGenerate?.(req);
-    if (signal.aborted) throw new Error('aborted');
+    if (signal.aborted) {
+      if (this.throwOnAbort) throw new Error('aborted');
+      return { text: '', tokens: 0, finishReason: 'aborted' };
+    }
     const next = this.queue.length > 0 ? this.queue.shift()! : this.fallback;
     for (const token of next.text) onToken(token);
     return next;
@@ -273,6 +287,27 @@ describe('AgentLoop', () => {
     const result = await run(loop, makeConversation([makeMessage('user', 'hi')]), makeContext(vm, llm), [], controller.signal);
 
     expect(result.finishReason).toBe('aborted');
+    expect(result.iterations).toBe(0);
+  });
+
+  it('stops retrying when the signal aborts between corrective attempts', async () => {
+    const controller = new AbortController();
+    const llm = new FakeLLM();
+    llm.throwOnAbort = false;
+    llm.fallback = { text: '<tool_call>not json</tool_call>', tokens: 1, finishReason: 'stop' };
+    llm.onGenerate = () => controller.abort();
+    const loop = new AgentLoop(makeTools(), makeConfig({ maxRetries: 5 }));
+
+    const result = await run(
+      loop,
+      makeConversation([makeMessage('user', 'hi')]),
+      makeContext(new FakeVM(), llm),
+      [],
+      controller.signal,
+    );
+
+    expect(result.finishReason).toBe('aborted');
+    expect(llm.requests).toHaveLength(1);
   });
 
   it('returns aborted when the signal is already aborted', async () => {
@@ -308,6 +343,72 @@ describe('AgentLoop', () => {
     expect(result.finishReason).toBe('max-iterations');
     expect(steps[0]!.results[0]!.ok).toBe(false);
     expect(steps[0]!.results[0]!.content).toContain('timed out');
+  });
+
+  it('aborts a timed-out tool so it stops instead of running to completion', async () => {
+    let toolSignal: AbortSignal | undefined;
+    const watchdog: ToolDefinition = {
+      name: 'watchdog',
+      description: 'records its signal',
+      parameters: { type: 'object', properties: {} },
+      execute: async (ctx) => {
+        toolSignal = ctx.signal;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        return { ok: true, content: 'finished' };
+      },
+    };
+    const llm = new FakeLLM();
+    llm.fallback = { text: toolCall('watchdog', {}), tokens: 1, finishReason: 'stop' };
+    const loop = new AgentLoop(
+      new Map([['watchdog', watchdog]]),
+      makeConfig({ toolTimeoutMs: 20, maxIterations: 1 }),
+    );
+    const steps: AgentStep[] = [];
+
+    const result = await run(loop, makeConversation([makeMessage('user', 'hi')]), makeContext(new FakeVM(), llm), steps);
+
+    expect(result.finishReason).toBe('max-iterations');
+    expect(steps[0]!.results[0]!.ok).toBe(false);
+    expect(toolSignal?.aborted).toBe(true);
+  });
+
+  it('does not start the next tool until a timed-out tool settles', async () => {
+    const order: string[] = [];
+    const hanging: ToolDefinition = {
+      name: 'hanging',
+      description: 'times out, then finishes',
+      parameters: { type: 'object', properties: {} },
+      execute: async () => {
+        order.push('hanging-start');
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        order.push('hanging-end');
+        return { ok: true, content: 'late' };
+      },
+    };
+    const next: ToolDefinition = {
+      name: 'next',
+      description: 'runs after the hanging tool',
+      parameters: { type: 'object', properties: {} },
+      execute: async () => {
+        order.push('next-start');
+        return { ok: true, content: 'ok' };
+      },
+    };
+    const llm = new FakeLLM();
+    llm.queue = [
+      { text: toolCall('hanging', {}), tokens: 1, finishReason: 'stop' },
+      { text: toolCall('next', {}), tokens: 1, finishReason: 'stop' },
+      { text: 'Done.', tokens: 1, finishReason: 'stop' },
+    ];
+    const loop = new AgentLoop(
+      new Map([['hanging', hanging], ['next', next]]),
+      makeConfig({ toolTimeoutMs: 20, maxIterations: 3 }),
+    );
+
+    const result = await run(loop, makeConversation([makeMessage('user', 'hi')]), makeContext(new FakeVM(), llm));
+
+    expect(result.finishReason).toBe('stop');
+    expect(order).toEqual(['hanging-start', 'hanging-end', 'next-start']);
   });
 
   it('interrupts the guest command and issues no further commands when aborted', async () => {
@@ -360,8 +461,20 @@ describe('AgentLoop', () => {
     );
 
     expect(result.finishReason).toBe('aborted');
+    expect(result.iterations).toBe(0);
     expect(steps).toHaveLength(0);
     expect(Date.now() - start).toBeLessThan(300);
+  });
+
+  it('counts a retries-exhausted iteration as completed', async () => {
+    const llm = new FakeLLM();
+    llm.fallback = { text: '<tool_call>not json</tool_call>', tokens: 1, finishReason: 'stop' };
+    const loop = new AgentLoop(makeTools(), makeConfig({ maxRetries: 1 }));
+
+    const result = await run(loop, makeConversation([makeMessage('user', 'hi')]), makeContext(new FakeVM(), llm));
+
+    expect(result.finishReason).toBe('error');
+    expect(result.iterations).toBe(1);
   });
 
   it('reports unknown tools without throwing', async () => {
@@ -449,6 +562,31 @@ describe('AgentLoop', () => {
     expect(llm.requests[1]!.messages.some((m) => m.content.includes('x'.repeat(200)))).toBe(false);
   });
 
+  it('does not insert a summary when aborted during summarization', async () => {
+    const controller = new AbortController();
+    const llm = new FakeLLM();
+    llm.throwOnAbort = false;
+    llm.onGenerate = () => controller.abort();
+    const loop = new AgentLoop(makeTools(), makeConfig({ contextWindow: 150 }));
+    const messages = [
+      makeMessage('user', 'x'.repeat(200)),
+      makeMessage('assistant', 'y'.repeat(200)),
+      makeMessage('user', 'z'.repeat(200)),
+    ];
+
+    const result = await run(
+      loop,
+      makeConversation(messages),
+      makeContext(new FakeVM(), llm),
+      [],
+      controller.signal,
+    );
+
+    expect(result.finishReason).toBe('aborted');
+    expect(result.messages.some((m) => m.content.includes('Summary of earlier conversation'))).toBe(false);
+    expect(result.messages.some((m) => m.content.includes('Earlier conversation omitted'))).toBe(false);
+  });
+
   it('keeps an existing system message instead of duplicating it', async () => {
     const llm = new FakeLLM();
     llm.queue = [{ text: 'Done.', tokens: 1, finishReason: 'stop' }];
@@ -460,5 +598,47 @@ describe('AgentLoop', () => {
 
     expect(result.messages.filter((m) => m.role === 'system')).toHaveLength(1);
     expect(result.messages[0]!.content).toBe('Custom system prompt.');
+  });
+});
+
+describe('grammar caching', () => {
+  it('builds the tool-call grammar once per tool set', async () => {
+    vi.mocked(buildToolCallGrammar).mockClear();
+    const llm = new FakeLLM();
+    llm.queue = [
+      { text: toolCall('bash', { command: 'ls' }), tokens: 1, finishReason: 'stop' },
+      { text: toolCall('bash', { command: 'pwd' }), tokens: 1, finishReason: 'stop' },
+      { text: 'Done.', tokens: 1, finishReason: 'stop' },
+    ];
+    const loop = new AgentLoop(makeTools(), makeConfig());
+
+    const result = await run(loop, makeConversation([makeMessage('user', 'hi')]), makeContext(new FakeVM(), llm));
+
+    expect(result.finishReason).toBe('stop');
+    expect(llm.requests).toHaveLength(3);
+    expect(vi.mocked(buildToolCallGrammar)).toHaveBeenCalledTimes(1);
+  });
+
+  it('rebuilds the grammar when the tool set changes', async () => {
+    vi.mocked(buildToolCallGrammar).mockClear();
+    const tools = makeTools();
+    const llm = new FakeLLM();
+    llm.queue = [
+      { text: 'Done.', tokens: 1, finishReason: 'stop' },
+      { text: 'Done again.', tokens: 1, finishReason: 'stop' },
+    ];
+    const loop = new AgentLoop(tools, makeConfig());
+
+    await run(loop, makeConversation([makeMessage('user', 'hi')]), makeContext(new FakeVM(), llm));
+    expect(vi.mocked(buildToolCallGrammar)).toHaveBeenCalledTimes(1);
+
+    tools.set('extra', {
+      name: 'extra',
+      description: 'extra tool',
+      parameters: { type: 'object', properties: {} },
+      execute: async () => ({ ok: true, content: 'ok' }),
+    });
+    await run(loop, makeConversation([makeMessage('user', 'hi')]), makeContext(new FakeVM(), llm));
+    expect(vi.mocked(buildToolCallGrammar)).toHaveBeenCalledTimes(2);
   });
 });

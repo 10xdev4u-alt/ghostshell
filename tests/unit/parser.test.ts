@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { parseToolCalls } from '@/core/agent/parser.js';
+import { describe, expect, it, vi } from 'vitest';
+import { parseToolCalls, retryWithCorrection } from '@/core/agent/parser.js';
 
 describe('parseToolCalls', () => {
   it('parses a grammar-constrained JSON object', () => {
@@ -41,5 +41,33 @@ describe('parseToolCalls', () => {
   it('handles string arguments', () => {
     const result = parseToolCalls('{"name":"bash","arguments":"{\\"command\\":\\"ls\\"}"}');
     expect(result.toolCalls[0]!.arguments).toEqual({ command: 'ls' });
+  });
+});
+
+describe('retryWithCorrection', () => {
+  it('makes no calls when the signal is already aborted', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const generate = vi.fn(async () => ({ text: 'hello' }));
+
+    const result = await retryWithCorrection(generate, [], 3, controller.signal);
+
+    expect(result.aborted).toBe(true);
+    expect(result.attempts).toBe(0);
+    expect(generate).not.toHaveBeenCalled();
+  });
+
+  it('stops retrying when the signal aborts between attempts', async () => {
+    const controller = new AbortController();
+    const generate = vi.fn(async () => {
+      controller.abort();
+      return { text: 'not a tool call' };
+    });
+
+    const result = await retryWithCorrection(generate, [], 3, controller.signal);
+
+    expect(result.aborted).toBe(true);
+    expect(result.attempts).toBe(1);
+    expect(generate).toHaveBeenCalledTimes(1);
   });
 });

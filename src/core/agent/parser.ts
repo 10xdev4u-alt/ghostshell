@@ -98,14 +98,27 @@ export async function retryWithCorrection(
   generate: (messages: Message[]) => Promise<GenerateOutcome>,
   messages: Message[],
   maxRetries: number,
+  signal?: AbortSignal,
 ): Promise<CorrectionResult> {
   const history = [...messages];
   let lastParse: ParseResult = { toolCalls: [], text: '', strategy: 'none' };
 
   for (let attempt = 1; attempt <= maxRetries + 1; attempt += 1) {
+    // Check between attempts too: an engine that ignores the signal would
+    // otherwise keep retrying after an abort.
+    if (signal?.aborted) {
+      return {
+        messages: history,
+        parse: lastParse,
+        attempts: attempt - 1,
+        exhausted: false,
+        aborted: true,
+      };
+    }
+
     const outcome = await generate(history);
 
-    if (outcome.aborted) {
+    if (outcome.aborted || signal?.aborted) {
       return {
         messages: history,
         parse: lastParse,

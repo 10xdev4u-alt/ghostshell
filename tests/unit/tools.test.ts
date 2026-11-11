@@ -9,7 +9,7 @@ import type {
   ToolDefinition,
   VMHandle,
 } from '@/types/index.js';
-import { builtinTools, MAX_OUTPUT_CHARS } from '@/core/agent/tools.js';
+import { builtinTools, MAX_OUTPUT_CHARS, truncateOutput } from '@/core/agent/tools.js';
 
 class FakeVM implements VMHandle {
   readonly id = 'fake-vm';
@@ -213,6 +213,17 @@ describe('builtin tools', () => {
     expect(vm.commands[0]!.cmd).toContain("'/root/workspace'");
   });
 
+  it('search skips binary files and VCS/dependency directories', async () => {
+    const vm = new FakeVM();
+    vm.execResult = { stdout: '', stderr: '', exitCode: 1, durationMs: 1, timedOut: false };
+
+    await tool('search').execute(makeContext(vm), { pattern: 'foo' });
+
+    expect(vm.commands[0]!.cmd).toContain('-rnI');
+    expect(vm.commands[0]!.cmd).toContain('--exclude-dir=.git');
+    expect(vm.commands[0]!.cmd).toContain('--exclude-dir=node_modules');
+  });
+
   it('search passes a glob filter', async () => {
     const vm = new FakeVM();
     vm.execResult = { stdout: '', stderr: '', exitCode: 1, durationMs: 1, timedOut: false };
@@ -249,7 +260,9 @@ describe('builtin tools', () => {
 
     await tool('search').execute(makeContext(vm), { pattern: 'foo', path: '-weird-path' });
 
-    expect(vm.commands[0]!.cmd).toBe("grep -rn -e 'foo' -- '-weird-path'");
+    expect(vm.commands[0]!.cmd).toBe(
+      "grep -rnI --exclude-dir=.git --exclude-dir=node_modules -e 'foo' -- '-weird-path'",
+    );
   });
 
   it('search treats no matches as success', async () => {
@@ -285,5 +298,28 @@ describe('builtin tools', () => {
       expect(typeof result.content).toBe('string');
       expect(typeof result.ok).toBe('boolean');
     }
+  });
+});
+
+describe('truncateOutput', () => {
+  it('leaves text within the limit untouched', () => {
+    expect(truncateOutput('hello', 10)).toBe('hello');
+    expect(truncateOutput('', 10)).toBe('');
+  });
+
+  it('never exceeds max when the marker is longer than max', () => {
+    const result = truncateOutput('x'.repeat(100), 10);
+    expect(result.length).toBeLessThanOrEqual(10);
+  });
+
+  it('reports the number of characters actually removed', () => {
+    const text = 'x'.repeat(100);
+    const result = truncateOutput(text, 50);
+    const marker = /…\[truncated (\d+) chars\]$/.exec(result);
+    expect(marker).not.toBeNull();
+    const reported = Number(marker![1]);
+    const kept = result.length - marker![0].length;
+    expect(reported).toBe(text.length - kept);
+    expect(result.length).toBeLessThanOrEqual(50);
   });
 });

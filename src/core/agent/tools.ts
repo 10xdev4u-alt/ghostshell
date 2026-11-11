@@ -29,11 +29,22 @@ function errorMessage(err: unknown): string {
 /**
  * Cap tool output at `max` characters, marking how much was removed.
  * The returned string is never longer than `max`.
+ *
+ * The marker is reserved using the largest possible removed count
+ * (`text.length`), so the real marker always fits and the reported count is
+ * the number of characters actually dropped.
  */
 export function truncateOutput(text: string, max: number = MAX_OUTPUT_CHARS): string {
   if (text.length <= max) return text;
-  const suffix = `…[truncated ${text.length - max} chars]`;
-  return `${text.slice(0, Math.max(0, max - suffix.length))}${suffix}`;
+  const reserved = `…[truncated ${text.length} chars]`;
+  if (reserved.length >= max) {
+    // The marker alone cannot fit; clamp to raw text.
+    return text.slice(0, max);
+  }
+  const keep = max - reserved.length;
+  const kept = text.slice(0, keep);
+  const removed = text.length - kept.length;
+  return `${kept}…[truncated ${removed} chars]`;
 }
 
 /** Quote a value for safe interpolation into a shell command. */
@@ -265,7 +276,8 @@ export function builtinTools(): ToolDefinition[] {
     {
       name: 'search',
       description:
-        'Search file contents in the VM using grep -rn. Returns matching lines with paths.',
+        'Search file contents in the VM using grep -rnI. Returns matching lines with paths. ' +
+        'Binary files and the .git/node_modules directories are skipped.',
       parameters: {
         type: 'object',
         properties: {
@@ -282,7 +294,9 @@ export function builtinTools(): ToolDefinition[] {
         const path = String(args['path'] ?? '/root/workspace').trim() || '/root/workspace';
         const glob = args['glob'] ? String(args['glob']).trim() : '';
 
-        const commandParts = ['grep', '-rn'];
+        // `-I` skips binary files; `--exclude-dir` keeps VCS metadata and
+        // dependency trees out of the match budget.
+        const commandParts = ['grep', '-rnI', '--exclude-dir=.git', '--exclude-dir=node_modules'];
         if (glob) commandParts.push(`--include=${shellQuote(glob)}`);
         // `-e` keeps a leading-dash pattern from being parsed as an option.
         commandParts.push('-e', shellQuote(pattern));
