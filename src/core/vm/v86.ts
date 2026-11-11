@@ -149,6 +149,11 @@ export class V86VMHandle implements VMHandle {
     return this.queue.add(() => this.runner.run(cmd, timeoutMs));
   }
 
+  /** Write raw data to the guest serial console (e.g. Ctrl-C to interrupt). */
+  sendSerial(data: string): void {
+    this.transport.send(data);
+  }
+
   async write(path: string, content: string): Promise<void> {
     const emu = this.requireEmu();
     const data = new TextEncoder().encode(content);

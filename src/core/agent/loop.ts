@@ -287,6 +287,8 @@ export class AgentLoop {
       };
     }
 
+    // The tool receives the run's abort signal so long-running guest commands
+    // can interrupt themselves (see `execWithAbort` in tools.ts).
     const toolCtx: ToolContext = { ...ctx, signal };
     try {
       return await this.queue.add(() =>
@@ -310,7 +312,9 @@ export class AgentLoop {
   /**
    * Race a tool against its timeout and the run's abort signal. Whichever
    * fires first settles the promise; the other listener is removed so a late
-   * tool result cannot leak into a settled run.
+   * tool result cannot leak into a settled run. Tools that talk to the VM
+   * must also honor `ctx.signal` and reject on abort, so the underlying
+   * command is interrupted instead of being orphaned.
    */
   private withTimeout<T>(
     promise: Promise<T>,

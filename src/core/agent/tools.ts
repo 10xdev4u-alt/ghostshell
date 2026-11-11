@@ -1,4 +1,4 @@
-import type { JSONSchema, ToolDefinition } from '@/types/index.js';
+import type { CommandResult, JSONSchema, ToolContext, ToolDefinition } from '@/types/index.js';
 import { formatBytes } from '@/lib/utils.js';
 
 /**
@@ -55,6 +55,55 @@ function combineOutputs(stdout: string, stderr: string): string {
   return parts.join('\n');
 }
 
+/**
+ * Run a guest command that honors the run's abort signal.
+ *
+ * On abort, send Ctrl-C (`\x03`) over the serial console so the guest command
+ * stops instead of running to completion, then reject. The underlying `exec`
+ * promise settles on its own once the interrupt lands; the tool's caller sees
+ * the rejection immediately.
+ */
+function execWithAbort(
+  ctx: ToolContext,
+  command: string,
+  timeoutMs: number,
+): Promise<CommandResult> {
+  const signal = ctx.signal;
+  if (!signal) return ctx.vm.exec(command, timeoutMs);
+  if (signal.aborted) throw new Error('aborted');
+
+  return new Promise<CommandResult>((resolve, reject) => {
+    let settled = false;
+
+    function onAbort(): void {
+      if (settled) return;
+      settled = true;
+      try {
+        ctx.vm.sendSerial('\x03');
+      } catch {
+        // Best effort: the tool still rejects below.
+      }
+      reject(new Error('aborted'));
+    }
+
+    signal.addEventListener('abort', onAbort, { once: true });
+    ctx.vm.exec(command, timeoutMs).then(
+      (result) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', onAbort);
+        resolve(result);
+      },
+      (err: unknown) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', onAbort);
+        reject(err);
+      },
+    );
+  });
+}
+
 export function builtinTools(): ToolDefinition[] {
   return [
     {
@@ -81,7 +130,7 @@ export function builtinTools(): ToolDefinition[] {
         );
 
         try {
-          const result = await ctx.vm.exec(command, timeoutMs);
+          const result = await execWithAbort(ctx, command, timeoutMs);
           const body = combineOutputs(result.stdout, result.stderr);
           const lines: string[] = [];
           if (result.timedOut) lines.push(`Command timed out after ${timeoutMs}ms`);
@@ -98,6 +147,8 @@ export function builtinTools(): ToolDefinition[] {
             },
           };
         } catch (err) {
+          // An abort is not a tool failure: rethrow so the loop reports `aborted`.
+          if (ctx.signal?.aborted) throw err;
           return { ok: false, content: `bash failed: ${errorMessage(err)}` };
         }
       },
@@ -157,12 +208,14 @@ export function builtinTools(): ToolDefinition[] {
         const parent = path.replace(/\/[^/]*$/, '') || '/';
         if (parent !== '/' && parent !== '.') {
           try {
-            await ctx.vm.exec(`mkdir -p ${shellQuote(parent)}`, DEFAULT_TIMEOUT_MS);
-          } catch {
+            await execWithAbort(ctx, `mkdir -p ${shellQuote(parent)}`, DEFAULT_TIMEOUT_MS);
+          } catch (err) {
+            if (ctx.signal?.aborted) throw err;
             // Best effort: the write below reports the real error.
           }
         }
         try {
+          if (ctx.signal?.aborted) throw new Error('aborted');
           await ctx.vm.write(path, content);
           return {
             ok: true,
@@ -170,6 +223,7 @@ export function builtinTools(): ToolDefinition[] {
             metadata: { path, chars: content.length },
           };
         } catch (err) {
+          if (ctx.signal?.aborted) throw err;
           return { ok: false, content: `write_file failed: ${errorMessage(err)}` };
         }
       },
@@ -236,7 +290,7 @@ export function builtinTools(): ToolDefinition[] {
         commandParts.push('--', shellQuote(path));
 
         try {
-          const result = await ctx.vm.exec(commandParts.join(' '), DEFAULT_TIMEOUT_MS);
+          const result = await execWithAbort(ctx, commandParts.join(' '), DEFAULT_TIMEOUT_MS);
           const body = combineOutputs(result.stdout, result.stderr);
           const metadata = { pattern, path, glob: glob || undefined, exitCode: result.exitCode };
 
@@ -252,6 +306,7 @@ export function builtinTools(): ToolDefinition[] {
             metadata,
           };
         } catch (err) {
+          if (ctx.signal?.aborted) throw err;
           return { ok: false, content: `search failed: ${errorMessage(err)}` };
         }
       },

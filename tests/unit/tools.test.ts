@@ -29,6 +29,8 @@ class FakeVM implements VMHandle {
     return this.execResult;
   }
 
+  sendSerial(_data: string): void {}
+
   async write(path: string, content: string): Promise<void> {
     this.files.set(path, content);
   }
