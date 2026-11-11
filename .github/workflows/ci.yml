@@ -40,6 +40,21 @@ jobs:
           path: coverage/
           continue-on-error: true
 
+  pr-size:
+    name: PR size
+    runs-on: ubuntu-latest
+    # Merges to main are push events, not reviewable PRs; skip them.
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Check changed-line count
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bun run scripts/pr-size.ts --pr ${{ github.event.pull_request.number }}
+
   build:
     name: Build
     runs-on: ubuntu-latest
