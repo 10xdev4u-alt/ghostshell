@@ -487,6 +487,31 @@ describe('AgentLoop', () => {
     expect(llm.requests[1]!.messages.some((m) => m.content.includes('x'.repeat(200)))).toBe(false);
   });
 
+  it('does not insert a summary when aborted during summarization', async () => {
+    const controller = new AbortController();
+    const llm = new FakeLLM();
+    llm.throwOnAbort = false;
+    llm.onGenerate = () => controller.abort();
+    const loop = new AgentLoop(makeTools(), makeConfig({ contextWindow: 150 }));
+    const messages = [
+      makeMessage('user', 'x'.repeat(200)),
+      makeMessage('assistant', 'y'.repeat(200)),
+      makeMessage('user', 'z'.repeat(200)),
+    ];
+
+    const result = await run(
+      loop,
+      makeConversation(messages),
+      makeContext(new FakeVM(), llm),
+      [],
+      controller.signal,
+    );
+
+    expect(result.finishReason).toBe('aborted');
+    expect(result.messages.some((m) => m.content.includes('Summary of earlier conversation'))).toBe(false);
+    expect(result.messages.some((m) => m.content.includes('Earlier conversation omitted'))).toBe(false);
+  });
+
   it('keeps an existing system message instead of duplicating it', async () => {
     const llm = new FakeLLM();
     llm.queue = [{ text: 'Done.', tokens: 1, finishReason: 'stop' }];

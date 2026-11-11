@@ -117,6 +117,40 @@ describe('compaction', () => {
     expect(result.messages.some((m) => m.content === 'current question')).toBe(true);
   });
 
+  it('leaves the conversation untouched when already aborted', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const messages = [message('user', 'a'.repeat(400)), message('user', 'b'.repeat(400))];
+
+    const result = await compactMessages(messages, 100, async () => 'summary', controller.signal);
+
+    expect(result.compacted).toBe(false);
+    expect(result.messages).toBe(messages);
+  });
+
+  it('skips the summary when the signal aborts during summarization', async () => {
+    const controller = new AbortController();
+    const messages = [
+      message('user', 'a'.repeat(400)),
+      message('user', 'b'.repeat(400)),
+      message('user', 'c'.repeat(400)),
+    ];
+
+    const result = await compactMessages(
+      messages,
+      100,
+      async () => {
+        controller.abort();
+        return 'summary text';
+      },
+      controller.signal,
+    );
+
+    expect(controller.signal.aborted).toBe(true);
+    expect(result.messages.some((m) => m.content.includes('Summary of earlier conversation'))).toBe(false);
+    expect(result.messages.some((m) => m.content.includes('Earlier conversation omitted'))).toBe(false);
+  });
+
   it('summarizes every dropped message exactly once', async () => {
     const dropped: Message[][] = [];
     const messages = [

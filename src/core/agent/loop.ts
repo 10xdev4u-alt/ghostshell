@@ -239,8 +239,11 @@ export class AgentLoop {
     const budget = Math.floor(this.config.contextWindow * CONTEXT_BUDGET_RATIO);
     if (tokenBudget(messages) <= budget) return;
 
-    const result = await compactMessages(messages, budget, (dropped) =>
-      this.summarize(dropped, ctx, signal),
+    const result = await compactMessages(
+      messages,
+      budget,
+      (dropped) => this.summarize(dropped, ctx, signal),
+      signal,
     );
     if (result.compacted) {
       messages.splice(0, messages.length, ...result.messages);

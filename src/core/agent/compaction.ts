@@ -70,8 +70,14 @@ export async function compactMessages(
   messages: Message[],
   maxTokens: number,
   summarize: (messages: Message[]) => Promise<string>,
+  signal?: AbortSignal,
 ): Promise<CompactionResult> {
   if (tokenBudget(messages) <= maxTokens) {
+    return { messages, compacted: false, removed: 0 };
+  }
+  // An aborted run is finishing; leave the conversation untouched rather than
+  // spending a summarization call on it.
+  if (signal?.aborted) {
     return { messages, compacted: false, removed: 0 };
   }
 
@@ -101,16 +107,26 @@ export async function compactMessages(
   }
 
   // Summarize what was dropped, then fit the real summary by truncating it to
-  // the remaining budget or dropping it entirely.
+  // the remaining budget or dropping it entirely. When the run aborts, return
+  // undefined so no spurious "Earlier conversation omitted." message is
+  // inserted into the conversation.
+  const summarizeDropped = async (): Promise<string | undefined> => {
+    if (signal?.aborted) return undefined;
+    const summary = (await summarize(dropped)).trim();
+    return signal?.aborted ? undefined : summary || 'Earlier conversation omitted.';
+  };
+
   let summaryMessage: Message | undefined;
   if (dropped.length > 0) {
-    const summary = (await summarize(dropped)).trim() || 'Earlier conversation omitted.';
-    summaryMessage = makeSummaryMessage(summary);
-    const remaining = maxTokens - tokenBudget(systems) - tokenBudget(kept);
-    if (remaining <= 0) {
-      summaryMessage = undefined;
-    } else {
-      summaryMessage = truncateMessageToTokens(summaryMessage, remaining);
+    const summary = await summarizeDropped();
+    if (summary !== undefined) {
+      summaryMessage = makeSummaryMessage(summary);
+      const remaining = maxTokens - tokenBudget(systems) - tokenBudget(kept);
+      if (remaining <= 0) {
+        summaryMessage = undefined;
+      } else {
+        summaryMessage = truncateMessageToTokens(summaryMessage, remaining);
+      }
     }
   }
 
@@ -127,8 +143,10 @@ export async function compactMessages(
       dropped.push(current);
       const room = maxTokens - tokenBudget(systems) - tokenBudget(kept);
       if (room > 0) {
-        const summary = (await summarize(dropped)).trim() || 'Earlier conversation omitted.';
-        summaryMessage = truncateMessageToTokens(makeSummaryMessage(summary), room);
+        const summary = await summarizeDropped();
+        if (summary !== undefined) {
+          summaryMessage = truncateMessageToTokens(makeSummaryMessage(summary), room);
+        }
       }
     }
   }
