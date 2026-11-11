@@ -170,8 +170,15 @@ function patchFetch(log: EgressLog, blockAll: boolean, allowlist: EgressAllowlis
   if (typeof original !== 'function') return () => {};
 
   const patched = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    // Duck-type the url: a URL from another realm is not `instanceof URL`,
+    // and the logged url would fall through to `input.url` (undefined).
+    // Check `href` before `url` so a Request keeps resolving to `request.url`.
     const url =
-      typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      typeof input === 'string'
+        ? input
+        : typeof input === 'object' && input !== null && 'href' in input
+          ? input.href
+          : input.url;
     // Duck-type the Request method: a Request from another realm is not
     // `instanceof Request`, and the logged method would fall back to GET.
     const method =
