@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { V86Options } from 'v86';
 import { DEFAULT_IMAGE } from '@/core/vm/image.js';
+import { V86_WASM_URL } from '@/core/vm/wasm.js';
 import { createV86Filesystem } from '@/core/vm/fs9p.js';
 import { buildNetDevice } from '@/core/vm/network.js';
 import { V86VMHandle } from '@/core/vm/v86.js';
@@ -188,6 +189,13 @@ describe('V86VMHandle', () => {
     expect(instances[0]!.options.net_device).toEqual(netDevice);
   });
 
+  it('hands the inlined wasm data URL to v86 as wasm_path', async () => {
+    const vm = new V86VMHandle({ wasmPath: V86_WASM_URL });
+    await vm.start(DEFAULT_IMAGE);
+    expect(instances[0]!.options.wasm_path).toBe(V86_WASM_URL);
+    expect(String(instances[0]!.options.wasm_path).startsWith('data:')).toBe(true);
+  });
+
   it('passes every boot dependency through to the v86 options', async () => {
     const bios = { url: 'bios.bin' };
     const vgaBios = { url: 'vgabios.bin' };
@@ -227,6 +235,20 @@ describe('V86VMHandle', () => {
   it('leaves net_device unset in airplane mode', async () => {
     const netDevice = buildNetDevice({ mode: 'off' });
     const vm = new V86VMHandle({ netDevice });
+    await vm.start(DEFAULT_IMAGE);
+    expect(instances[0]!.options.net_device).toBeUndefined();
+  });
+
+  it('applies a net device set after construction on the next boot', async () => {
+    const vm = new V86VMHandle();
+    vm.setNetDevice(buildNetDevice({ mode: 'fetch' }));
+    await vm.start(DEFAULT_IMAGE);
+    expect(instances[0]!.options.net_device).toEqual({ relay_url: 'fetch' });
+  });
+
+  it('lets a later setNetDevice override an earlier one', async () => {
+    const vm = new V86VMHandle({ netDevice: buildNetDevice({ mode: 'fetch' }) });
+    vm.setNetDevice(buildNetDevice({ mode: 'off' }));
     await vm.start(DEFAULT_IMAGE);
     expect(instances[0]!.options.net_device).toBeUndefined();
   });

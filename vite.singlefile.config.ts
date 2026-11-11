@@ -16,6 +16,9 @@ export default defineConfig({
     alias: { '@': resolve(import.meta.dirname, 'src') },
   },
   plugins: [viteSingleFile({ removeViteModuleLoader: true })],
+  // v86/build/v86.wasm?inline (src/core/vm/wasm.ts): `.wasm` is not in Vite's
+  // default asset types, so `?inline` is ignored unless it is matched here.
+  assetsInclude: ['**/*.wasm'],
   build: {
     target: 'es2022',
     outDir: 'dist/single',

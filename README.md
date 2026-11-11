@@ -16,8 +16,8 @@ Open one HTML file. Get a chat with an AI that runs **real commands in a real
 
 - 🖥️ **Real Linux VM** — [v86](https://copy.sh/v86/) x86 emulator, Alpine 3.21 i386
 - 🧠 **Local LLM** — [Transformers.js](https://huggingface.co/docs/transformers.js) / [WebLLM](https://webllm.mlc.ai), 1.5B–3B quantized
-- 🔒 **No server, no account, no telemetry** — the only network call is the one-time model download
-- 📦 **One file** — the whole app inlines into a single `index.html`
+- 🔒 **No server, no account, no telemetry** — the only network calls are the app's own boot and model assets
+- 📦 **One file** — the whole app, including the v86 WASM, inlines into a single `index.html`
 
 ### Why?
 
@@ -40,11 +40,23 @@ bun run dev          # http://localhost:5173
 Build the single file:
 
 ```bash
-bun run build:single # dist/single/index.html (~45–85 MB with inlined assets)
+bun run build:single # dist/single/index.html (~59 MB with inlined assets)
 ```
 
 Host it anywhere static (Netlify, Cloudflare Pages, GitHub Pages). For threaded
 WASM, the host must send `COOP: same-origin` and `COEP: require-corp`.
+
+### Network lockdown
+
+Airplane mode (the default) patches `fetch`, `WebSocket`, `XMLHttpRequest`,
+`EventSource`, and `sendBeacon`. Every request is logged to the privacy report;
+anything that is not one of the app's own boot or model assets is blocked.
+The allowlist exists because GhostShell cannot boot or load a model without
+it: `copy.sh` (v86 BIOS and VGA BIOS), `huggingface.co` and `*.hf.co` (model
+weights and the HF Xet CDN), `cdn.jsdelivr.net` (the ONNX runtime), and
+`data:` (the inlined v86 WASM). Lockdown blocks application egress, not the
+app booting itself. The list mirrors the CSP `connect-src` and lives in
+`BOOT_EGRESS_ALLOWLIST` (`src/core/security/egress.ts`).
 
 ## Architecture
 

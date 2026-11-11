@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it } from 'vitest';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import {
@@ -136,5 +136,14 @@ describe('dist/single/index.html', () => {
     expect(result.externalAssets).toEqual([]);
     expect(result.ok).toBe(true);
     expect(result.sizeBytes).toBeLessThanOrEqual(result.maxBytes);
+  });
+
+  // Issue #87: v86 must load its WASM from the bundle, not from a fetch to
+  // build/v86.wasm (which does not exist in the release).
+  it.runIf(distAvailable)('inlines the v86 emulator wasm', () => {
+    const html = readFileSync(distPath, 'utf8');
+    const wasmBytes = readFileSync(resolve(process.cwd(), 'node_modules/v86/build/v86.wasm'));
+    const expected = `data:application/wasm;base64,${wasmBytes.toString('base64')}`;
+    expect(html).toContain(expected);
   });
 });

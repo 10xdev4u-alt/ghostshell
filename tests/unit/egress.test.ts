@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { InMemoryEgressLog, installEgressInterceptor } from '@/core/security/egress.js';
+import {
+  BOOT_EGRESS_ALLOWLIST,
+  InMemoryEgressLog,
+  installEgressInterceptor,
+  isEgressAllowed,
+  type EgressAllowlist,
+} from '@/core/security/egress.js';
 
 class FakeWebSocket {
   readonly url: string;
@@ -268,5 +274,152 @@ describe('InMemoryEgressLog', () => {
     log.record({ url: 'https://example.com', method: 'GET', blocked: false });
     log.list().pop();
     expect(log.list()).toHaveLength(1);
+  });
+});
+
+describe('isEgressAllowed', () => {
+  const allowlist: EgressAllowlist = [
+    { host: 'copy.sh' },
+    { host: 'hf.co' },
+    { urlPrefix: 'data:' },
+  ];
+
+  it('matches exact hosts, subdomains, and URL prefixes', () => {
+    expect(isEgressAllowed('https://copy.sh/v86/bios/seabios.bin', allowlist)).toBe(true);
+    expect(isEgressAllowed('https://us.aws.cdn.hf.co/blob/resolve/main/model.onnx', allowlist)).toBe(
+      true,
+    );
+    expect(isEgressAllowed('data:application/wasm;base64,AGFzbQ==', allowlist)).toBe(true);
+  });
+
+  it('does not match other hosts or lookalike domains', () => {
+    expect(isEgressAllowed('https://evil.example.com/secret', allowlist)).toBe(false);
+    expect(isEgressAllowed('https://copy.sh.evil.example.com/secret', allowlist)).toBe(false);
+    expect(isEgressAllowed('https://notcopy.sh/secret', allowlist)).toBe(false);
+  });
+
+  it('returns false for an empty allowlist', () => {
+    expect(isEgressAllowed('https://copy.sh', [])).toBe(false);
+  });
+});
+
+describe('BOOT_EGRESS_ALLOWLIST', () => {
+  it('covers the v86 boot hosts, the model CDN, and the inlined wasm', () => {
+    expect(isEgressAllowed('https://copy.sh/v86/bios/seabios.bin', BOOT_EGRESS_ALLOWLIST)).toBe(
+      true,
+    );
+    expect(isEgressAllowed('https://copy.sh/v86/bios/vgabios.bin', BOOT_EGRESS_ALLOWLIST)).toBe(
+      true,
+    );
+    expect(
+      isEgressAllowed(
+        'https://huggingface.co/onnx-community/Qwen2.5-1.5B-Instruct/resolve/main/onnx/model.onnx',
+        BOOT_EGRESS_ALLOWLIST,
+      ),
+    ).toBe(true);
+    expect(
+      isEgressAllowed('https://us.aws.cdn.hf.co/resolve/main/onnx/model.onnx', BOOT_EGRESS_ALLOWLIST),
+    ).toBe(true);
+    expect(
+      isEgressAllowed(
+        'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.0/dist/transformers.min.js',
+        BOOT_EGRESS_ALLOWLIST,
+      ),
+    ).toBe(true);
+    expect(isEgressAllowed('data:application/wasm;base64,AGFzbQ==', BOOT_EGRESS_ALLOWLIST)).toBe(
+      true,
+    );
+  });
+
+  it('leaves arbitrary hosts blocked', () => {
+    expect(isEgressAllowed('https://example.com/secret', BOOT_EGRESS_ALLOWLIST)).toBe(false);
+    expect(isEgressAllowed('https://evil.test/collect', BOOT_EGRESS_ALLOWLIST)).toBe(false);
+  });
+});
+
+describe('installEgressInterceptor allowlist', () => {
+  const allowlist: EgressAllowlist = [{ host: 'copy.sh' }, { urlPrefix: 'data:' }];
+
+  let log: InMemoryEgressLog;
+  let restore: (() => void) | undefined;
+
+  beforeEach(() => {
+    log = new InMemoryEgressLog();
+  });
+
+  afterEach(() => {
+    restore?.();
+    restore = undefined;
+    vi.unstubAllGlobals();
+    delete (navigator as unknown as { sendBeacon?: unknown }).sendBeacon;
+    delete (globalThis as unknown as { sendBeacon?: unknown }).sendBeacon;
+  });
+
+  it('lets an allowlisted host through in lockdown and logs blocked: false', async () => {
+    const fetchMock = vi.fn(async () => new Response('ok'));
+    vi.stubGlobal('fetch', fetchMock);
+    restore = installEgressInterceptor(log, true, allowlist);
+
+    const response = await fetch('https://copy.sh/v86/bios/seabios.bin');
+    expect(response.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(log.list()[0]).toEqual(
+      expect.objectContaining({
+        url: 'https://copy.sh/v86/bios/seabios.bin',
+        blocked: false,
+      }),
+    );
+  });
+
+  it('lets an allowlisted URL prefix through in lockdown', () => {
+    vi.stubGlobal('XMLHttpRequest', FakeXMLHttpRequest);
+    restore = installEgressInterceptor(log, true, allowlist);
+
+    const xhr = new XMLHttpRequest() as unknown as FakeXMLHttpRequest;
+    xhr.open('GET', 'data:application/wasm;base64,AGFzbQ==');
+    expect(xhr.openedUrl).toBe('data:application/wasm;base64,AGFzbQ==');
+    expect(log.list()[0]).toEqual(
+      expect.objectContaining({
+        url: 'data:application/wasm;base64,AGFzbQ==',
+        blocked: false,
+      }),
+    );
+  });
+
+  it('still blocks arbitrary hosts and logs blocked: true', async () => {
+    const fetchMock = vi.fn(async () => new Response('ok'));
+    vi.stubGlobal('fetch', fetchMock);
+    restore = installEgressInterceptor(log, true, allowlist);
+
+    await expect(fetch('https://evil.example.com/secret')).rejects.toThrow('lockdown');
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(log.list()[0]).toEqual(
+      expect.objectContaining({
+        url: 'https://evil.example.com/secret',
+        blocked: true,
+        reason: 'lockdown',
+      }),
+    );
+  });
+
+  it('keeps the two-argument form blocking everything in lockdown', async () => {
+    const fetchMock = vi.fn(async () => new Response('ok'));
+    vi.stubGlobal('fetch', fetchMock);
+    restore = installEgressInterceptor(log, true);
+
+    await expect(fetch('https://copy.sh/v86/bios/seabios.bin')).rejects.toThrow('lockdown');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('ignores the allowlist when lockdown is off', async () => {
+    const fetchMock = vi.fn(async () => new Response('ok'));
+    vi.stubGlobal('fetch', fetchMock);
+    restore = installEgressInterceptor(log, false, []);
+
+    const response = await fetch('https://evil.example.com/secret');
+    expect(response.status).toBe(200);
+    expect(log.list()[0]).toEqual(
+      expect.objectContaining({ url: 'https://evil.example.com/secret', blocked: false }),
+    );
   });
 });

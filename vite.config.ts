@@ -11,6 +11,9 @@ export default defineConfig({
   resolve: {
     alias: { '@': resolve(import.meta.dirname, 'src') },
   },
+  // v86/build/v86.wasm?inline (src/core/vm/wasm.ts) must be treated as an
+  // asset in dev too; `.wasm` is not in Vite's default asset types.
+  assetsInclude: ['**/*.wasm'],
   build: {
     target: 'es2022',
     outDir: 'dist',

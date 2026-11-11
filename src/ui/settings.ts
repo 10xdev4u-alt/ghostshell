@@ -1,6 +1,6 @@
 import type { AgentConfig, EgressEvent, PrivacyReport } from '@/types/index.js';
 import { listModels } from '@/core/llm/models.js';
-import { readQueryOverrides } from '@/config.js';
+import { isNetworkMode, readQueryOverrides } from '@/config.js';
 import {
   buildReport,
   exportPublicKeyJwk,
@@ -11,9 +11,33 @@ import {
 } from '@/core/security/attestation.js';
 
 /**
- * Settings panel. Binds the model picker, network mode, and agent knobs to the
- * AgentConfig. Emits a change event whenever a value changes.
+ * Settings panel. Binds the model picker and network mode to the AgentConfig,
+ * persists changes to the settings store, and emits a change event whenever a
+ * value changes.
  */
+
+/** IndexedDB key for the persisted AgentConfig (src/core/persistence/db.ts). */
+export const SETTINGS_KEY = 'agent-config';
+
+/** The slice of `Database` the settings panel persists through. */
+export interface SettingsStore {
+  setSetting(key: string, value: unknown): Promise<void>;
+}
+
+/** Explicit selects, for tests and for hosts that mount the panel elsewhere. */
+export interface SettingsElements {
+  modelSelect?: HTMLSelectElement | null | undefined;
+  networkSelect?: HTMLSelectElement | null | undefined;
+}
+
+export interface CreateSettingsOptions {
+  /** Base config: defaults merged with persisted values and query overrides. */
+  config: AgentConfig;
+  /** Persistence backend. Omit to keep changes in memory only. */
+  db?: SettingsStore | undefined;
+  /** Select elements. Defaults to `#gs-model-select` / `#gs-network-select`. */
+  elements?: SettingsElements | undefined;
+}
 
 export interface SettingsHandle {
   get(): AgentConfig;
@@ -21,23 +45,100 @@ export interface SettingsHandle {
   dispose(): void;
 }
 
-export function createSettings(config: AgentConfig): SettingsHandle {
+/**
+ * Merge persisted settings over defaults, then apply query overrides.
+ *
+ * Enum fields are validated so a corrupt or stale value in IndexedDB cannot
+ * leave the app in a state the UI cannot represent.
+ */
+export function resolveSettingsConfig(
+  base: AgentConfig,
+  persisted: Partial<AgentConfig> | undefined,
+): AgentConfig {
+  const merged: AgentConfig = { ...base, ...persisted };
+  if (!isNetworkMode(merged.networkMode)) merged.networkMode = base.networkMode;
+  if (!listModels().some((spec) => spec.id === merged.modelId)) {
+    merged.modelId = base.modelId;
+  }
+  return { ...merged, ...readQueryOverrides() };
+}
+
+function defaultElements(): SettingsElements {
+  if (typeof document === 'undefined') return {};
+  return {
+    modelSelect:
+      (document.getElementById('gs-model-select') as HTMLSelectElement | null) ?? undefined,
+    networkSelect:
+      (document.getElementById('gs-network-select') as HTMLSelectElement | null) ?? undefined,
+  };
+}
+
+export function createSettings(options: CreateSettingsOptions): SettingsHandle {
   const overrides = readQueryOverrides();
-  let current: AgentConfig = { ...config, ...overrides };
+  let current: AgentConfig = { ...options.config, ...overrides };
   const listeners = new Set<(config: AgentConfig) => void>();
+  const elements: SettingsElements = { ...defaultElements(), ...options.elements };
+  const modelSelect = elements.modelSelect ?? null;
+  const networkSelect = elements.networkSelect ?? null;
+  const disposers: Array<() => void> = [];
+
+  const emit = (): void => {
+    for (const fn of listeners) fn({ ...current });
+  };
+
+  const persist = (): void => {
+    if (!options.db) return;
+    void Promise.resolve(options.db.setSetting(SETTINGS_KEY, { ...current })).catch((error) => {
+      console.error('[ghostshell] could not persist settings', error);
+    });
+  };
+
+  const update = (next: AgentConfig): void => {
+    current = next;
+    persist();
+    emit();
+  };
+
+  if (modelSelect) {
+    populateModelSelect(modelSelect);
+    modelSelect.value = current.modelId;
+    const onChange = (): void => {
+      const modelId = modelSelect.value;
+      if (modelId && modelId !== current.modelId) update({ ...current, modelId });
+    };
+    modelSelect.addEventListener('change', onChange);
+    disposers.push(() => modelSelect.removeEventListener('change', onChange));
+  }
+
+  if (networkSelect) {
+    networkSelect.value = current.networkMode;
+    const onChange = (): void => {
+      const mode = networkSelect.value;
+      if (isNetworkMode(mode) && mode !== current.networkMode) {
+        update({ ...current, networkMode: mode });
+      }
+    };
+    networkSelect.addEventListener('change', onChange);
+    disposers.push(() => networkSelect.removeEventListener('change', onChange));
+  }
 
   return {
-    get: () => current,
+    get: () => ({ ...current }),
     onChange(fn) {
       listeners.add(fn);
     },
     dispose() {
       listeners.clear();
+      for (const dispose of disposers) dispose();
+      disposers.length = 0;
     },
   };
 }
 
 export function populateModelSelect(select: HTMLSelectElement): void {
+  // The release HTML ships placeholder options; replace them so the registry
+  // is the single source of truth.
+  select.replaceChildren();
   for (const spec of listModels()) {
     const option = document.createElement('option');
     option.value = spec.id;
