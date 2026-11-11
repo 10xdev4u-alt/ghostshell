@@ -52,9 +52,9 @@ const DEFAULT_MEMORY_BYTES = 512 * 1024 * 1024;
 const DEFAULT_VGA_MEMORY_BYTES = 8 * 1024 * 1024;
 const DEFAULT_READY_TIMEOUT_MS = 60_000;
 /**
- * Field separator for `stat -c`. A literal tab is unsafe: BusyBox ash's line
- * editor treats it as completion. `|` is inert inside the single-quoted
- * format string.
+ * Field separator for the list output. A literal tab is unsafe: BusyBox ash's
+ * line editor treats it as completion. `|` is inert inside the single-quoted
+ * printf format, and names are escaped so they can never contain a newline.
  */
 const LIST_SEP = '|';
 
@@ -201,8 +201,12 @@ export class V86VMHandle implements VMHandle {
     const data = new TextEncoder().encode(content);
     try {
       await emu.create_file(path, data);
-    } catch {
-      // v86 rejects writes whose parent directory does not exist yet.
+    } catch (err) {
+      // Only the missing-parent case is recoverable. v86 0.5.473 rejects with
+      // a plain `Error` whose message is exactly "File not found" (class `Fc`
+      // in build/libv86.mjs) when `SearchPath` cannot resolve the parent.
+      // Permission, read-only, and quota errors must surface as themselves.
+      if (!isMissingParentError(err)) throw err;
       const dir = parentDir(path);
       if (dir !== '/') {
         await this.exec(`mkdir -p ${shellQuote(dir)}`);
@@ -220,10 +224,18 @@ export class V86VMHandle implements VMHandle {
   async list(path: string): Promise<DirEntry[]> {
     this.requireEmu();
     return this.queue.add(async () => {
+      // Glob from inside the directory instead of `ls -A -1 | while read`:
+      // the pipe splits on newlines, so a filename containing one is parsed as
+      // two entries. Globbing keeps each name in `$f`, and the shell escapes
+      // backslashes and newlines so the line-oriented parser can decode them.
       const cmd =
         `if [ -d ${shellQuote(path)} ]; then ` +
-        `(cd ${shellQuote(path)} && ls -A -1 | while IFS= read -r f; do ` +
-        `stat -c '%F${LIST_SEP}%s${LIST_SEP}%Y${LIST_SEP}%n' "$f"; done); ` +
+        `(cd ${shellQuote(path)} || exit 1; ` +
+        `for f in * .[!.]* ..?*; do ` +
+        `[ -e "$f" ] || [ -L "$f" ] || continue; ` +
+        `if line=$(stat -c '%F${LIST_SEP}%s${LIST_SEP}%Y' "./$f"); then ` +
+        `name=\${f//\\\\/\\\\\\\\}; name=\${name//$'\\n'/\\\\n}; ` +
+        `printf '%s${LIST_SEP}%s\\n' "$line" "$name"; fi; done); ` +
         `else echo list: not a directory: ${shellQuote(path)}; false; fi`;
       const res = await this.runner.run(cmd);
       if (res.exitCode !== 0) {
@@ -235,7 +247,7 @@ export class V86VMHandle implements VMHandle {
         .map((line): DirEntry => {
           const [type, size, mtime, ...rest] = line.split(LIST_SEP);
           return {
-            name: rest.join(LIST_SEP),
+            name: unescapeName(rest.join(LIST_SEP)),
             kind: type === 'directory' ? 'dir' : type === 'symbolic link' ? 'symlink' : 'file',
             size: Number(size ?? 0),
             mtime: Math.floor(Number(mtime ?? 0) * 1000),
@@ -307,6 +319,42 @@ export class V86VMHandle implements VMHandle {
 function parentDir(path: string): string {
   const idx = path.lastIndexOf('/');
   return idx > 0 ? path.slice(0, idx) : '/';
+}
+
+/**
+ * True when v86 rejected a write because the parent directory is missing.
+ *
+ * v86 0.5.473 rejects with a plain `Error` whose message is exactly
+ * "File not found" (class `Fc` in build/libv86.mjs) when `SearchPath` cannot
+ * resolve the parent. Everything else (EACCES, read-only, quota) is a real
+ * failure and must propagate.
+ */
+function isMissingParentError(err: unknown): boolean {
+  return err instanceof Error && err.message === 'File not found';
+}
+
+/**
+ * Decode a filename escaped by the list command.
+ *
+ * The shell escapes backslashes and newlines as `\\` and `\n` so a name can
+ * never contain a literal newline (which would break the line-oriented
+ * parser). Decode left-to-right so `\\n` (an escaped backslash followed by
+ * `n`) does not become a newline.
+ */
+function unescapeName(name: string): string {
+  let out = '';
+  for (let i = 0; i < name.length; i++) {
+    if (name[i] === '\\' && i + 1 < name.length) {
+      const next = name[i + 1];
+      if (next === 'n') out += '\n';
+      else if (next === '\\') out += '\\';
+      else out += next;
+      i++;
+    } else {
+      out += name[i];
+    }
+  }
+  return out;
 }
 
 function shellQuote(value: string): string {

@@ -163,11 +163,16 @@ Size budget: git ~20 MB, python3 ~40 MB, nodejs ~50 MB, npm ~30 MB, gcc ~150 MB.
 1. Agent loop calls `VM.run(command, {timeout})`.
 2. `VM.run` writes a sentinel-wrapped command to the serial port:
    ```bash
-   printf '\n__GS_START__\n'; <command>; printf '\n__GS_END_%s__\n' "$?"
+   PS1='__GS_PROMPT_<id>__'
+   echo __GS_BEGIN_<id>__
+   <command>
+   echo __GS_DONE_<id>__ $?
    ```
+   The begin/done pair brackets the command output; the prompt sentinel
+   identifies guest prompts so they can be stripped from the body.
 3. `v86.serial0.send(...)` pushes bytes to the guest UART.
 4. Guest shell executes; output returns via `v86.serial0.on_receive`.
-5. `VM.run` accumulates bytes until it sees `__GS_END_<code>__` or the timeout fires.
+5. `VM.run` accumulates bytes until it sees `__GS_DONE_<id>__ <code>` or the timeout fires.
 6. On timeout: send Ctrl-C (`\x03`), wait 200 ms, return `Command timed out after Ns (exit code -1)`.
 7. Result: `{stdout, stderr, exitCode, durationMs}`.
 

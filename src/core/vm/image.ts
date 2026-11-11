@@ -186,8 +186,11 @@ export const DEFAULT_IMAGE: ManifestImage = {
   id: VM_CONSTRAINTS.bootImage,
   name: 'Alpine 3.21 i386 (pre-baked)',
   arch: 'ia32',
-  // Recorded by scripts/build-image.sh once the rootfs is vendored.
+  // TODO(#62): record the real rootfs size once scripts/build-image.sh
+  // vendors it; 0 is a placeholder until then.
   sizeBytes: 0,
+  // TODO(#62): point at the built image artifact rather than the upstream
+  // Docker Hub tag page once the build script publishes one.
   url: ALPINE_IMAGE_URLS.dockerBase,
   artifacts: [ALPINE_BOOT.rootfsFsJson, ALPINE_BOOT.rootfsBaseUrl],
   prebaked: [

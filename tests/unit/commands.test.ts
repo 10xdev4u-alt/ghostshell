@@ -3,6 +3,7 @@ import {
   buildSentinelCommand,
   cleanOutput,
   createCommandRunner,
+  doneSentinelPattern,
   extractSentinelOutput,
   stripAnsi,
   stripSentinels,
@@ -89,6 +90,30 @@ describe('extractSentinelOutput', () => {
       '__GS_BEGIN_abc__\n__GS_PROMPT_abc__hello\n__GS_PROMPT_abc____GS_DONE_abc__ 0\n';
     expect(extractSentinelOutput(raw, 'abc')).toEqual({ body: '\nhello\n', exitCode: 0 });
   });
+
+  it('drops prompt-prefixed echoed wrapper lines from the body', () => {
+    const wrapped = buildSentinelCommand('ls -la', 'abc');
+    const raw =
+      '__GS_BEGIN_abc__\n' +
+      '__GS_PROMPT_abc__ls -la\n' +
+      'a.txt\n' +
+      '__GS_PROMPT_abc__echo __GS_DONE_abc__ $?\n' +
+      '__GS_DONE_abc__ 0\n';
+    expect(extractSentinelOutput(raw, 'abc', doneSentinelPattern('abc'), wrapped)).toEqual({
+      body: '\na.txt\n',
+      exitCode: 0,
+    });
+  });
+
+  it('keeps output lines that merely equal the command text', () => {
+    const wrapped = buildSentinelCommand('one', 'abc');
+    const raw =
+      '__GS_BEGIN_abc__\n' + '__GS_PROMPT_abc__one\n' + 'one\n' + '__GS_DONE_abc__ 0\n';
+    expect(extractSentinelOutput(raw, 'abc', doneSentinelPattern('abc'), wrapped)).toEqual({
+      body: '\none\n',
+      exitCode: 0,
+    });
+  });
 });
 
 describe('stripSentinels', () => {
@@ -99,7 +124,7 @@ describe('stripSentinels', () => {
       '__GS_BEGIN_abc__\n' +
       '__GS_PROMPT_abc__sleep 100\n' +
       '__GS_PROMPT_abc__partial output\n';
-    expect(cleanOutput(stripSentinels(raw, 'abc', wrapped), wrapped)).toBe('partial output');
+    expect(cleanOutput(stripSentinels(raw, 'abc', wrapped))).toBe('partial output');
   });
 
   it('keeps output when no begin marker has arrived', () => {
@@ -119,17 +144,16 @@ describe('cleanOutput', () => {
   it('removes sentinel lines', () => {
     expect(cleanOutput('hello\n__GS_DONE_abc__ 0\n')).toBe('hello');
   });
-
-  it('removes the echoed command when provided', () => {
-    const echoed = 'echo __GS_BEGIN_abc__\nls\necho __GS_DONE_abc__ $?\n';
-    expect(cleanOutput(`${echoed}a.txt\n`, echoed)).toBe('a.txt');
-  });
 });
 
 describe('stripAnsi', () => {
   it('removes CSI and OSC sequences', () => {
     expect(stripAnsi('\u001b[1;32mgreen\u001b[0m')).toBe('green');
     expect(stripAnsi('\u001b]0;title\u0007text')).toBe('text');
+  });
+
+  it('removes CSI sequences with intermediate bytes such as colons', () => {
+    expect(stripAnsi('\u001b[1:32mgreen\u001b[0m')).toBe('green');
   });
 });
 
@@ -283,6 +307,28 @@ describe('createCommandRunner', () => {
     const result = await pending;
     expect(result.stdout.length).toBeLessThanOrEqual(20);
   });
+
+  it('handles 100k lines delivered a byte at a time', async () => {
+    const transport = new FakeTransport();
+    const runner = createCommandRunner(transport);
+    const pending = runner.run('seq 1 100000');
+    await tick();
+    const id = sentinelId(transport.sent[0]!);
+
+    transport.emit(`localhost:~# ${transport.sent[0]}`);
+    transport.emit(`__GS_BEGIN_${id}__\n`);
+    // v86 delivers one byte at a time; model that so the runner cannot rely on
+    // receiving the body in a single chunk.
+    const body = 'x\n'.repeat(100_000);
+    for (const ch of body) transport.emit(ch);
+    transport.emit(`__GS_DONE_${id}__ 0\n`);
+
+    const result = await pending;
+    expect(result.exitCode).toBe(0);
+    const lines = result.stdout.split('\n');
+    expect(lines).toHaveLength(100_000);
+    expect(lines.every((line) => line === 'x')).toBe(true);
+  }, 30_000);
 
   it('serializes concurrent runs', async () => {
     const transport = new FakeTransport();
