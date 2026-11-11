@@ -2,17 +2,13 @@ import { describe, expect, it } from 'vitest';
 import type { V86Options } from 'v86';
 import {
   ManifestError,
-  cloneNode,
-  cloneTree,
-  cowRemoveChild,
-  cowSetChild,
-  cowWrite,
   create9pHandler,
   createEmptyTree,
   createV86Filesystem,
   findNode,
   loadTree,
   persistTree,
+  walk,
   type Fs9pHandle,
   type P9Node,
 } from '@/core/vm/fs9p.js';
@@ -355,6 +351,26 @@ describe('fs9p handler', () => {
     await handle.flush();
   });
 
+  it('replies with EINVAL to a malformed Tversion instead of hanging', async () => {
+    const { deps } = makeDeps();
+    const handle = create9pHandler(deps, { autoPersist: false });
+
+    const reply = await request(handle, 100, 1, new Uint8Array(2));
+    expect(reply.type).toBe(7);
+    expect(reply.tag).toBe(1);
+    expect(new FrameReader(reply.payload).u32()).toBe(22); // EINVAL
+
+    // The handler still negotiates a valid version afterwards.
+    const ok = await request(
+      handle,
+      100,
+      2,
+      new FrameWriter().u32(8192).string('9P2000.L').build(),
+    );
+    expect(ok.type).toBe(101);
+    await handle.flush();
+  });
+
   it('attaches and walks to a file', async () => {
     const { deps } = makeDeps();
     const handle = create9pHandler(deps, { autoPersist: false });
@@ -494,6 +510,59 @@ describe('fs9p handler', () => {
     await handle.flush();
   });
 
+  it('reports v86 block counts in Tgetattr', async () => {
+    const { deps } = makeDeps();
+    const handle = create9pHandler(deps, { autoPersist: false });
+
+    await request(handle, 100, 1, new FrameWriter().u32(8192).string('9P2000.L').build());
+    await request(handle, 104, 2, attachPayload(1));
+    await request(
+      handle,
+      14,
+      3,
+      new FrameWriter().u32(1).string('f.txt').u32(0x2).u32(0o100644).u32(0).build(),
+    );
+
+    const blocksOf = async (tag: number): Promise<bigint> => {
+      const reply = await request(handle, 24, tag, new FrameWriter().u32(1).u64(0x3ff).build());
+      expect(reply.type).toBe(25);
+      const r = new FrameReader(reply.payload);
+      r.u64(); // valid
+      r.qid();
+      r.u32(); // mode
+      r.u32(); // uid
+      r.u32(); // gid
+      r.u64(); // nlink
+      r.u64(); // rdev
+      r.u64(); // size
+      r.u64(); // blksize
+      return r.u64(); // blocks
+    };
+
+    // v86: Math.floor(size / 512 + 1) — an empty file still occupies one block.
+    expect(await blocksOf(4)).toBe(1n);
+
+    const write = async (size: number, tag: number) => {
+      const data = new Uint8Array(size);
+      const reply = await request(
+        handle,
+        118,
+        tag,
+        new FrameWriter().u32(1).u64(0).u32(size).bytes(data).build(),
+      );
+      expect(reply.type).toBe(119);
+    };
+
+    await write(512, 5);
+    expect(await blocksOf(6)).toBe(2n);
+    await write(513, 7);
+    expect(await blocksOf(8)).toBe(2n);
+    await write(1024, 9);
+    expect(await blocksOf(10)).toBe(3n);
+
+    await handle.flush();
+  });
+
   it('reads Tsetattr fields in the 9P2000.L wire order', async () => {
     const { deps } = makeDeps();
     const handle = create9pHandler(deps, { autoPersist: false });
@@ -616,6 +685,144 @@ describe('fs9p handler', () => {
     );
     expect(again.type).toBe(7);
     expect(new FrameReader(again.payload).u32()).toBe(2); // ENOENT
+
+    await handle.flush();
+  });
+
+  it('rejects Trenameat that would create a directory cycle', async () => {
+    const { deps } = makeDeps();
+    const handle = create9pHandler(deps, { autoPersist: false });
+
+    await request(handle, 100, 1, new FrameWriter().u32(8192).string('9P2000.L').build());
+    await request(handle, 104, 2, attachPayload(1));
+    await request(handle, 104, 3, attachPayload(2));
+    await request(
+      handle,
+      72,
+      4,
+      new FrameWriter().u32(1).string('d').u32(0o40755).u32(0).build(),
+    );
+    await request(
+      handle,
+      110,
+      5,
+      new FrameWriter().u32(2).u32(4).u16(1).string('d').build(),
+    );
+
+    // mv d d/sub: the target directory is inside the source directory.
+    const cycle = await request(
+      handle,
+      74,
+      6,
+      new FrameWriter().u32(1).string('d').u32(4).string('sub').build(),
+    );
+    expect(cycle.type).toBe(7);
+    expect(new FrameReader(cycle.payload).u32()).toBe(22); // EINVAL
+    expect(findNode(handle.tree, '/d')).toBeDefined();
+    expect(findNode(handle.tree, '/d/sub')).toBeUndefined();
+
+    // A non-cyclic rename still works.
+    const renamed = await request(
+      handle,
+      74,
+      7,
+      new FrameWriter().u32(1).string('d').u32(2).string('e').build(),
+    );
+    expect(renamed.type).toBe(75);
+    expect(findNode(handle.tree, '/e')).toBeDefined();
+    expect(findNode(handle.tree, '/d')).toBeUndefined();
+
+    await handle.flush();
+  });
+
+  it('prunes the blob of a file removed with Tunlinkat on persist', async () => {
+    const { deps, root } = makeDeps();
+    const handle = create9pHandler(deps, { autoPersist: false });
+
+    await request(handle, 100, 1, new FrameWriter().u32(8192).string('9P2000.L').build());
+    await request(handle, 104, 2, attachPayload(1));
+    await request(handle, 104, 3, attachPayload(2));
+    await request(handle, 104, 4, attachPayload(3));
+    await request(
+      handle,
+      14,
+      5,
+      new FrameWriter().u32(1).string('gone.txt').u32(0x2).u32(0o100644).u32(0).build(),
+    );
+    await request(
+      handle,
+      14,
+      6,
+      new FrameWriter().u32(2).string('keep.txt').u32(0x2).u32(0o100644).u32(0).build(),
+    );
+    const goneData = text.encode('gone');
+    const keepData = text.encode('keep');
+    await request(
+      handle,
+      118,
+      7,
+      new FrameWriter().u32(1).u64(0).u32(goneData.byteLength).bytes(goneData).build(),
+    );
+    await request(
+      handle,
+      118,
+      8,
+      new FrameWriter().u32(2).u64(0).u32(keepData.byteLength).bytes(keepData).build(),
+    );
+    await handle.persist();
+
+    const goneQid = findNode(handle.tree, '/gone.txt')!.qidPath.toString();
+    const keepQid = findNode(handle.tree, '/keep.txt')!.qidPath.toString();
+    const dir = await root.getDirectoryHandle('test');
+    expect(dir.files.has(`${goneQid}.bin`)).toBe(true);
+    expect(dir.files.has(`${keepQid}.bin`)).toBe(true);
+
+    await request(
+      handle,
+      76,
+      9,
+      new FrameWriter().u32(3).string('gone.txt').u32(0).build(),
+    );
+    await handle.persist();
+
+    expect(dir.files.has(`${goneQid}.bin`)).toBe(false);
+    expect(dir.files.has(`${keepQid}.bin`)).toBe(true);
+    expect(dir.files.has('manifest.json')).toBe(true);
+
+    await handle.flush();
+  });
+
+  it('prunes the blob of a file removed with Tremove on persist', async () => {
+    const { deps, root } = makeDeps();
+    const handle = create9pHandler(deps, { autoPersist: false });
+
+    await request(handle, 100, 1, new FrameWriter().u32(8192).string('9P2000.L').build());
+    await request(handle, 104, 2, attachPayload(1));
+    await request(
+      handle,
+      14,
+      3,
+      new FrameWriter().u32(1).string('other.txt').u32(0x2).u32(0o100644).u32(0).build(),
+    );
+    const data = text.encode('other');
+    await request(
+      handle,
+      118,
+      4,
+      new FrameWriter().u32(1).u64(0).u32(data.byteLength).bytes(data).build(),
+    );
+    await handle.persist();
+
+    const qid = findNode(handle.tree, '/other.txt')!.qidPath.toString();
+    const dir = await root.getDirectoryHandle('test');
+    expect(dir.files.has(`${qid}.bin`)).toBe(true);
+
+    const removed = await request(handle, 122, 5, new FrameWriter().u32(1).build());
+    expect(removed.type).toBe(123);
+    await handle.persist();
+
+    expect(dir.files.has(`${qid}.bin`)).toBe(false);
+    expect(dir.files.has('manifest.json')).toBe(true);
 
     await handle.flush();
   });
@@ -920,67 +1127,28 @@ describe('fs9p handler', () => {
   });
 });
 
-describe('copy-on-write helpers', () => {
-  function makeTree(): P9Node {
+describe('walk', () => {
+  it('terminates on a hand-built cyclic tree', () => {
     const root = createEmptyTree();
-    const file = createEmptyTree('/a.txt') as P9Node;
-    file.kind = 'file';
-    file.mode = 0o100644;
-    file.data = text.encode('original');
-    file.size = 8;
-    root.children.set('a.txt', file);
-    return root;
-  }
+    const child = createEmptyTree('/a');
+    root.children.set('a', child);
+    child.children.set('back', root); // cycle: /a/back -> /
 
-  it('cowWrite leaves the original untouched', () => {
-    const root = makeTree();
-    const original = root.children.get('a.txt')!;
-    const updated = cowWrite(original, 0, text.encode('CHANGED'));
-    expect(new TextDecoder().decode(original.data)).toBe('original');
-    // pwrite semantics: a short write overwrites in place and keeps the tail.
-    expect(new TextDecoder().decode(updated.data)).toBe('CHANGEDl');
-    expect(updated.size).toBe(8);
-    expect(updated.qidVersion).toBe(original.qidVersion + 1);
+    const visited = [...walk(root)];
+    expect(visited).toHaveLength(2);
+    expect(visited[0]).toBe(root);
+    expect(visited[1]).toBe(child);
   });
 
-  it('cowWrite extends the file when writing past the end', () => {
-    const root = makeTree();
-    const original = root.children.get('a.txt')!;
-    const updated = cowWrite(original, 8, text.encode('!'));
-    expect(new TextDecoder().decode(updated.data)).toBe('original!');
-    expect(updated.size).toBe(9);
-  });
+  it('visits every node of an acyclic tree once', () => {
+    const root = createEmptyTree();
+    const a = createEmptyTree('/a');
+    const b = createEmptyTree('/b');
+    const leaf = createEmptyTree('/a/leaf');
+    a.children.set('leaf', leaf);
+    root.children.set('a', a);
+    root.children.set('b', b);
 
-  it('cowSetChild and cowRemoveChild leave the original untouched', () => {
-    const root = makeTree();
-    const child = createEmptyTree('/b.txt') as P9Node;
-    child.kind = 'file';
-    child.mode = 0o100644;
-
-    const withChild = cowSetChild(root, 'b.txt', child);
-    expect(root.children.has('b.txt')).toBe(false);
-    expect(withChild.children.has('b.txt')).toBe(true);
-
-    const without = cowRemoveChild(withChild, 'b.txt');
-    expect(withChild.children.has('b.txt')).toBe(true);
-    expect(without.children.has('b.txt')).toBe(false);
-  });
-
-  it('cloneTree deep-copies data and children', () => {
-    const root = makeTree();
-    const copy = cloneTree(root);
-    expect(copy).not.toBe(root);
-    expect(copy.children.get('a.txt')).not.toBe(root.children.get('a.txt'));
-    copy.children.get('a.txt')!.data.set(text.encode('mutated'), 0);
-    expect(new TextDecoder().decode(root.children.get('a.txt')!.data)).toBe('original');
-  });
-
-  it('cloneNode preserves inode identity', () => {
-    const root = makeTree();
-    const node = root.children.get('a.txt')!;
-    const copy = cloneNode(node, '/copy.txt');
-    expect(copy.path).toBe('/copy.txt');
-    expect(copy.qidPath).toBe(node.qidPath);
-    expect(copy.qidVersion).toBe(node.qidVersion);
+    expect([...walk(root)]).toEqual([root, a, leaf, b]);
   });
 });

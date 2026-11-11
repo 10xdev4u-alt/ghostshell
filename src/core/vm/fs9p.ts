@@ -473,10 +473,21 @@ export function toP9Mode(node: P9Node): number {
   return mode >>> 0;
 }
 
-/** Depth-first iteration over a node and all descendants. */
+/**
+ * Depth-first iteration over a node and all descendants.
+ *
+ * A hand-built or corrupt tree can contain a cycle; the visited set keeps the
+ * traversal finite instead of recursing forever.
+ */
 export function* walk(node: P9Node): Generator<P9Node> {
-  yield node;
-  for (const child of node.children.values()) yield* walk(child);
+  const seen = new Set<P9Node>();
+  function* visit(current: P9Node): Generator<P9Node> {
+    if (seen.has(current)) return;
+    seen.add(current);
+    yield current;
+    for (const child of current.children.values()) yield* visit(child);
+  }
+  yield* visit(node);
 }
 
 export function findNode(root: P9Node, path: string): P9Node | undefined {
@@ -497,79 +508,26 @@ function findParent(root: P9Node, path: string): P9Node | undefined {
   return findNode(root, path.slice(0, index));
 }
 
+/**
+ * True when `ancestor` is `node` itself or one of its ancestors.
+ *
+ * `T_RENAMEAT` uses this to reject `mv dir dir/sub`, which would otherwise
+ * make the tree cyclic and send `walk()` into infinite recursion.
+ */
+function isSameOrAncestor(root: P9Node, ancestor: P9Node, node: P9Node): boolean {
+  let current: P9Node | undefined = node;
+  while (current && current !== root) {
+    if (current === ancestor) return true;
+    current = findParent(root, current.path);
+  }
+  return current === ancestor;
+}
+
 function retargetPaths(node: P9Node, newPath: string): void {
   node.path = newPath;
   for (const [name, child] of node.children) {
     retargetPaths(child, joinPath(newPath, name));
   }
-}
-
-/** Deep copy of a node, preserving inode identity (qidPath/qidVersion). */
-export function cloneNode(node: P9Node, newPath?: string): P9Node {
-  const copy: P9Node = {
-    path: newPath ?? node.path,
-    kind: node.kind,
-    data: node.data.slice(),
-    children: new Map(),
-    mode: node.mode,
-    uid: node.uid,
-    gid: node.gid,
-    nlink: node.nlink,
-    rdev: node.rdev,
-    size: node.size,
-    atime: node.atime,
-    mtime: node.mtime,
-    ctime: node.ctime,
-    qidPath: node.qidPath,
-    qidVersion: node.qidVersion,
-  };
-  if (node.symlink !== undefined) copy.symlink = node.symlink;
-  if (node.status !== undefined) copy.status = node.status;
-  for (const [name, child] of node.children) {
-    copy.children.set(name, cloneNode(child, joinPath(copy.path, name)));
-  }
-  return copy;
-}
-
-export function cloneTree(root: P9Node): P9Node {
-  return cloneNode(root, root.path);
-}
-
-/** Copy-on-write write: returns a new node, leaving the original untouched. */
-export function cowWrite(node: P9Node, offset: number, data: Uint8Array): P9Node {
-  const copy = cloneNode(node);
-  const end = offset + data.byteLength;
-  if (end > copy.data.byteLength) {
-    const next = new Uint8Array(end);
-    next.set(copy.data);
-    copy.data = next;
-  }
-  copy.data.set(data, offset);
-  copy.size = copy.data.byteLength;
-  copy.mtime = nowSeconds();
-  copy.ctime = copy.mtime;
-  copy.qidVersion++;
-  return copy;
-}
-
-/** Copy-on-write child insertion: returns a new parent. */
-export function cowSetChild(parent: P9Node, name: string, child: P9Node): P9Node {
-  const copy = cloneNode(parent);
-  copy.children.set(name, cloneNode(child, joinPath(copy.path, name)));
-  copy.mtime = nowSeconds();
-  copy.ctime = copy.mtime;
-  copy.qidVersion++;
-  return copy;
-}
-
-/** Copy-on-write child removal: returns a new parent. */
-export function cowRemoveChild(parent: P9Node, name: string): P9Node {
-  const copy = cloneNode(parent);
-  copy.children.delete(name);
-  copy.mtime = nowSeconds();
-  copy.ctime = copy.mtime;
-  copy.qidVersion++;
-  return copy;
 }
 
 // ---------------------------------------------------------------------------
@@ -765,8 +723,34 @@ function parseNextQidPath(raw: unknown): bigint {
 }
 
 /**
+ * Delete `<qidPath>.bin` blobs the manifest no longer references.
+ *
+ * Runs after the manifest is written, so a crash can only leave unreferenced
+ * garbage behind, never drop a blob the stored manifest still points at.
+ */
+async function pruneUnreferencedBlobs(
+  dir: FileSystemDirectoryHandle,
+  live: ReadonlySet<string>,
+): Promise<void> {
+  // DOM.AsyncIterable is not in the configured lib; use the runtime shape.
+  const keys = (dir as unknown as { keys(): AsyncIterableIterator<string> }).keys();
+  const stale: string[] = [];
+  for await (const name of keys) {
+    if (name.endsWith('.bin') && !live.has(name)) stale.push(name);
+  }
+  for (const name of stale) {
+    try {
+      await dir.removeEntry(name);
+    } catch (err) {
+      if (!isNotFoundError(err)) throw err;
+    }
+  }
+}
+
+/**
  * Persist the tree to OPFS: `manifest.json` plus one blob per file.
- * Blobs whose bytes are unchanged are left alone.
+ * Blobs whose bytes are unchanged are left alone; blobs no longer referenced
+ * by the tree are removed.
  */
 export async function persistTree(
   root: P9Node,
@@ -779,8 +763,10 @@ export async function persistTree(
   const dir = await ensureDir(storage, prefix, true);
 
   let maxQid = 0n;
+  const liveBlobs = new Set<string>();
   for (const node of walk(root)) {
     if (node.qidPath > maxQid) maxQid = node.qidPath;
+    if (node.kind === 'file') liveBlobs.add(blobName(node));
   }
   const manifest: Manifest = {
     version: 1,
@@ -804,6 +790,7 @@ export async function persistTree(
   }
 
   await writeOpfsFile(dir, 'manifest.json', textEncoder.encode(JSON.stringify(manifest)));
+  await pruneUnreferencedBlobs(dir, liveBlobs);
   deps.onLog?.(`fs9p: persisted ${written}/${total} file(s)`);
 }
 
@@ -1277,7 +1264,7 @@ export function create9pHandler(deps: Fs9pDeps, options: Fs9pOptions = {}): Fs9p
         w.u64(BigInt(node.rdev));
         w.u64(BigInt(node.size));
         w.u64(BigInt(BLOCK_SIZE));
-        w.u64(BigInt(Math.floor(node.size / 512) + (node.size > 0 ? 1 : 0)));
+        w.u64(BigInt(Math.floor(node.size / 512 + 1)));
         w.u64(BigInt(node.atime));
         w.u64(0n); // atime nsec
         w.u64(BigInt(node.mtime));
@@ -1462,6 +1449,7 @@ export function create9pHandler(deps: Fs9pDeps, options: Fs9pOptions = {}): Fs9p
         }
         const node = olddir.node.children.get(oldname);
         if (!node) throw new P9Error(ENOENT);
+        if (isSameOrAncestor(root, node, newdir.node)) throw new P9Error(EINVAL);
         const target = newdir.node.children.get(newname);
         if (target) {
           if (target.kind === 'dir' && target.children.size > 0) {
@@ -1547,18 +1535,23 @@ export function create9pHandler(deps: Fs9pDeps, options: Fs9pOptions = {}): Fs9p
     }
 
     if (request.type === T_VERSION) {
-      const r = new Reader(request.payload);
-      const requested = r.u32();
-      r.string();
-      msize = Math.min(requested, MAX_MSIZE);
-      const w = new Writer();
-      w.u32(msize);
-      w.string(P9_VERSION);
-      reply(buildReply(request.type + 1, request.tag, w.payload()));
-      if (!loaded && !loadPromise) {
-        void ensureLoaded().catch((err) =>
-          deps.onLog?.(`fs9p: load failed (${String(err)})`),
-        );
+      try {
+        const r = new Reader(request.payload);
+        const requested = r.u32();
+        r.string();
+        msize = Math.min(requested, MAX_MSIZE);
+        const w = new Writer();
+        w.u32(msize);
+        w.string(P9_VERSION);
+        reply(buildReply(request.type + 1, request.tag, w.payload()));
+        if (!loaded && !loadPromise) {
+          void ensureLoaded().catch((err) =>
+            deps.onLog?.(`fs9p: load failed (${String(err)})`),
+          );
+        }
+      } catch (err) {
+        deps.onLog?.(`fs9p: ${String(err)}`);
+        reply(buildErrorFrame(request.tag, toErrno(err)));
       }
       return;
     }
