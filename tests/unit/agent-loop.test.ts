@@ -385,7 +385,7 @@ describe('AgentLoop', () => {
       { text: 'Done.', tokens: 1, finishReason: 'stop' },
     ];
     const vm = new FakeVM();
-    const loop = new AgentLoop(makeTools(), makeConfig({ contextWindow: 40 }));
+    const loop = new AgentLoop(makeTools(), makeConfig({ contextWindow: 150 }));
     const messages = [
       makeMessage('user', 'x'.repeat(200)),
       makeMessage('assistant', 'y'.repeat(200)),

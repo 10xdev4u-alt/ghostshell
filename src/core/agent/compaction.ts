@@ -6,7 +6,20 @@ import { uuid } from '@/lib/utils.js';
  *
  * Local models have a small context (4k in v0.1). When the conversation
  * exceeds the budget, older messages are summarized into a single
- * `system` message. Tool results are the first thing to go.
+ * `system` message.
+ *
+ * Sacrifice order (what is dropped or truncated, in order):
+ *  1. Tool-result messages (`tool` messages and assistant messages carrying
+ *     `toolResults`), oldest first.
+ *  2. Other non-system messages, oldest first.
+ *  3. The generated summary: truncated to the remaining budget, then dropped
+ *     entirely when no room remains.
+ *  4. The current request (most recent message): truncated to fit, then
+ *     dropped when no part of it can fit.
+ *  5. System messages: never dropped; truncated only in the pathological case
+ *     where they alone exceed the budget.
+ *
+ * The returned list never exceeds `maxTokens` when the budget is positive.
  */
 
 export interface CompactionResult {
@@ -66,7 +79,8 @@ export async function compactMessages(
   const kept = messages.filter((message) => !isSystem(message));
   const dropped: Message[] = [];
 
-  // The most recent message is the current request; never drop it.
+  // The most recent message is the current request; it is not a drop
+  // candidate until the summary has been truncated or dropped.
   const candidates = kept.slice(0, Math.max(0, kept.length - 1));
   const ordered = [
     ...candidates.filter(isToolResult),
@@ -76,7 +90,8 @@ export async function compactMessages(
   const fitsWith = (summaryTokens: number): boolean =>
     tokenBudget(systems) + tokenBudget(kept) + summaryTokens <= maxTokens;
 
-  // Drop until the retained conversation leaves room for the worst-case summary.
+  // Drop until the retained conversation leaves room for the worst-case
+  // summary. The current request is never a candidate here.
   for (const candidate of ordered) {
     if (fitsWith(SUMMARY_HEADROOM_TOKENS)) break;
     const index = kept.indexOf(candidate);
@@ -85,34 +100,75 @@ export async function compactMessages(
     dropped.push(candidate);
   }
 
-  if (dropped.length === 0) {
-    // Nothing droppable (only system messages plus the current request).
-    return { messages, compacted: false, removed: 0 };
+  // Summarize what was dropped, then fit the real summary by truncating it to
+  // the remaining budget or dropping it entirely.
+  let summaryMessage: Message | undefined;
+  if (dropped.length > 0) {
+    const summary = (await summarize(dropped)).trim() || 'Earlier conversation omitted.';
+    summaryMessage = makeSummaryMessage(summary);
+    const remaining = maxTokens - tokenBudget(systems) - tokenBudget(kept);
+    if (remaining <= 0) {
+      summaryMessage = undefined;
+    } else {
+      summaryMessage = truncateMessageToTokens(summaryMessage, remaining);
+    }
   }
 
-  const summary = (await summarize(dropped)).trim() || 'Earlier conversation omitted.';
-  const summaryMessage: Message = {
+  // If the retained messages alone still exceed the budget, shrink the
+  // current request. Dropping it is the last resort; when it is dropped,
+  // regenerate the summary so the request is not lost.
+  if (tokenBudget(systems) + tokenBudget(kept) > maxTokens && kept.length > 0) {
+    const current = kept[kept.length - 1]!;
+    const remaining = maxTokens - tokenBudget(systems) - tokenBudget(kept.slice(0, -1));
+    if (remaining > 0) {
+      kept[kept.length - 1] = truncateMessageToTokens(current, remaining);
+    } else {
+      kept.pop();
+      dropped.push(current);
+      const room = maxTokens - tokenBudget(systems) - tokenBudget(kept);
+      if (room > 0) {
+        const summary = (await summarize(dropped)).trim() || 'Earlier conversation omitted.';
+        summaryMessage = truncateMessageToTokens(makeSummaryMessage(summary), room);
+      }
+    }
+  }
+
+  // Pathological: the original system prompt alone exceeds the budget.
+  // Truncate system messages (never drop the prompt entirely unless even an
+  // empty message cannot fit).
+  while (tokenBudget(systems) > maxTokens && systems.length > 0) {
+    const last = systems[systems.length - 1]!;
+    const remaining = maxTokens - tokenBudget(systems.slice(0, -1));
+    if (remaining > 0) {
+      systems[systems.length - 1] = truncateMessageToTokens(last, remaining);
+      break;
+    }
+    systems.pop();
+  }
+
+  return {
+    messages: [...systems, ...(summaryMessage ? [summaryMessage] : []), ...kept],
+    compacted: true,
+    removed: dropped.length,
+  };
+}
+
+function makeSummaryMessage(summary: string): Message {
+  return {
     id: uuid(),
     role: 'system',
     content: `${SUMMARY_PREFIX}${summary}`,
     timestamp: Date.now(),
   };
+}
 
-  // The summary is capped, but a model may overrun its token budget. Drop
-  // further old messages until the real summary fits, so the result never
-  // exceeds maxTokens when there is anything left to drop. Those extra drops
-  // are not covered by the summary; they are already past the compaction point.
-  for (const candidate of ordered) {
-    if (fitsWith(messageTokens(summaryMessage))) break;
-    const index = kept.indexOf(candidate);
-    if (index === -1) continue;
-    kept.splice(index, 1);
-    dropped.push(candidate);
-  }
-
-  return {
-    messages: [...systems, summaryMessage, ...kept],
-    compacted: true,
-    removed: dropped.length,
-  };
+/**
+ * Return a copy of `message` whose content fits in `maxTokens`, or the
+ * original message when it already fits. `estimateTokens` uses ~4 chars per
+ * token, so the character cap is `maxTokens * 4`.
+ */
+function truncateMessageToTokens(message: Message, maxTokens: number): Message {
+  if (estimateTokens(message.content) <= maxTokens) return message;
+  const maxChars = Math.max(0, maxTokens * 4);
+  return { ...message, content: message.content.slice(0, maxChars) };
 }
