@@ -33,6 +33,13 @@
         Face resolve URLs 302 to HF's Xet CDN
         (https://us.aws.cdn.hf.co/...), so the wildcard *.hf.co covers the
         regional CDN hosts that vary by request.
+      - connect-src also allows data: and blob:. Both are non-network,
+        same-agent origins — the bytes are already local, so they cannot
+        exfiltrate. The single-file build inlines v86's WASM as a data:
+        URL and v86 loads it with fetch/XHR; blob: covers blob-loaded
+        assets. Allowing them does not weaken the lockdown against
+        arbitrary remote egress: the runtime egress interceptor remains
+        the actual enforcement layer.
       - img-src needs blob: for artifact images rendered from object URLs.
       - worker-src needs blob: for the ONNX/transformers worker pools.
 
@@ -43,7 +50,7 @@
     -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' https://huggingface.co https://*.hf.co https://cdn.jsdelivr.net https://copy.sh; frame-src 'none'; worker-src 'self' blob:; object-src 'none'; form-action 'none'; base-uri 'none'"
+      content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' https://huggingface.co https://*.hf.co https://cdn.jsdelivr.net https://copy.sh data: blob:; frame-src 'none'; worker-src 'self' blob:; object-src 'none'; form-action 'none'; base-uri 'none'"
     />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
