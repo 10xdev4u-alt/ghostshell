@@ -1,6 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { ATTESTATION_CONFIG } from '@/config.js';
-import { createPrivacyReportSection } from '@/ui/settings.js';
+import { ATTESTATION_CONFIG, DEPENDENCY_LICENSES } from '@/config.js';
+import { buildReport } from '@/core/security/attestation.js';
+import {
+  createPrivacyReportSection,
+  renderPrivacyReport,
+  serializePrivacyReport,
+} from '@/ui/settings.js';
 import type { EgressEvent } from '@/types/index.js';
 
 /**
@@ -86,6 +91,40 @@ function asFake(element: unknown): FakeElement | undefined {
   return element as FakeElement | undefined;
 }
 
+function collectByTag(root: FakeElement, tagName: string): FakeElement[] {
+  const out: FakeElement[] = [];
+  const visit = (element: FakeElement): void => {
+    for (const child of element.children) {
+      if (child.tagName === tagName.toUpperCase()) out.push(child);
+      visit(child);
+    }
+  };
+  visit(root);
+  return out;
+}
+
+interface DependencyRow {
+  name: string;
+  version: string;
+  license: string;
+}
+
+/** Read the rendered dependency table, skipping its header row. */
+function readDependencyRows(root: unknown): DependencyRow[] {
+  const table = (root as FakeElement).querySelector('.privacy-report__dependencies');
+  if (!table) return [];
+  return collectByTag(table, 'tr')
+    .slice(1)
+    .map((row) => {
+      const cells = collectByTag(row, 'td');
+      return {
+        name: cells[0]?.textContent ?? '',
+        version: cells[1]?.textContent ?? '',
+        license: cells[2]?.textContent ?? '',
+      };
+    });
+}
+
 const egress: EgressEvent[] = [
   {
     id: 'event-1',
@@ -132,6 +171,38 @@ describe('createPrivacyReportSection', () => {
     expect(output.textContent).toContain('Dependencies');
     expect(output.textContent).toContain('Signature (ECDSA P-256)');
     expect(asFake(output.querySelector('h3'))?.textContent).toBe('Verification key (JWK)');
+  });
+
+  it('renders one row per runtime dependency with its license (#101)', async () => {
+    const section = createPrivacyReportSection({ config: ATTESTATION_CONFIG, egress: [] });
+
+    asFake(section.querySelector('.privacy-report-section__generate'))!.click();
+    await vi.waitFor(() => {
+      expect(asFake(section.querySelector('.privacy-report-section__download'))?.disabled).toBe(
+        false,
+      );
+    });
+
+    const output = asFake(section.querySelector('.privacy-report-section__output'))!;
+    const rows = readDependencyRows(output);
+    expect(rows).toHaveLength(ATTESTATION_CONFIG.dependencies.length);
+    expect(rows.map((row) => row.name)).toEqual(
+      ATTESTATION_CONFIG.dependencies.map((dep) => dep.name),
+    );
+
+    for (const row of rows) {
+      expect(row.license).toBe(DEPENDENCY_LICENSES[row.name]);
+      expect(row.version).toBeTruthy();
+    }
+  });
+
+  it('downloads the same dependency rows it renders (#101)', async () => {
+    const report = await buildReport(ATTESTATION_CONFIG, []);
+    const section = renderPrivacyReport(report);
+
+    expect(readDependencyRows(section)).toEqual(
+      JSON.parse(serializePrivacyReport(report)).dependencies,
+    );
   });
 
   it('accepts a getter so events logged after mount are included', async () => {
