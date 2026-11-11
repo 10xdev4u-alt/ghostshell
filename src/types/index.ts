@@ -38,11 +38,42 @@ export interface ModelCard {
 // LLM engine
 // ---------------------------------------------------------------------------
 
+/**
+ * The stages a model run moves through.
+ *
+ * `downloading`, `loading`, and `compiling` are load phases; `generating` is
+ * the token stream. Transformers.js only reports the first two (plus
+ * per-file download bytes); `compiling` is reserved for engines that expose a
+ * session-compile step.
+ */
+export type ModelProgressPhase = 'downloading' | 'loading' | 'compiling' | 'generating';
+
+/**
+ * Progress for a model load or generation run.
+ *
+ * `loaded`/`total` are bytes for the download/loading phases and generated
+ * tokens for the generation phase. `total` is 0 when the size is unknown.
+ * `percent` is 0–100, or `null` when `total` is unknown (indeterminate).
+ */
+export interface ModelProgress {
+  phase: ModelProgressPhase;
+  loaded: number;
+  total: number;
+  percent: number | null;
+  message?: string;
+}
+
+/**
+ * Load-phase progress. Kept as the legacy name; `ModelProgress` is the
+ * unified event shape used by both `load` and `generate`.
+ */
 export interface LoadProgress {
-  phase: 'downloading' | 'extracting' | 'compiling' | 'loading';
+  phase: ModelProgressPhase | 'extracting';
   loaded: number;
   total: number;
   message?: string;
+  /** 0–100, or `null` when `total` is unknown. */
+  percent?: number | null;
 }
 
 export interface GenerateRequest {
@@ -63,13 +94,22 @@ export interface GenerateResult {
 export interface LLMEngine {
   readonly id: string;
   readonly kind: BackendKind;
-  load(spec: ModelSpec, onProgress: (p: LoadProgress) => void): Promise<void>;
+  /**
+   * Load a model, reporting progress. When `signal` aborts, the returned
+   * promise rejects with an `AbortError` and the download is stopped.
+   */
+  load(
+    spec: ModelSpec,
+    onProgress: (p: ModelProgress) => void,
+    signal?: AbortSignal,
+  ): Promise<void>;
   unload(): Promise<void>;
   isLoaded(): boolean;
   generate(
     req: GenerateRequest,
     onToken: (token: string) => void,
     signal: AbortSignal,
+    onProgress?: (p: ModelProgress) => void,
   ): Promise<GenerateResult>;
 }
 
@@ -324,7 +364,7 @@ export interface AppEventMap {
   'vm:serial': string;
   'vm:ready': void;
   'vm:stopped': void;
-  'llm:progress': LoadProgress;
+  'llm:progress': ModelProgress;
   'llm:token': string;
   'llm:loaded': void;
   'agent:tool-call': ToolCall;

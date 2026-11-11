@@ -1,4 +1,10 @@
-import type { GenerateRequest, GenerateResult, LLMEngine, LoadProgress, ModelSpec } from '@/types/index.js';
+import type {
+  GenerateRequest,
+  GenerateResult,
+  LLMEngine,
+  ModelProgress,
+  ModelSpec,
+} from '@/types/index.js';
 
 /**
  * WebLLM engine (WebGPU fast path).
@@ -17,11 +23,16 @@ export class WebLLMEngine implements LLMEngine {
     return this.loaded;
   }
 
-  async load(spec: ModelSpec, onProgress: (p: LoadProgress) => void): Promise<void> {
+  async load(
+    spec: ModelSpec,
+    onProgress: (p: ModelProgress) => void,
+    signal?: AbortSignal,
+  ): Promise<void> {
     // TODO: new webllm.MLCEngine(), reload(spec.repo), progress callback,
     //       cache: 'opfs', function calling enabled.
     void spec;
     void onProgress;
+    void signal;
     throw new Error('WebLLMEngine.load not implemented (issue #15)');
   }
 
@@ -33,11 +44,13 @@ export class WebLLMEngine implements LLMEngine {
     req: GenerateRequest,
     onToken: (token: string) => void,
     signal: AbortSignal,
+    onProgress?: (p: ModelProgress) => void,
   ): Promise<GenerateResult> {
     // TODO: chat.completions.create({ messages, stream: true, ... })
     void req;
     void onToken;
     void signal;
+    void onProgress;
     throw new Error('WebLLMEngine.generate not implemented (issue #15)');
   }
 }

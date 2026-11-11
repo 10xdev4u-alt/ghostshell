@@ -64,10 +64,12 @@ vi.mock('@huggingface/transformers', () => ({
   TextStreamer: TextStreamerMock,
 }));
 
-import type { LoadProgress } from '@/types/index.js';
+import type { LoadProgress, ModelProgress } from '@/types/index.js';
 import { Template } from '@huggingface/jinja';
 import { parseToolCalls } from '@/core/agent/parser.js';
 import { TransformersEngine, clearTransformersCache } from '@/core/llm/transformers.js';
+import { createModelProgress } from '@/ui/progress.js';
+import { FakeElement, findByClass, installFakeDocument } from './helpers/dom.js';
 import { createEngine, detectBackend, supportsBackend } from '@/core/llm/engine.js';
 import {
   getModel,
@@ -566,6 +568,190 @@ describe('TransformersEngine', () => {
     expect(parsed.strategy).toBe('hermes');
     expect(parsed.toolCalls[0]?.name).toBe('list_dir');
     expect(parsed.toolCalls[0]?.arguments).toEqual({ path: '/' });
+  });
+
+  it('passes library progress callback values through to onProgress', async () => {
+    pipelineMock.mockResolvedValue(makeGenerator());
+    const engine = new TransformersEngine({ device: 'wasm', cache: 'browser' });
+    const progress: ModelProgress[] = [];
+    await engine.load(getModel('qwen2.5-1.5b'), (p) => progress.push(p));
+
+    const options = pipelineMock.mock.calls[0]![2] as {
+      progress_callback: (info: unknown) => void;
+    };
+    progress.length = 0;
+
+    options.progress_callback({ status: 'initiate', name: 'model', file: 'model.onnx' });
+    expect(progress.at(-1)).toMatchObject({
+      phase: 'downloading',
+      loaded: 0,
+      total: 0,
+      percent: null,
+    });
+
+    options.progress_callback({
+      status: 'progress',
+      name: 'model',
+      file: 'model.onnx',
+      progress: 42.5,
+      loaded: 420,
+      total: 1000,
+    });
+    expect(progress.at(-1)).toMatchObject({
+      phase: 'downloading',
+      loaded: 420,
+      total: 1000,
+      percent: 42.5,
+    });
+
+    // `done` carries no bytes, so the last `progress` sample is reported.
+    options.progress_callback({ status: 'done', name: 'model', file: 'model.onnx' });
+    expect(progress.at(-1)).toMatchObject({
+      phase: 'downloading',
+      loaded: 420,
+      total: 1000,
+      percent: 100,
+    });
+
+    options.progress_callback({ status: 'ready', task: 'text-generation', model: 'model' });
+    expect(progress.at(-1)).toMatchObject({ phase: 'loading', percent: 100 });
+  });
+
+  it('reports token progress while generating', async () => {
+    pipelineMock.mockResolvedValue(
+      makeGenerator((options) => {
+        options.streamer?.put([[1n]]);
+        options.streamer?.put([[2n]]);
+        options.streamer?.end();
+      }),
+    );
+    const engine = new TransformersEngine({ device: 'wasm', cache: 'browser' });
+    await engine.load(getModel('qwen2.5-1.5b'), () => {});
+
+    const progress: ModelProgress[] = [];
+    await engine.generate(
+      { messages: [], maxTokens: 4 },
+      () => {},
+      new AbortController().signal,
+      (p) => progress.push(p),
+    );
+
+    expect(progress[0]).toMatchObject({
+      phase: 'generating',
+      loaded: 0,
+      total: 4,
+      percent: 0,
+    });
+    expect(progress.at(-1)).toMatchObject({
+      phase: 'generating',
+      loaded: 2,
+      total: 4,
+      percent: 50,
+    });
+  });
+
+  it('rejects an aborted load with an AbortError and never resolves', async () => {
+    pipelineMock.mockImplementation(() => new Promise(() => {}));
+    const engine = new TransformersEngine({ device: 'wasm', cache: 'browser' });
+    const controller = new AbortController();
+    const load = engine.load(getModel('qwen2.5-1.5b'), () => {}, controller.signal);
+
+    const assertion = expect(load).rejects.toMatchObject({ name: 'AbortError' });
+    controller.abort();
+    await assertion;
+    expect(engine.isLoaded()).toBe(false);
+  });
+
+  it('rejects an already-aborted load before calling the pipeline', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const engine = new TransformersEngine({ device: 'wasm', cache: 'browser' });
+
+    await expect(
+      engine.load(getModel('qwen2.5-1.5b'), () => {}, controller.signal),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+    expect(pipelineMock).not.toHaveBeenCalled();
+  });
+
+  it('aborts the underlying fetch when a load is canceled', async () => {
+    const fetchMock = vi.fn(
+      (_input: RequestInfo | URL, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () =>
+            reject(new DOMException('The operation was aborted.', 'AbortError')),
+          );
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    pipelineMock.mockImplementation(async () => {
+      await fetch('https://huggingface.co/model.onnx');
+      return makeGenerator();
+    });
+
+    const engine = new TransformersEngine({ device: 'wasm', cache: 'browser' });
+    const controller = new AbortController();
+    const load = engine.load(getModel('qwen2.5-1.5b'), () => {}, controller.signal);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [, init] = fetchMock.mock.calls[0]!;
+    expect(init?.signal).toBe(controller.signal);
+
+    controller.abort();
+    await expect(load).rejects.toMatchObject({ name: 'AbortError' });
+    // The scoped wrapper must not leave a patched global behind.
+    expect(globalThis.fetch).toBe(fetchMock);
+  });
+
+  it('wires the progress cancel button to the load abort signal', async () => {
+    installFakeDocument();
+    const container = new FakeElement('div');
+    const progress = createModelProgress(container as unknown as HTMLElement);
+    const controller = new AbortController();
+    const onCancel = vi.fn(() => controller.abort());
+    progress.onCancel(onCancel);
+
+    pipelineMock.mockImplementation(() => new Promise(() => {}));
+    const engine = new TransformersEngine({ device: 'wasm', cache: 'browser' });
+    const load = engine.load(getModel('qwen2.5-1.5b'), () => {}, controller.signal);
+
+    const cancel = findByClass(container, 'gs-model-progress__cancel');
+    expect(cancel).toBeDefined();
+    cancel!.click();
+
+    expect(onCancel).toHaveBeenCalledTimes(1);
+    await expect(load).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
+  it('wires the progress cancel button to the generation abort signal', async () => {
+    installFakeDocument();
+    const container = new FakeElement('div');
+    const progress = createModelProgress(container as unknown as HTMLElement);
+    const controller = new AbortController();
+    progress.onCancel(() => controller.abort());
+
+    pipelineMock.mockResolvedValue(
+      makeGenerator(
+        (options) =>
+          new Promise<void>((_resolve, reject) => {
+            controller.signal.addEventListener('abort', () => {
+              try {
+                options.streamer?.put([[1n]]);
+              } catch (err) {
+                reject(err);
+              }
+            });
+          }),
+      ),
+    );
+    const engine = new TransformersEngine({ device: 'wasm', cache: 'browser' });
+    await engine.load(getModel('qwen2.5-1.5b'), () => {});
+
+    const generate = engine.generate({ messages: [] }, () => {}, controller.signal);
+    const cancel = findByClass(container, 'gs-model-progress__cancel');
+    cancel!.click();
+
+    const result = await generate;
+    expect(result.finishReason).toBe('aborted');
   });
 
 });
