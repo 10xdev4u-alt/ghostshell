@@ -56,3 +56,26 @@ jobs:
         with:
           name: ghostshell-single-file
           path: dist/single/index.html
+
+  # Separate from `test` so a slow v86 boot cannot fail the fast unit gate.
+  # The suite skips when the Alpine rootfs has not been built or the BIOS host
+  # is unreachable; see tests/e2e/vm-boot.spec.ts.
+  e2e:
+    name: E2E (VM boot)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - name: Install Playwright Chromium
+        run: bunx playwright install --with-deps chromium
+      - name: Run e2e tests
+        run: bun run test:e2e
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-test-results
+          path: test-results/
+          continue-on-error: true
