@@ -6,9 +6,10 @@ import { createV86Filesystem } from '@/core/vm/fs9p.js';
 import { buildNetDevice } from '@/core/vm/network.js';
 import { V86VMHandle } from '@/core/vm/v86.js';
 
-const { instances, neverReady } = vi.hoisted(() => ({
+const { instances, neverReady, failRun } = vi.hoisted(() => ({
   instances: [] as any[],
   neverReady: { value: false },
+  failRun: { value: false },
 }));
 
 vi.mock('v86', () => {
@@ -39,6 +40,9 @@ vi.mock('v86', () => {
       async run(): Promise<void> {
         if (!this.ready) {
           throw new TypeError("Cannot read properties of undefined (reading 'run')");
+        }
+        if (failRun.value) {
+          throw new Error('v86 run failed');
         }
         this.running = true;
         this.emit('emulator-started', undefined);
@@ -139,6 +143,7 @@ describe('V86VMHandle', () => {
   beforeEach(() => {
     instances.length = 0;
     neverReady.value = false;
+    failRun.value = false;
   });
 
   it('boots Alpine with the expected v86 options', async () => {
@@ -346,6 +351,55 @@ describe('V86VMHandle', () => {
 
   it('exec throws when the VM is not started', async () => {
     const vm = new V86VMHandle();
+    await expect(vm.exec('echo hi')).rejects.toThrow('VM not started');
+  });
+
+  it('exec rejects immediately after a failed start', async () => {
+    neverReady.value = true;
+    const vm = new V86VMHandle({ readyTimeoutMs: 20 });
+    await expect(vm.start(DEFAULT_IMAGE)).rejects.toThrow(/Timed out/);
+    expect(vm.running).toBe(false);
+
+    const startedAt = Date.now();
+    await expect(vm.exec('echo hi')).rejects.toThrow('VM not started');
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
+
+  it('write, read, and list reject immediately after a failed start', async () => {
+    neverReady.value = true;
+    const vm = new V86VMHandle({ readyTimeoutMs: 20 });
+    await expect(vm.start(DEFAULT_IMAGE)).rejects.toThrow(/Timed out/);
+
+    await expect(vm.write('/tmp/a.txt', 'x')).rejects.toThrow('VM not started');
+    await expect(vm.read('/tmp/a.txt')).rejects.toThrow('VM not started');
+    await expect(vm.list('/tmp')).rejects.toThrow('VM not started');
+  });
+
+  it('exec rejects immediately when run() fails during start', async () => {
+    failRun.value = true;
+    const vm = new V86VMHandle();
+    await expect(vm.start(DEFAULT_IMAGE)).rejects.toThrow(/run failed/);
+    expect(vm.running).toBe(false);
+
+    await expect(vm.exec('echo hi')).rejects.toThrow('VM not started');
+  });
+
+  it('allows a retry after a failed start', async () => {
+    neverReady.value = true;
+    const vm = new V86VMHandle({ readyTimeoutMs: 20 });
+    await expect(vm.start(DEFAULT_IMAGE)).rejects.toThrow(/Timed out/);
+
+    neverReady.value = false;
+    await vm.start(DEFAULT_IMAGE);
+    expect(vm.running).toBe(true);
+    const result = await vm.exec('echo hi');
+    expect(result.stdout).toBe('hello');
+  });
+
+  it('exec rejects after stop()', async () => {
+    const vm = new V86VMHandle();
+    await vm.start(DEFAULT_IMAGE);
+    await vm.stop();
     await expect(vm.exec('echo hi')).rejects.toThrow('VM not started');
   });
 

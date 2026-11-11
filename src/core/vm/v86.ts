@@ -57,6 +57,15 @@ const LIST_SEP = '|';
 export class V86VMHandle implements VMHandle {
   readonly id = 'v86';
   private emu: V86 | null = null;
+  /**
+   * True once `start()` has brought the emulator up.
+   *
+   * `this.emu` is assigned before the emulator is ready, so its presence
+   * alone does not mean the VM is runnable. Without this flag a failed boot
+   * would leave `exec()` queueing commands to a dead emulator until the
+   * command timeout.
+   */
+  private started = false;
   private image: VMImage | null = null;
   private queue = new SerialQueue();
   private serialListeners = new Set<(data: string) => void>();
@@ -75,7 +84,7 @@ export class V86VMHandle implements VMHandle {
   }
 
   get running(): boolean {
-    return this.emu?.is_running() ?? false;
+    return this.started && (this.emu?.is_running() ?? false);
   }
 
   /**
@@ -96,6 +105,7 @@ export class V86VMHandle implements VMHandle {
       await this.emu.destroy().catch(() => undefined);
       this.emu = null;
     }
+    this.started = false;
     this.image = image;
     const emu = new V86(this.buildOptions());
     this.emu = emu;
@@ -103,8 +113,17 @@ export class V86VMHandle implements VMHandle {
       const ch = this.decoder.decode(new Uint8Array([byte]), { stream: true });
       if (ch) for (const fn of this.serialListeners) fn(ch);
     });
-    await this.waitForReady(emu);
-    await emu.run();
+    try {
+      await this.waitForReady(emu);
+      await emu.run();
+    } catch (err) {
+      // A constructed-but-unstarted emulator must not pass `requireEmu()`.
+      this.emu = null;
+      this.started = false;
+      void emu.destroy().catch(() => undefined);
+      throw err;
+    }
+    this.started = true;
   }
 
   /**
@@ -144,8 +163,10 @@ export class V86VMHandle implements VMHandle {
   }
 
   async stop(): Promise<void> {
-    if (!this.emu) return;
-    await this.emu.stop();
+    const emu = this.emu;
+    this.started = false;
+    if (!emu) return;
+    await emu.stop();
   }
 
   async pause(): Promise<void> {
@@ -262,7 +283,7 @@ export class V86VMHandle implements VMHandle {
   }
 
   private requireEmu(): V86 {
-    if (!this.emu) throw new Error('VM not started');
+    if (!this.started || !this.emu) throw new Error('VM not started');
     return this.emu;
   }
 
