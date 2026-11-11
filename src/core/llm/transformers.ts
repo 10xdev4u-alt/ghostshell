@@ -15,6 +15,23 @@ import type {
   ModelSpec,
 } from '@/types/index.js';
 import { resolveModelDtype, resolveModelRepo, supportsBackend } from './models.js';
+import { buildToolDefinitions, type ChatTool } from './grammar.js';
+
+/**
+ * Tool schemas ride on `GenerateRequest` so chat templates can render them.
+ *
+ * The field is declared here rather than in `src/types` to keep the LLM engine
+ * self-contained; TypeScript merges it into the shared interface.
+ */
+declare module '@/types/index.js' {
+  interface GenerateRequest {
+    /**
+     * Tool schemas for chat templates that support function calling. When
+     * absent or empty, the template renders without a tool block.
+     */
+    tools?: ChatTool[];
+  }
+}
 
 /**
  * Transformers.js engine (default for v0.1).
@@ -173,6 +190,31 @@ class OPFSCache {
       // Cache writes are best-effort; a quota error must not break loading.
     }
   }
+
+  /**
+   * Drop the cached directory handle and remove the cache directory.
+   *
+   * The handle is reset first so the next `match`/`put` re-opens the directory
+   * instead of writing into a removed one.
+   */
+  async clear(): Promise<void> {
+    this.dirPromise = null;
+    await removeOPFSCacheDirectory();
+  }
+}
+
+/**
+ * Remove the OPFS weight-cache directory. Best-effort: a missing directory or
+ * a denied removal must not break cache clearing.
+ */
+async function removeOPFSCacheDirectory(): Promise<void> {
+  if (!hasOPFS()) return;
+  try {
+    const root = await navigator.storage.getDirectory();
+    await root.removeEntry(OPFS_CACHE_DIR, { recursive: true });
+  } catch {
+    // The directory may not exist; clearing is best-effort.
+  }
 }
 
 /**
@@ -204,15 +246,28 @@ function isNode(): boolean {
   );
 }
 
-/** Delete the IndexedDB weight cache. Safe to call when it does not exist. */
+/**
+ * Delete the IndexedDB and OPFS weight caches. Safe to call when neither
+ * exists. The OPFS directory is removed even when the engine never installed
+ * an `OPFSCache` (for example, after a restart).
+ */
 export async function clearTransformersCache(): Promise<void> {
-  if (typeof indexedDB === 'undefined') return;
-  await new Promise<void>((resolve) => {
-    const request = indexedDB.deleteDatabase(CACHE_DB_NAME);
-    request.onsuccess = () => resolve();
-    request.onerror = () => resolve();
-    request.onblocked = () => resolve();
-  });
+  if (typeof indexedDB !== 'undefined') {
+    await new Promise<void>((resolve) => {
+      const request = indexedDB.deleteDatabase(CACHE_DB_NAME);
+      request.onsuccess = () => resolve();
+      request.onerror = () => resolve();
+      request.onblocked = () => resolve();
+    });
+  }
+
+  const cache = env.customCache;
+  if (cache instanceof OPFSCache) {
+    await cache.clear();
+    env.customCache = null;
+    return;
+  }
+  await removeOPFSCacheDirectory();
 }
 
 /**
@@ -403,7 +458,7 @@ export class TransformersEngine implements LLMEngine {
     }
 
     const tokenizer = generator.tokenizer;
-    const prompt = this.applyChatTemplate(req.messages, tokenizer);
+    const prompt = this.applyChatTemplate(req.messages, tokenizer, req.tools);
     const maxTokens = req.maxTokens ?? DEFAULT_MAX_NEW_TOKENS;
     const temperature = req.temperature ?? DEFAULT_TEMPERATURE;
 
@@ -484,14 +539,25 @@ export class TransformersEngine implements LLMEngine {
     }
   }
 
-  private applyChatTemplate(messages: Message[], tokenizer: PreTrainedTokenizer): string {
+  private applyChatTemplate(
+    messages: Message[],
+    tokenizer: PreTrainedTokenizer,
+    tools?: ChatTool[],
+  ): string {
     const chat = toChatMessages(messages);
+    const templateTools = tools && tools.length > 0 ? buildToolDefinitions(tools) : undefined;
 
     try {
-      const templated = tokenizer.apply_chat_template(chat, {
+      // `tool_choice` is not a documented transformers.js option, but unknown
+      // kwargs are forwarded to the Jinja context. Templates that understand it
+      // (Hermes-style) read it; Qwen's ignores it. It is only sent with tools so
+      // the no-tools prompt is byte-for-byte unchanged.
+      const options = {
         tokenize: false,
         add_generation_prompt: true,
-      });
+        ...(templateTools ? { tools: templateTools, tool_choice: 'auto' } : {}),
+      } as Parameters<PreTrainedTokenizer['apply_chat_template']>[1];
+      const templated = tokenizer.apply_chat_template(chat, options);
       if (typeof templated === 'string') return templated;
     } catch {
       // No chat template configured; fall through to the ChatML default.
@@ -577,9 +643,21 @@ function toChatMessages(messages: Message[]): ChatMessage[] {
 
 /** ChatML fallback for tokenizers without a chat template. */
 function fallbackChatTemplate(messages: ChatMessage[]): string {
-  const parts = messages.map(
-    (message) => `<|im_start|>${message.role}\n${message.content}\n<|im_end|>`,
-  );
+  const parts = messages.map((message) => {
+    const blocks = message.tool_calls?.map(formatToolCall) ?? [];
+    const body = [message.content, ...blocks].filter((part) => part.length > 0).join('\n');
+    return `<|im_start|>${message.role}\n${body}\n<|im_end|>`;
+  });
   parts.push('<|im_start|>assistant\n');
   return parts.join('\n');
+}
+
+/**
+ * Render one tool call in the Hermes format `parseToolCalls` accepts
+ * (`<tool_call>{"name": …, "arguments": …}</tool_call>`), which is also the
+ * syntax Qwen's chat template emits.
+ */
+function formatToolCall(call: ChatToolCall): string {
+  const payload = JSON.stringify({ name: call.function.name, arguments: call.function.arguments });
+  return `<tool_call>\n${payload}\n</tool_call>`;
 }
