@@ -36,6 +36,7 @@ export class FakeClassList {
 export class FakeStyle {
   display = '';
   paddingLeft = '';
+  width = '';
   private readonly properties = new Map<string, string>();
 
   setProperty(name: string, value: string): void {

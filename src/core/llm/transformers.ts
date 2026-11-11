@@ -10,8 +10,8 @@ import type {
   GenerateRequest,
   GenerateResult,
   LLMEngine,
-  LoadProgress,
   Message,
+  ModelProgress,
   ModelSpec,
 } from '@/types/index.js';
 import { resolveModelDtype, resolveModelRepo, supportsBackend } from './models.js';
@@ -333,15 +333,105 @@ function hasOPFS(): boolean {
   return typeof storage.getDirectory === 'function';
 }
 
-function toLoadProgress(info: ProgressInfo, spec: ModelSpec): LoadProgress {
-  const fallbackTotal = spec.sizeBytes;
+/** Build the standard `AbortError` shape so callers can detect cancellation. */
+function abortError(): DOMException {
+  return new DOMException('The operation was aborted.', 'AbortError');
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw abortError();
+}
+
+/**
+ * Reject as soon as `signal` aborts, while still settling the wrapped
+ * promise's own result. Adds cancellation to `pipeline()`, which has no
+ * signal of its own.
+ */
+function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(abortError());
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(abortError());
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (err: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(err);
+      },
+    );
+  });
+}
+
+const abortFetchSignals: AbortSignal[] = [];
+let abortFetchBase: typeof fetch | null = null;
+let abortFetchCombined: AbortSignal | null = null;
+let abortFetchPatched: typeof fetch | null = null;
+
+/**
+ * Route every global `fetch` call made while a load runs through `signal`.
+ *
+ * `@huggingface/transformers` downloads weights with `fetch(url)` and exposes
+ * no `AbortSignal` (`hub.js` `getFile`), so the only way to stop a download
+ * mid-flight is to wrap the global. One wrapper serves every in-flight load
+ * and restores the previous global when the last one settles.
+ */
+function installAbortFetch(signal: AbortSignal): () => void {
+  const g = globalThis as { fetch?: typeof fetch };
+  if (typeof g.fetch !== 'function') return () => {};
+
+  if (abortFetchPatched) {
+    abortFetchCombined = AbortSignal.any([...abortFetchSignals, signal]);
+  } else {
+    abortFetchBase = g.fetch;
+    abortFetchCombined = signal;
+    abortFetchPatched = ((input: RequestInfo | URL, init?: RequestInit) =>
+      abortFetchBase!(input, { ...init, signal: abortFetchCombined! })) as typeof fetch;
+    g.fetch = abortFetchPatched;
+  }
+
+  abortFetchSignals.push(signal);
+
+  return () => {
+    const index = abortFetchSignals.indexOf(signal);
+    if (index !== -1) abortFetchSignals.splice(index, 1);
+    if (abortFetchSignals.length === 0) {
+      if (g.fetch === abortFetchPatched) g.fetch = abortFetchBase!;
+      abortFetchPatched = null;
+      abortFetchBase = null;
+      abortFetchCombined = null;
+      return;
+    }
+    abortFetchCombined = AbortSignal.any(abortFetchSignals);
+  };
+}
+
+function clampPercent(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(100, Math.max(0, value));
+}
+
+/** Last byte counts seen for a file, used to give `done` a real total. */
+interface FileProgressSample {
+  loaded: number;
+  total: number;
+}
+
+function toLoadProgress(
+  info: ProgressInfo,
+  spec: ModelSpec,
+  last?: FileProgressSample,
+): ModelProgress {
   switch (info.status) {
     case 'initiate':
     case 'download':
       return {
         phase: 'downloading',
         loaded: 0,
-        total: fallbackTotal,
+        total: 0,
+        percent: null,
         message: `Downloading ${info.file}`,
       };
     case 'progress':
@@ -349,24 +439,27 @@ function toLoadProgress(info: ProgressInfo, spec: ModelSpec): LoadProgress {
         phase: 'downloading',
         loaded: info.loaded,
         total: info.total,
+        percent: info.total > 0 ? clampPercent(info.progress) : null,
         message: `Downloading ${info.file}`,
       };
     case 'done':
       return {
         phase: 'downloading',
-        loaded: fallbackTotal,
-        total: fallbackTotal,
+        loaded: last?.loaded ?? 0,
+        total: last?.total ?? 0,
+        percent: last !== undefined && last.total > 0 ? 100 : null,
         message: `Downloaded ${info.file}`,
       };
     case 'ready':
       return {
         phase: 'loading',
-        loaded: fallbackTotal,
-        total: fallbackTotal,
+        loaded: spec.sizeBytes,
+        total: spec.sizeBytes,
+        percent: spec.sizeBytes > 0 ? 100 : null,
         message: `Ready: ${info.task}`,
       };
     default:
-      return { phase: 'loading', loaded: 0, total: fallbackTotal, message: 'Loading model' };
+      return { phase: 'loading', loaded: 0, total: 0, percent: null, message: 'Loading model' };
   }
 }
 
@@ -396,7 +489,14 @@ export class TransformersEngine implements LLMEngine {
     return this.loaded;
   }
 
-  async load(spec: ModelSpec, onProgress: (p: LoadProgress) => void): Promise<void> {
+  async load(
+    spec: ModelSpec,
+    onProgress: (p: ModelProgress) => void,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const abortSignal = signal ?? new AbortController().signal;
+    throwIfAborted(abortSignal);
+
     this.configureCache();
 
     // A model validated only on WASM must never build a WebGPU pipeline, even
@@ -407,28 +507,65 @@ export class TransformersEngine implements LLMEngine {
 
     const repo = resolveModelRepo(spec, 'transformers');
     const dtype = this.dtype ?? resolveModelDtype(spec);
-    onProgress({
+
+    // Progress from a canceled load is meaningless; drop it so the UI does
+    // not flash a stale percentage after the user cancels.
+    const emit = (progress: ModelProgress): void => {
+      if (!abortSignal.aborted) onProgress(progress);
+    };
+
+    emit({
       phase: 'downloading',
       loaded: 0,
       total: spec.sizeBytes,
+      percent: spec.sizeBytes > 0 ? 0 : null,
       message: `Loading ${spec.name}`,
     });
 
-    const generator = (await pipeline<'text-generation'>('text-generation', repo, {
-      device: this.kind,
-      dtype,
-      ...(this.revision ? { revision: this.revision } : {}),
-      progress_callback: (info: ProgressInfo) => onProgress(toLoadProgress(info, spec)),
-    })) as unknown as TextGenerationPipelineType;
-    this.generator = generator;
+    // `done` carries no byte counts, so keep the last `progress` sample per
+    // file and report it as the completed total.
+    const fileProgress = new Map<string, FileProgressSample>();
 
-    this.loaded = true;
-    onProgress({
-      phase: 'loading',
-      loaded: spec.sizeBytes,
-      total: spec.sizeBytes,
-      message: `${spec.name} ready`,
-    });
+    const restoreFetch = installAbortFetch(abortSignal);
+    try {
+      const pending = pipeline<'text-generation'>('text-generation', repo, {
+        device: this.kind,
+        dtype,
+        ...(this.revision ? { revision: this.revision } : {}),
+        progress_callback: (info: ProgressInfo) => {
+          if (abortSignal.aborted) return;
+          if (info.status === 'progress') {
+            fileProgress.set(info.file, { loaded: info.loaded, total: info.total });
+            emit(toLoadProgress(info, spec));
+            return;
+          }
+          if (info.status === 'done') {
+            emit(toLoadProgress(info, spec, fileProgress.get(info.file)));
+            return;
+          }
+          emit(toLoadProgress(info, spec));
+        },
+      });
+
+      const generator = (await raceWithAbort(
+        pending as Promise<TextGenerationPipelineType>,
+        abortSignal,
+      )) as unknown as TextGenerationPipelineType;
+      this.generator = generator;
+      this.loaded = true;
+      emit({
+        phase: 'loading',
+        loaded: spec.sizeBytes,
+        total: spec.sizeBytes,
+        percent: spec.sizeBytes > 0 ? 100 : null,
+        message: `${spec.name} ready`,
+      });
+    } catch (err) {
+      if (abortSignal.aborted) throw abortError();
+      throw err;
+    } finally {
+      restoreFetch();
+    }
   }
 
   async unload(): Promise<void> {
@@ -448,6 +585,7 @@ export class TransformersEngine implements LLMEngine {
     req: GenerateRequest,
     onToken: (token: string) => void,
     signal: AbortSignal,
+    onProgress?: (p: ModelProgress) => void,
   ): Promise<GenerateResult> {
     const generator = this.generator;
     if (!generator) {
@@ -461,6 +599,19 @@ export class TransformersEngine implements LLMEngine {
     const prompt = this.applyChatTemplate(req.messages, tokenizer, req.tools);
     const maxTokens = req.maxTokens ?? DEFAULT_MAX_NEW_TOKENS;
     const temperature = req.temperature ?? DEFAULT_TEMPERATURE;
+
+    // Generation has no byte stream to measure; tokens against the turn cap
+    // are the honest analogue. `total` is the cap, not a predicted length.
+    const report = (tokens: number): void => {
+      onProgress?.({
+        phase: 'generating',
+        loaded: tokens,
+        total: maxTokens,
+        percent: maxTokens > 0 ? clampPercent((tokens / maxTokens) * 100) : null,
+        message: 'Generating…',
+      });
+    };
+    report(0);
 
     const chunks: string[] = [];
     const stopStrings = req.stop ?? [];
@@ -478,6 +629,7 @@ export class TransformersEngine implements LLMEngine {
       },
       onTokenIds: (ids) => {
         generatedTokens += ids.length;
+        report(generatedTokens);
       },
     });
 

@@ -231,6 +231,63 @@ html, body {
 .gs-artifact { display: flex; flex-direction: column; height: 100%; }
 .gs-artifact-frame { flex: 1; }
 
+.gs-model-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--gs-border);
+  border-radius: var(--gs-radius);
+  background: var(--gs-panel);
+}
+.gs-model-progress[hidden] { display: none; }
+.gs-model-progress__label {
+  font-size: 12px;
+  color: var(--gs-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.gs-model-progress__bar {
+  flex: 1;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--gs-bg);
+  overflow: hidden;
+}
+.gs-model-progress__fill {
+  height: 100%;
+  width: 0;
+  background: var(--gs-accent);
+  transition: width 0.15s ease-out;
+}
+.gs-model-progress__bar.is-indeterminate .gs-model-progress__fill {
+  width: 40%;
+  animation: gs-progress-indeterminate 1.2s ease-in-out infinite;
+}
+@keyframes gs-progress-indeterminate {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(250%); }
+}
+.gs-model-progress__bytes {
+  font-family: var(--gs-mono);
+  font-size: 11px;
+  color: var(--gs-muted);
+  white-space: nowrap;
+}
+.gs-model-progress__cancel {
+  border: 1px solid var(--gs-border);
+  background: var(--gs-bg);
+  color: var(--gs-text);
+  border-radius: var(--gs-radius);
+  padding: 4px 10px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.gs-model-progress__cancel:hover { border-color: var(--gs-red); color: var(--gs-red); }
+
 @media (max-width: 860px) {
   .gs-main { grid-template-columns: 1fr; }
   .gs-side { display: none; }
