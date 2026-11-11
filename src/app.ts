@@ -93,6 +93,7 @@ export class App {
   private settings: ReturnType<typeof createSettings> | null = null;
   private engine: LLMEngine | null = null;
   private engineLoad: Promise<LLMEngine> | null = null;
+  private loadedModelId: string | null = null;
   private conversation: Conversation | null = null;
   private runController: AbortController | null = null;
   private restoreEgress: (() => void) | null = null;
@@ -177,8 +178,22 @@ export class App {
 
   async start(): Promise<void> {
     if (this.vm.running) return;
-    const image = getImage('alpine-3.21-i386');
-    await this.vm.start(image);
+    try {
+      const image = getImage('alpine-3.21-i386');
+      await this.vm.start(image);
+    } catch (err) {
+      // Boot failures (missing image, network fetch, wasm init) must be
+      // visible; the welcome panel is the only surface left on failure.
+      const welcome = document.querySelector('.gs-welcome');
+      if (welcome) {
+        const hint = document.createElement('p');
+        hint.className = 'gs-hint';
+        hint.textContent = `Boot failed: ${errorMessage(err)}`;
+        welcome.appendChild(hint);
+      }
+      this.updateBadges();
+      return;
+    }
     this.serialFilter.reset();
     this.fileTree?.setVM(this.filteredVM);
     this.bus.emit('vm:ready', undefined);
@@ -332,17 +347,28 @@ export class App {
   }
 
   /**
-   * Load the configured model on first use. The engine is created once and
-   * reused; concurrent callers share the same in-flight load.
+   * Load the configured model on first use. The engine is created once per
+   * model and reused; concurrent callers share the same in-flight load.
    */
   private ensureEngine(): Promise<LLMEngine> {
-    if (this.engine?.isLoaded()) return Promise.resolve(this.engine);
-    if (this.engineLoad) return this.engineLoad;
-
     const config = this.settings?.get() ?? DEFAULT_AGENT_CONFIG;
+    if (this.engine?.isLoaded() && this.loadedModelId === config.modelId) {
+      return Promise.resolve(this.engine);
+    }
+    if (this.engineLoad && this.loadedModelId === config.modelId) return this.engineLoad;
+
+    // The selected model changed (or a previous load failed); drop the old
+    // engine so the next load uses the new model.
+    const stale = this.engine;
+    if (stale) {
+      this.engine = null;
+      if (stale.isLoaded()) void stale.unload().catch(() => undefined);
+    }
+
     const spec = getModel(config.modelId);
     const engine = createEngine('transformers', { spec });
     this.engine = engine;
+    this.loadedModelId = spec.id;
     this.updateModelBadge();
 
     this.engineLoad = engine
@@ -350,18 +376,25 @@ export class App {
         this.bus.emit('llm:progress', progress);
         this.updateModelBadge();
       })
-      .then(() => {
-        this.engineLoad = null;
-        this.bus.emit('llm:loaded', undefined);
-        this.updateModelBadge();
-        return engine;
-      })
-      .catch((err: unknown) => {
-        this.engineLoad = null;
-        if (this.engine === engine) this.engine = null;
-        this.updateModelBadge();
-        throw err;
-      });
+      .then(
+        () => {
+          // A settings change may have superseded this load.
+          if (this.engine !== engine) return engine;
+          this.engineLoad = null;
+          this.bus.emit('llm:loaded', undefined);
+          this.updateModelBadge();
+          return engine;
+        },
+        (err: unknown) => {
+          if (this.engine === engine) {
+            this.engine = null;
+            this.loadedModelId = null;
+            this.engineLoad = null;
+            this.updateModelBadge();
+          }
+          throw err;
+        },
+      );
 
     return this.engineLoad;
   }
@@ -406,7 +439,22 @@ export class App {
       config.networkMode === 'off',
       BOOT_EGRESS_ALLOWLIST,
     );
+    this.unloadEngineIfModelChanged(config.modelId);
     this.updateBadges();
+  }
+
+  /**
+   * Drop the loaded engine when the selected model changes so the next submit
+   * loads the new model instead of reusing the old one. An in-flight load is
+   * left to finish; its result is discarded by the `ensureEngine` guard.
+   */
+  private unloadEngineIfModelChanged(modelId: string): void {
+    if (modelId === this.loadedModelId) return;
+    const old = this.engine;
+    this.engine = null;
+    this.engineLoad = null;
+    this.loadedModelId = null;
+    if (old?.isLoaded()) void old.unload().catch(() => undefined);
   }
 
   private updateBadges(): void {
