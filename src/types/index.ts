@@ -276,24 +276,39 @@ export interface Artifact {
 }
 
 export interface Recipe {
+  /** Unique recipe name, also used for the installed registry key. */
   name: string;
+  /** Semantic version of the recipe manifest. */
   version: string;
   description: string;
   license: string;
   author: string;
+  /** System-prompt fragment merged into the agent prompt on install. */
   prompt: string;
+  /** Built-in tool names this recipe is allowed to use. */
   tools: string[];
   fewShot?: unknown;
+  /** Shell script run inside the VM during install. */
   setup: string;
+  /** Optional shell script that reverses `setup`, run during uninstall. */
+  unsetup?: string | undefined;
   evals?: unknown;
+  /**
+   * Integrity check over the canonical recipe JSON (sorted keys), excluding
+   * the `integrity` field itself. See `canonicalRecipe` in plugins/recipes.ts.
+   */
   integrity: { sha256: string };
 }
 
 export interface MCPServer {
   name: string;
   transport: 'stdio' | 'sse' | 'http';
-  command?: string;
-  url?: string;
+  /** Executable for stdio servers (run inside the VM). */
+  command?: string | undefined;
+  /** Arguments passed to `command` for stdio servers. */
+  args?: string[] | undefined;
+  /** Endpoint for `http` (Streamable HTTP) and `sse` servers. */
+  url?: string | undefined;
   enabled: boolean;
 }
 
