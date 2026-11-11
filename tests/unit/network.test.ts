@@ -39,22 +39,6 @@ describe('buildNetDevice', () => {
     );
   });
 
-  it('builds the wsproxy backend as a raw ws:// relay', () => {
-    expect(buildNetDevice({ mode: 'wsproxy', proxyUrl: 'wss://proxy.example.com' })).toEqual({
-      relay_url: 'wss://proxy.example.com',
-    });
-  });
-
-  it('requires a wsproxy relay URL', () => {
-    expect(() => buildNetDevice({ mode: 'wsproxy' })).toThrow('wsproxy');
-  });
-
-  it('rejects a non-ws wsproxy relay URL', () => {
-    expect(() => buildNetDevice({ mode: 'wsproxy', proxyUrl: 'https://proxy.example.com' })).toThrow(
-      'ws://',
-    );
-  });
-
   it('passes id and peer hints through as router_mac/router_ip', () => {
     expect(
       buildNetDevice({
@@ -84,10 +68,9 @@ describe('buildNetDevice', () => {
       buildNetDevice({ mode: 'inbrowser' }),
       buildNetDevice({ mode: 'fetch' }),
       buildNetDevice({ mode: 'wisp', wispUrl: 'wss://relay.example.com' }),
-      buildNetDevice({ mode: 'wsproxy', proxyUrl: 'wss://proxy.example.com' }),
     ];
     for (const device of devices) {
-      expect(device?.relay_url).toMatch(/^(fetch|inbrowser|wisp:\/\/|wisps:\/\/|ws:\/\/|wss:\/\/)/);
+      expect(device?.relay_url).toMatch(/^(fetch|inbrowser|wisp:\/\/|wisps:\/\/)/);
     }
   });
 });
@@ -98,6 +81,5 @@ describe('isNetworkEnabled', () => {
     expect(isNetworkEnabled('inbrowser')).toBe(true);
     expect(isNetworkEnabled('fetch')).toBe(true);
     expect(isNetworkEnabled('wisp')).toBe(true);
-    expect(isNetworkEnabled('wsproxy')).toBe(true);
   });
 });

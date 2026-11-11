@@ -15,20 +15,20 @@ import type { NetworkMode } from '@/types/index.js';
  * adapters. There is no `backend`, `url`, `peer_mac`, `peer_ip`, or `wsproxy`
  * field in v86's contract; setting them is a silent no-op.
  *
+ * GhostShell exposes only the three named modes. v86's fallback branch (any
+ * other `relay_url`, e.g. `"ws://…"`) is not a GhostShell mode: there is no
+ * `wsproxy` backend in v86's contract.
+ *
  * GhostShell defaults to `off`. Every other mode is an explicit opt-in.
  */
 
-export type NetworkBackend = NetworkMode | 'wsproxy';
-
 export interface NetworkConfig {
-  mode: NetworkBackend;
+  mode: NetworkMode;
   /** WISP proxy URL when mode === 'wisp' (ws://, wss://, wisp://, or wisps://). */
   wispUrl?: string;
-  /** Raw-Ethernet relay URL when mode === 'wsproxy' (ws:// or wss://). */
-  proxyUrl?: string;
-  /** Peer MAC hint (fetch/wisp/wsproxy). */
+  /** Peer MAC hint (fetch/wisp). */
   peerMac?: string;
-  /** Peer IP hint (fetch/wisp/wsproxy). */
+  /** Peer IP hint (fetch/wisp). */
   peerIp?: string;
   /** v86 network namespace id. */
   id?: number;
@@ -43,7 +43,7 @@ export type NetDevice = NonNullable<V86Options['net_device']> & {
   relay_url: string;
 };
 
-function requireUrl(url: string | undefined, mode: 'wisp' | 'wsproxy'): string {
+function requireUrl(url: string | undefined, mode: 'wisp'): string {
   if (!url) {
     throw new Error(`${mode} mode requires a proxy URL`);
   }
@@ -61,13 +61,6 @@ function toWispRelayUrl(url: string | undefined): string {
   if (href.startsWith('ws://')) return `wisp://${href.slice('ws://'.length)}`;
   if (href.startsWith('wss://')) return `wisps://${href.slice('wss://'.length)}`;
   throw new Error(`wisp mode expects a ws:// or wss:// proxy URL, got: ${href}`);
-}
-
-/** The raw relay is handed straight to `new WebSocket(url)`, so it must be ws(s)://. */
-function toRawRelayUrl(url: string | undefined): string {
-  const href = requireUrl(url, 'wsproxy');
-  if (href.startsWith('ws://') || href.startsWith('wss://')) return href;
-  throw new Error(`wsproxy mode expects a ws:// or wss:// relay URL, got: ${href}`);
 }
 
 function withHints(config: NetworkConfig, device: NetDevice): NetDevice {
@@ -96,8 +89,6 @@ export function buildNetDevice(config: NetworkConfig): NetDevice | undefined {
       return withHints(config, { relay_url: 'fetch' });
     case 'wisp':
       return withHints(config, { relay_url: toWispRelayUrl(config.wispUrl) });
-    case 'wsproxy':
-      return withHints(config, { relay_url: toRawRelayUrl(config.proxyUrl) });
     default: {
       const exhaustive: never = config.mode;
       throw new Error(`Unsupported network mode: ${String(exhaustive)}`);
@@ -106,6 +97,6 @@ export function buildNetDevice(config: NetworkConfig): NetDevice | undefined {
 }
 
 /** True when the VM has any network device attached. */
-export function isNetworkEnabled(mode: NetworkBackend): boolean {
+export function isNetworkEnabled(mode: NetworkMode): boolean {
   return mode !== 'off';
 }

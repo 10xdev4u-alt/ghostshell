@@ -40,6 +40,14 @@ export async function sha256Hex(data: Uint8Array | string): Promise<string> {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+/**
+ * Assemble the privacy report.
+ *
+ * Kept `async` even though it performs no `await`, so the report pipeline
+ * (`buildReport` → `signReport` → `verifyReport`) has a uniform awaitable
+ * shape and can grow asynchronous work (e.g. hashing artifact bytes) without
+ * changing its callers.
+ */
 export async function buildReport(
   config: AttestationConfig,
   egress: EgressEvent[],
@@ -84,6 +92,10 @@ export function stableStringify(value: unknown): string {
 /**
  * Canonical bytes covered by the signature. The signature itself is excluded
  * so a report can be signed and verified without circularity.
+ *
+ * Only the six canonical fields below are attested. Any other top-level field
+ * on the report object is deliberately dropped, so verifiers must compare only
+ * these canonical fields and never the whole report object.
  */
 export function canonicalize(report: PrivacyReport): string {
   return stableStringify({

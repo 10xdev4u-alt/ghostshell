@@ -108,6 +108,12 @@ describe('canonicalize', () => {
     const signed: PrivacyReport = { ...unsigned, signature: 'deadbeef' };
     expect(canonicalize(unsigned)).toBe(canonicalize(signed));
   });
+
+  it('drops unknown top-level fields so verifiers cover only canonical fields', () => {
+    const report = reportWith([]);
+    const withExtra = { ...report, injected: 'not-signed' } as PrivacyReport;
+    expect(canonicalize(withExtra)).toBe(canonicalize(report));
+  });
 });
 
 describe('signReport / verifyReport', () => {

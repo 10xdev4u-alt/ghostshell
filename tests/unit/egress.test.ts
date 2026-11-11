@@ -73,6 +73,41 @@ describe('installEgressInterceptor', () => {
     expect(log.list()[0]!.method).toBe('POST');
   });
 
+  it('reads the method from a Request input', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('ok')));
+    restore = installEgressInterceptor(log, false);
+
+    const request = new Request('https://example.com/request', { method: 'PUT' });
+    await fetch(request);
+    expect(log.list()[0]).toEqual(
+      expect.objectContaining({
+        url: 'https://example.com/request',
+        method: 'PUT',
+        blocked: false,
+      }),
+    );
+  });
+
+  it('reads the method from a cross-realm Request-like input', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('ok')));
+    restore = installEgressInterceptor(log, false);
+
+    // A Request from another realm is not `instanceof Request`; duck-typing
+    // must still read its method instead of falling back to GET.
+    const requestLike = {
+      url: 'https://example.com/request',
+      method: 'DELETE',
+    } as unknown as Request;
+    await fetch(requestLike);
+    expect(log.list()[0]).toEqual(
+      expect.objectContaining({
+        url: 'https://example.com/request',
+        method: 'DELETE',
+        blocked: false,
+      }),
+    );
+  });
+
   it('blocks and logs fetch calls in lockdown', async () => {
     const fetchMock = vi.fn(async () => new Response('ok'));
     vi.stubGlobal('fetch', fetchMock);
@@ -233,17 +268,49 @@ describe('installEgressInterceptor', () => {
   });
 
   it('restores every patched global', () => {
-    const originalFetch = globalThis.fetch;
-    const originalWebSocket = globalThis.WebSocket;
-    const originalEventSource = globalThis.EventSource;
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('ok')));
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+    vi.stubGlobal('XMLHttpRequest', FakeXMLHttpRequest);
+    vi.stubGlobal('EventSource', FakeEventSource);
+    const navigatorBeacon = vi.fn(() => true);
+    const globalBeacon = vi.fn(() => true);
+    (navigator as unknown as { sendBeacon: unknown }).sendBeacon = navigatorBeacon;
+    (globalThis as unknown as { sendBeacon: unknown }).sendBeacon = globalBeacon;
+
+    const installedFetch = globalThis.fetch;
+    const installedWebSocket = globalThis.WebSocket;
+    const installedXMLHttpRequest = globalThis.XMLHttpRequest;
+    const installedXhrOpen = FakeXMLHttpRequest.prototype.open;
+    const installedEventSource = globalThis.EventSource;
+    const installedNavigatorBeacon = navigator.sendBeacon;
+    const installedGlobalBeacon = (globalThis as unknown as { sendBeacon: unknown }).sendBeacon;
 
     restore = installEgressInterceptor(log, false);
+
+    // The install must actually patch each surface, or the restore assertions
+    // below would pass vacuously.
+    expect(globalThis.fetch).not.toBe(installedFetch);
+    expect(globalThis.WebSocket).not.toBe(installedWebSocket);
+    expect(globalThis.XMLHttpRequest).toBe(installedXMLHttpRequest);
+    expect(FakeXMLHttpRequest.prototype.open).not.toBe(installedXhrOpen);
+    expect(globalThis.EventSource).not.toBe(installedEventSource);
+    expect(navigator.sendBeacon).not.toBe(installedNavigatorBeacon);
+    expect((globalThis as unknown as { sendBeacon: unknown }).sendBeacon).not.toBe(
+      installedGlobalBeacon,
+    );
+
     restore();
     restore = undefined;
 
-    expect(globalThis.fetch).toBe(originalFetch);
-    expect(globalThis.WebSocket).toBe(originalWebSocket);
-    expect(globalThis.EventSource).toBe(originalEventSource);
+    expect(globalThis.fetch).toBe(installedFetch);
+    expect(globalThis.WebSocket).toBe(installedWebSocket);
+    expect(globalThis.XMLHttpRequest).toBe(installedXMLHttpRequest);
+    expect(FakeXMLHttpRequest.prototype.open).toBe(installedXhrOpen);
+    expect(globalThis.EventSource).toBe(installedEventSource);
+    expect(navigator.sendBeacon).toBe(installedNavigatorBeacon);
+    expect((globalThis as unknown as { sendBeacon: unknown }).sendBeacon).toBe(
+      installedGlobalBeacon,
+    );
   });
 });
 
