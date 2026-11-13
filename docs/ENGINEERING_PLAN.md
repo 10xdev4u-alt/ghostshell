@@ -14,7 +14,7 @@ GhostShell is one static HTML file that runs a coding agent entirely in the brow
 
 Hard tensions to accept up front:
 
-1. **"Single HTML file" vs "apt-get install at runtime":** VM networking is opt-in. `off` (no NIC) is the default; `inbrowser` and `fetch` need no relay, and only `wisp` sends VM traffic through a third-party proxy the user supplies. v0.1 ships a **frozen image** with packages pre-baked; runtime installs are a v1.0 opt-in.
+1. **"Single HTML file" vs "apt-get install at runtime":** VM networking is opt-in. `off` (no network backend) is the default; `inbrowser` and `fetch` need no relay, and only `wisp` sends VM traffic through a third-party proxy the user supplies. v0.1 ships a **frozen image** with packages pre-baked; runtime installs are a v1.0 opt-in.
 2. **"No server" means no GhostShell backend, not no network:** model weights (~1–2 GB) are fetched from a CDN on first run and cached. A truly offline file would need the weights bundled, which is incompatible with a <100 MB HTML file.
 3. **1.5B–3B local models are mediocre at tool calling.** The agent loop must be engineered around that: delimited XML/JSON syntax, corrective retries, eval-driven model choice.
 
@@ -112,7 +112,7 @@ A zero-infrastructure coding agent. Open the file, get a chat with an AI that ru
 
 ### 3.1 Emulated Linux (v86)
 
-**What v86 is.** copy.sh v86 is a WASM build of a QEMU-derived x86 emulator (TCG) that boots a full Linux kernel in a browser tab. It emulates a PC: x86/x86-64 CPU, RAM, VGA framebuffer, IDE/virtio-blk disk, NIC (virtio-net/e1000/rtl8139; v86 picks the backend from `net_device.relay_url` — `inbrowser`, `fetch`, or a `wisp://`/`wisps://` proxy for its SLIRP-style TCP), PS/2 input, serial ports, RTC. References: https://copy.sh/v86/, https://github.com/copy/v86.
+**What v86 is.** copy.sh v86 is a WASM build of a QEMU-derived x86 emulator (TCG) that boots a full Linux kernel in a browser tab. It emulates a PC: x86/x86-64 CPU, RAM, VGA framebuffer, IDE/virtio-blk disk, NIC (virtio-net/e1000/rtl8139; v86 picks the backend from `net_device.relay_url` — `inbrowser`, `fetch`, or a `wisp://`/`wisps://` proxy for its in-page TCP/IP stack), PS/2 input, serial ports, RTC. References: https://copy.sh/v86/, https://github.com/copy/v86.
 
 **Why v86 over alternatives:**
 
@@ -160,16 +160,16 @@ Size budget: git ~20 MB, python3 ~40 MB, nodejs ~50 MB, npm ~30 MB, gcc ~150 MB.
 
 | Mode | `relay_url` | Transport | Needs a third-party relay? |
 |---|---|---|---|
-| `off` (default) | — | no net device attached | No |
+| `off` (default) | — | no network backend (v86's default ne2k NIC stays, disconnected) | No |
 | `inbrowser` | `"inbrowser"` | `BroadcastChannel` between tabs/windows | No |
 | `fetch` | `"fetch"` | browser `fetch()` | No |
 | `wisp` | `"wisp://…"` / `"wisps://…"` | WISP proxy (TCP over WebSocket) | Yes — user-supplied |
 
-- **`off`** returns no `net_device`, so no NIC is attached. Every other mode is an explicit opt-in.
+- **`off`** returns no `net_device`, so no network backend is attached; v86 still emulates its default ne2k NIC, which has nowhere to send frames. Every other mode is an explicit opt-in.
 - **`inbrowser`** moves Ethernet frames between tabs over `BroadcastChannel`. No server, no external network.
 - **`fetch`** runs its TCP/IP stack in the page and performs HTTP through the browser's `fetch()`. It reaches CORS-friendly mirrors and the host's `localhost` (`http://<port>.external`); it needs no relay or proxy.
 - **`wisp`** is the only mode that needs a relay: it tunnels TCP through a user-supplied WISP proxy, which sees VM traffic. GhostShell accepts `ws://` and `wss://` and normalizes them to `wisp://` / `wisps://`; a missing or invalid URL throws instead of silently attaching a NIC.
-- Optional peer hints (`router_mac`, `router_ip`, `id`) pass through to the device when set.
+- Optional fetch/wisp peer hints (`router_mac`, `router_ip`) and the shared network namespace `id` pass through to the device when set.
 
 **How agent commands execute in the VM.**
 
@@ -200,7 +200,7 @@ const v86 = new V86({
   memory_size: 256 * 1024 * 1024,
   vga_memory_size: 8 * 1024 * 1024,
   filesystem: { base_url: "images/", base_fs: "alpine_fs.json" },
-  net_device: undefined,              // default `off`: no NIC attached
+  net_device: undefined,              // default `off`: no network backend attached
   disable_keyboard: true,
   disable_mouse: true,
 });
@@ -404,7 +404,7 @@ If parsing fails: append a corrective message and retry (max 2). If the model em
 
 **VM isolation.**
 
-- v86 runs in WASM with no host filesystem, no host network (NIC disabled in v0.1), no clipboard, no USB. Guest root is not host root.
+- v86 runs in WASM with no host filesystem, no host network (`off` default: no network backend; v86's default NIC stays disconnected), no clipboard, no USB. Guest root is not host root.
 - The VM is disposable: a corrupted image is restored from the IndexedDB snapshot or re-initialized.
 - Escape risk = a v86 emulator bug (CPU/virtio/9p). Mitigations: pin a known v86 version, minimize the attack surface (disable keyboard/mouse/speaker/clipboard), monitor v86 security issues, never expose host paths.
 - The agent runs as root in the VM; that is fine because the VM is the security boundary, not the guest user. If a future version supports unprivileged guests, run as a `sandbox` user.
@@ -732,7 +732,7 @@ LLM output
 | 5 | XSS via agent/VM output | Medium | Critical | `textContent` only; no `innerHTML`; CSP; optional sandboxed iframe |
 | 6 | v86 escape / emulator bug | Low | Critical | Pin v86; disable unused devices; no host access; monitor security issues |
 | 7 | Memory blowup on 8 GB machines | Medium | High | 1.5B default; 4k context; memory monitor; graceful OOM handling |
-| 8 | "No server" vs VM networking contradiction | High (scope) | Medium | Default `off` (no NIC) with a frozen image; `inbrowser`/`fetch` need no relay; `wisp` is opt-in with a user-supplied proxy and a warning |
+| 8 | "No server" vs VM networking contradiction | High (scope) | Medium | Default `off` (no network backend) with a frozen image; `inbrowser`/`fetch` need no relay; `wisp` is opt-in with a user-supplied proxy and a warning |
 | 9 | IndexedDB quota / eviction loses sessions | Medium | High | `storage.persist()`; usage warning; export/import; explicit "Save snapshot" |
 | 10 | Single-file size > 100 MB | Medium | Medium | Alpine image; slim build (CDN image); gzip/brotli; accept 60–85 MB |
 | 11 | Model license restrictions | Medium | Medium | Default to Apache-2.0 (Qwen2.5, SmolLM2); document licenses |
@@ -891,7 +891,7 @@ answer the user directly.
 Rules:
 - One tool call per turn.
 - Work in /root/workspace unless the user says otherwise.
-- The VM has no network. Do not try to download anything.
+- With the default `off` network mode the VM has no network; do not try to download anything unless the user enables a network mode.
 - Read files before editing them.
 - Prefer small, focused changes.
 - If a command fails, read the error and try a different approach.
@@ -935,7 +935,7 @@ mkdir -p /root/workspace
 | GGUF | llama.cpp model format; many quantizations (Q4_K_M, etc.) |
 | KV cache | Key/value attention cache; grows with context length |
 | COOP/COEP | Headers needed for `SharedArrayBuffer` / threaded WASM |
-| SLIRP | User-space TCP/IP stack; v86 implements it in the page and carries packets through its network adapter (`fetch`, `inbrowser`, or a WISP proxy) |
+| SLIRP | User-space TCP/IP stack; v86 implements one in the page and carries packets through its network adapter (`fetch`, `inbrowser`, or a WISP proxy) |
 | Hermes format | `<tool_call>{"name":…, "arguments":…}</tool_call>` convention |
 
 ---
