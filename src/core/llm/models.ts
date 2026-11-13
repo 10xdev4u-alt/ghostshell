@@ -60,6 +60,49 @@ export const ONNX_TARGETS: Readonly<Record<string, ONNXModelTarget>> = {
 };
 
 /**
+ * A verified MLC conversion of a registry model.
+ *
+ * WebLLM loads artifacts from MLC's own catalog rather than the HF repo the
+ * registry stores, so the mapping is explicit. The id must exist in the
+ * installed `@mlc-ai/web-llm` version's `prebuiltAppConfig.model_list`; the
+ * engine re-checks at load time and fails clearly when it does not.
+ */
+export interface WebLLMModelTarget {
+  /** MLC `model_id` of the quantized conversation build. */
+  modelId: string;
+}
+
+/**
+ * Verified WebLLM targets for the registry models.
+ *
+ * Both ids were confirmed present in `@mlc-ai/web-llm@0.2.88`'s
+ * `prebuiltAppConfig.model_list` on 2026-11-13. The engine looks the full
+ * record up by id at load time, so URLs and the model library stay owned by
+ * the pinned package version instead of being reconstructed here.
+ */
+export const WEBLLM_TARGETS: Readonly<Record<string, WebLLMModelTarget>> = {
+  'qwen2.5-1.5b': { modelId: 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC' },
+  'qwen2.5-3b': { modelId: 'Qwen2.5-3B-Instruct-q4f16_1-MLC' },
+};
+
+/**
+ * Resolve the MLC model id for a registry model.
+ *
+ * Throws when a model has no verified WebLLM target, so `load()` fails with
+ * a clear message instead of asking MLC for an unknown id.
+ */
+export function resolveWebLLMModelId(spec: ModelSpec): string {
+  const target = WEBLLM_TARGETS[spec.id];
+  if (!target) {
+    throw new Error(
+      `No WebLLM conversion for model "${spec.id}" (${spec.repo}). ` +
+        'Add a verified target to WEBLLM_TARGETS in src/core/llm/models.ts.',
+    );
+  }
+  return target.modelId;
+}
+
+/**
  * Resolve the Hugging Face repo for a given engine.
  *
  * The registry entries are GGUF (`…-Instruct-GGUF`). Transformers.js cannot
