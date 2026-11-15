@@ -334,8 +334,12 @@ export class WebLLMEngine implements LLMEngine {
   private loadGeneration = 0;
   /** Aborts the in-flight download when a newer load or `unload` starts. */
   private loadController: AbortController | null = null;
-  /** True while the active engine is being disposed for a replacement. */
-  private swapping = false;
+  /**
+   * Engines with an `unload()` call still in flight, refcounted per engine.
+   * Per-engine (not a single flag) so a stale replacement finishing its
+   * disposal cannot clear the guard for a newer engine still being torn down.
+   */
+  private readonly disposing = new Map<MLCEngine, number>();
 
   constructor(options: WebLLMEngineOptions = {}) {
     this.cache = options.cache ?? 'opfs';
@@ -438,12 +442,14 @@ export class WebLLMEngine implements LLMEngine {
 
     // A newer load (or an unload) started while this one was downloading:
     // release the engine this call built and leave the current state alone.
-    if (generation !== this.loadGeneration) {
+    if (generation !== this.loadGeneration || signal?.aborted) {
       try {
         await engine.unload();
       } catch {
         // Disposing a superseded engine is best-effort.
       }
+      // Aborting takes precedence over being replaced, as below.
+      if (signal?.aborted) throw abortError();
       return;
     }
 
@@ -451,14 +457,16 @@ export class WebLLMEngine implements LLMEngine {
     // reload leaves the old model loaded instead of leaking it.
     const previous = this.active?.engine;
     if (previous) {
-      // `generate()` must not run on an engine that is being disposed.
-      this.swapping = true;
+      // `generate()` must not run on an engine whose disposal is in flight.
+      this.disposing.set(previous, (this.disposing.get(previous) ?? 0) + 1);
       try {
         await previous.unload();
       } catch {
         // Disposing the old engine is best-effort; the new one is ready.
       } finally {
-        this.swapping = false;
+        const remaining = (this.disposing.get(previous) ?? 0) - 1;
+        if (remaining > 0) this.disposing.set(previous, remaining);
+        else this.disposing.delete(previous);
       }
     }
     // This load no longer owns the swap when a newer load (or an unload)
@@ -520,9 +528,9 @@ export class WebLLMEngine implements LLMEngine {
     if (!active || !this.loaded) {
       throw new Error('WebLLMEngine: model is not loaded');
     }
-    // The captured engine may be mid-disposal for a replacement; generating
-    // on it would race WebLLM's own teardown.
-    if (this.swapping) {
+    // The captured engine may have an unload() in flight for a replacement;
+    // generating on it would race WebLLM's own teardown.
+    if (this.disposing.has(active.engine)) {
       throw new Error('WebLLMEngine: model is being replaced');
     }
     if (signal.aborted) {

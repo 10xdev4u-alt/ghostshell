@@ -800,6 +800,122 @@ describe('WebLLMEngine', () => {
     expect(lastEngine().unload).not.toHaveBeenCalled();
   });
 
+  it('keeps generate blocked when a stale disposal finishes during a newer one', async () => {
+    const engine = new WebLLMEngine();
+    await engine.load(getModel('qwen2.5-1.5b'), () => {});
+    const initial = lastEngine();
+
+    const gates: Array<() => void> = [];
+    initial.unload.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          gates.push(resolve);
+        }),
+    );
+
+    const stale = engine.load(getModel('qwen2.5-3b'), () => {});
+    await vi.waitFor(() => expect(initial.unload).toHaveBeenCalledTimes(1));
+    const winner = engine.load(getModel('qwen2.5-3b'), () => {});
+    await vi.waitFor(() => expect(initial.unload).toHaveBeenCalledTimes(2));
+
+    // The second load wins and installs its engine.
+    gates[1]!();
+    await winner;
+    expect(engine.isLoaded()).toBe(true);
+    const installed = lastEngine();
+
+    // A third load replaces the winner and parks on the winner's disposal.
+    let releaseInstalledDisposal: (() => void) | undefined;
+    installed.unload.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseInstalledDisposal = resolve;
+        }),
+    );
+    const replacing = engine.load(getModel('qwen2.5-1.5b'), () => {});
+    await vi.waitFor(() => expect(installed.unload).toHaveBeenCalled());
+
+    // The stale load's disposal finishing must not lift the guard for the
+    // newer teardown.
+    gates[0]!();
+    await stale;
+
+    await expect(
+      engine.generate(
+        { messages: [userMessage()], maxTokens: 4 },
+        () => {},
+        new AbortController().signal,
+      ),
+    ).rejects.toThrow('being replaced');
+    expect(installed.chat.completions.create).not.toHaveBeenCalled();
+
+    releaseInstalledDisposal?.();
+    await replacing;
+    expect(engine.isLoaded()).toBe(true);
+  });
+
+  it('claims nothing while a superseded load waits to dispose its candidate', async () => {
+    const engine = new WebLLMEngine();
+    await engine.load(getModel('qwen2.5-1.5b'), () => {});
+    const initial = lastEngine();
+
+    let releasePredecessor: (() => void) | undefined;
+    const predecessorGate = new Promise<void>((resolve) => {
+      releasePredecessor = resolve;
+    });
+    initial.unload.mockImplementation(() => predecessorGate);
+
+    const stale = engine.load(getModel('qwen2.5-3b'), () => {});
+    await vi.waitFor(() => expect(initial.unload).toHaveBeenCalledTimes(1));
+
+    const controller = new AbortController();
+    const aborted = engine.load(
+      getModel('qwen2.5-3b'),
+      () => {},
+      controller.signal,
+    );
+    await vi.waitFor(() => expect(initial.unload).toHaveBeenCalledTimes(2));
+
+    // Park both candidates' disposals.
+    let releaseStaleCandidate: (() => void) | undefined;
+    let releaseAbortedCandidate: (() => void) | undefined;
+    MLCEngineMock.instances[1]!.unload.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseStaleCandidate = resolve;
+        }),
+    );
+    MLCEngineMock.instances[2]!.unload.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseAbortedCandidate = resolve;
+        }),
+    );
+
+    controller.abort();
+    releasePredecessor?.();
+
+    // The stale load clears the disposed predecessor before parking, so
+    // nothing claims it while both candidates are pending.
+    await vi.waitFor(() =>
+      expect(MLCEngineMock.instances[1]!.unload).toHaveBeenCalled(),
+    );
+    expect(engine.isLoaded()).toBe(false);
+    await expect(
+      engine.generate(
+        { messages: [userMessage()], maxTokens: 4 },
+        () => {},
+        new AbortController().signal,
+      ),
+    ).rejects.toThrow('not loaded');
+
+    releaseStaleCandidate?.();
+    await stale;
+    releaseAbortedCandidate?.();
+    await expect(aborted).rejects.toMatchObject({ name: 'AbortError' });
+    expect(engine.isLoaded()).toBe(false);
+  });
+
   it('aborts an in-flight load when unload runs', async () => {
     MLCEngineMock.reloadHook = () => new Promise<void>(() => {});
 
