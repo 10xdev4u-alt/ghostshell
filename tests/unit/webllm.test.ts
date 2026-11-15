@@ -356,6 +356,38 @@ describe('WebLLMEngine', () => {
     expect(engine.isLoaded()).toBe(false);
   });
 
+  it('stops reporting progress once the load is cancelled', async () => {
+    let captured: MockEngineInstance | null = null;
+    MLCEngineMock.reloadHook = (instance) => {
+      captured = instance;
+      return new Promise<void>(() => {});
+    };
+
+    const engine = new WebLLMEngine();
+    const controller = new AbortController();
+    const progress: ModelProgress[] = [];
+    const load = engine.load(
+      getModel('qwen2.5-1.5b'),
+      (p) => progress.push(p),
+      controller.signal,
+    );
+    await vi.waitFor(() => expect(captured).not.toBeNull());
+    expect(progress.length).toBeGreaterThan(0);
+    const countAfterStart = progress.length;
+
+    controller.abort();
+    await expect(load).rejects.toMatchObject({ name: 'AbortError' });
+
+    // A late progress callback from WebLLM must not reach the caller.
+    reportProgress(captured!, {
+      progress: 0.5,
+      timeElapsed: 1,
+      text: 'late',
+    });
+    expect(progress).toHaveLength(countAfterStart);
+    expect(engine.isLoaded()).toBe(false);
+  });
+
   it('rejects an already-aborted load before touching WebLLM', async () => {
     const controller = new AbortController();
     controller.abort();
@@ -535,6 +567,59 @@ describe('WebLLMEngine', () => {
     );
     expect(result.text).toBe('ok');
     expect(staleCandidate.chat.completions.create).not.toHaveBeenCalled();
+  });
+
+  it('rejects with AbortError when cancelled during teardown of the previous engine', async () => {
+    const engine = new WebLLMEngine();
+    await engine.load(getModel('qwen2.5-1.5b'), () => {});
+    const initial = lastEngine();
+
+    let releaseUnload: (() => void) | undefined;
+    const unloadGate = new Promise<void>((resolve) => {
+      releaseUnload = resolve;
+    });
+    initial.unload.mockImplementation(() => unloadGate);
+
+    const controller = new AbortController();
+    const pending = engine.load(
+      getModel('qwen2.5-3b'),
+      () => {},
+      controller.signal,
+    );
+    await vi.waitFor(() => expect(initial.unload).toHaveBeenCalled());
+
+    controller.abort();
+    releaseUnload?.();
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+
+    // The cancelled candidate is disposed and never swapped in.
+    expect(lastEngine().unload).toHaveBeenCalledTimes(1);
+    expect(engine.isLoaded()).toBe(false);
+  });
+
+  it('stays unloaded when unload runs while disposing the previous engine', async () => {
+    const engine = new WebLLMEngine();
+    await engine.load(getModel('qwen2.5-1.5b'), () => {});
+    const initial = lastEngine();
+
+    let releaseUnload: (() => void) | undefined;
+    const unloadGate = new Promise<void>((resolve) => {
+      releaseUnload = resolve;
+    });
+    initial.unload.mockImplementation(() => unloadGate);
+
+    const pending = engine.load(getModel('qwen2.5-3b'), () => {});
+    await vi.waitFor(() => expect(initial.unload).toHaveBeenCalledTimes(1));
+
+    // Teardown is in progress; unload() joins the same disposal.
+    const unloading = engine.unload();
+    await vi.waitFor(() => expect(initial.unload).toHaveBeenCalledTimes(2));
+    releaseUnload?.();
+    await Promise.all([pending, unloading]);
+
+    // The superseded candidate is released, not installed.
+    expect(engine.isLoaded()).toBe(false);
+    expect(lastEngine().unload).toHaveBeenCalledTimes(1);
   });
 
   it('aborts an in-flight load when unload runs', async () => {

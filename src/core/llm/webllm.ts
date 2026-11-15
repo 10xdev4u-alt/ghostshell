@@ -186,8 +186,10 @@ export async function verifyArtifact(
  * optional group keeps the same language: `rule ::= (a | b)?`.
  */
 function toXGrammar(grammar: string): string {
+  // `[^\S\n]` keeps the match horizontal so a multi-line rule body cannot be
+  // merged across lines.
   return grammar.replace(
-    /^(\s*[A-Za-z0-9_-]+\s*::=)\s*\|\s*(.+?)\s*$/gm,
+    /^([^\S\n]*[A-Za-z0-9_-]+[^\S\n]*::=)[^\S\n]*\|[^\S\n]*(.+?)[^\S\n]*$/gm,
     '$1($2)?',
   );
 }
@@ -454,6 +456,10 @@ export class WebLLMEngine implements LLMEngine {
       } catch {
         // Disposing the old engine is best-effort; the new one is ready.
       }
+      // The old engine is gone: stop claiming it is loaded so a guard below
+      // cannot leave `active` pointing at a disposed engine.
+      this.active = null;
+      this.loaded = false;
     }
     // A newer load (or an unload) can start while the old engine is being
     // disposed. If that happened, drop this candidate instead of clobbering
@@ -466,9 +472,21 @@ export class WebLLMEngine implements LLMEngine {
       }
       return;
     }
+    // The caller may also abort while the old engine is being disposed; the
+    // `LLMEngine` contract promises an `AbortError` in that case.
+    if (signal?.aborted) {
+      try {
+        await engine.unload();
+      } catch {
+        // Disposing the cancelled engine is best-effort.
+      }
+      throw abortError();
+    }
     this.active = { engine, modelId };
     this.loaded = true;
-    this.loadController = null;
+    if (this.loadController === controller) {
+      this.loadController = null;
+    }
 
     emit({
       phase: 'loading',
