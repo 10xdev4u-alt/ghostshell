@@ -408,8 +408,9 @@ export class WebLLMEngine implements LLMEngine {
       },
     });
 
+    const reloadPromise = engine.reload(modelId);
     try {
-      await raceWithAbort(engine.reload(modelId), abortSignal);
+      await raceWithAbort(reloadPromise, abortSignal);
     } catch (err) {
       // A canceled or failed load leaves a half-initialized engine behind;
       // release it before surfacing the error.
@@ -418,6 +419,14 @@ export class WebLLMEngine implements LLMEngine {
       } catch {
         // Unloading a partially-loaded engine is best-effort.
       }
+      // In 0.2.88 `unload()` clears the pipeline maps and only then aborts
+      // the reload controller, while `reloadInternal` registers its pipeline
+      // after the last signal-aware await. An early unload can therefore miss
+      // a pipeline that registers later; dispose again once the reload
+      // settles so that late registration cannot leak GPU memory.
+      void reloadPromise
+        .catch(() => {})
+        .finally(() => engine.unload().catch(() => {}));
       if (signal?.aborted) throw abortError();
       // Superseded by a newer load or by `unload()`: the caller's request was
       // replaced, not failed, so return without surfacing an error.
@@ -445,6 +454,17 @@ export class WebLLMEngine implements LLMEngine {
       } catch {
         // Disposing the old engine is best-effort; the new one is ready.
       }
+    }
+    // A newer load (or an unload) can start while the old engine is being
+    // disposed. If that happened, drop this candidate instead of clobbering
+    // the winner's `active` state.
+    if (generation !== this.loadGeneration) {
+      try {
+        await engine.unload();
+      } catch {
+        // Disposing a superseded engine is best-effort.
+      }
+      return;
     }
     this.active = { engine, modelId };
     this.loaded = true;

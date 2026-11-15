@@ -377,7 +377,10 @@ describe('WebLLMEngine', () => {
       'device lost',
     );
 
-    expect(lastEngine().unload).toHaveBeenCalledTimes(1);
+    // Once immediately, once more when the reload promise settles.
+    await vi.waitFor(() =>
+      expect(lastEngine().unload).toHaveBeenCalledTimes(2),
+    );
     expect(first.unload).not.toHaveBeenCalled();
     expect(engine.isLoaded()).toBe(true);
   });
@@ -395,7 +398,8 @@ describe('WebLLMEngine', () => {
       engine.load(getModel('qwen2.5-1.5b'), () => {}),
     ).rejects.toThrow('device lost');
 
-    expect(captured!.unload).toHaveBeenCalledTimes(1);
+    // The first release fails; the deferred settle-time release still runs.
+    await vi.waitFor(() => expect(captured!.unload).toHaveBeenCalledTimes(2));
     expect(engine.isLoaded()).toBe(false);
   });
 
@@ -448,9 +452,89 @@ describe('WebLLMEngine', () => {
     // Let the stale load finish: it must dispose itself and leave state alone.
     releaseFirst?.();
     await expect(first).resolves.toBeUndefined();
-    expect(MLCEngineMock.instances[0]!.unload).toHaveBeenCalledTimes(1);
+    // Once on cancellation, once when the reload promise settles.
+    await vi.waitFor(() =>
+      expect(MLCEngineMock.instances[0]!.unload).toHaveBeenCalledTimes(2),
+    );
     expect(lastEngine().unload).not.toHaveBeenCalled();
     expect(engine.isLoaded()).toBe(true);
+  });
+
+  it('disposes again when the reload settles after cancellation', async () => {
+    let releaseReload: (() => void) | undefined;
+    MLCEngineMock.reloadHook = () =>
+      new Promise<void>((resolve) => {
+        releaseReload = resolve;
+      });
+
+    const engine = new WebLLMEngine();
+    const controller = new AbortController();
+    const load = engine.load(
+      getModel('qwen2.5-1.5b'),
+      () => {},
+      controller.signal,
+    );
+    const assertion = expect(load).rejects.toMatchObject({
+      name: 'AbortError',
+    });
+    await vi.waitFor(() => expect(releaseReload).toBeDefined());
+    controller.abort();
+    await assertion;
+
+    // Cancellation unloads immediately...
+    expect(lastEngine().unload).toHaveBeenCalledTimes(1);
+
+    // ...and a reload that settles late must not leave resources behind.
+    releaseReload?.();
+    await vi.waitFor(() =>
+      expect(lastEngine().unload).toHaveBeenCalledTimes(2),
+    );
+    expect(engine.isLoaded()).toBe(false);
+  });
+
+  it('does not clobber a newer load while disposing the previous engine', async () => {
+    const engine = new WebLLMEngine();
+    await engine.load(getModel('qwen2.5-1.5b'), () => {});
+    const initial = lastEngine();
+
+    let releaseUnload: (() => void) | undefined;
+    const unloadGate = new Promise<void>((resolve) => {
+      releaseUnload = resolve;
+    });
+    initial.unload.mockImplementation(() => unloadGate);
+
+    const stale = engine.load(getModel('qwen2.5-3b'), () => {});
+    await vi.waitFor(() => expect(initial.unload).toHaveBeenCalled());
+
+    // Both loads now wait on the same blocked disposal of `initial`.
+    const winner = engine.load(getModel('qwen2.5-3b'), () => {});
+    await vi.waitFor(() => expect(initial.unload).toHaveBeenCalledTimes(2));
+    releaseUnload?.();
+    await Promise.all([stale, winner]);
+
+    // The stale candidate is disposed rather than swapped in.
+    const staleCandidate = MLCEngineMock.instances[1]!;
+    expect(staleCandidate.unload).toHaveBeenCalledTimes(1);
+
+    // The winner owns the active engine.
+    expect(engine.isLoaded()).toBe(true);
+    const active = lastEngine();
+    expect(active).toBe(MLCEngineMock.instances[2]);
+    active.chat.completions.create.mockResolvedValue(
+      streamOf([
+        completionChunk(null),
+        completionChunk('ok'),
+        completionChunk(''),
+        usageChunk(1),
+      ]),
+    );
+    const result = await engine.generate(
+      { messages: [userMessage()], maxTokens: 4 },
+      () => {},
+      new AbortController().signal,
+    );
+    expect(result.text).toBe('ok');
+    expect(staleCandidate.chat.completions.create).not.toHaveBeenCalled();
   });
 
   it('aborts an in-flight load when unload runs', async () => {
