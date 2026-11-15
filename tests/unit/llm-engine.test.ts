@@ -64,6 +64,32 @@ vi.mock('@huggingface/transformers', () => ({
   TextStreamer: TextStreamerMock,
 }));
 
+/**
+ * The real WebLLM engine is mocked so the factory tests can observe the
+ * options they pass without loading the GPU runtime.
+ */
+const { WebLLMEngineMock } = vi.hoisted(() => {
+  class WebLLMEngineMock {
+    static readonly instances: WebLLMEngineMock[] = [];
+    id = 'webllm';
+    kind = 'webgpu' as const;
+    constructor(readonly options: Record<string, unknown> = {}) {
+      WebLLMEngineMock.instances.push(this);
+    }
+    isLoaded(): boolean {
+      return false;
+    }
+    async load(): Promise<void> {}
+    async unload(): Promise<void> {}
+    async generate(): Promise<never> {
+      throw new Error('not implemented');
+    }
+  }
+  return { WebLLMEngineMock };
+});
+
+vi.mock('@/core/llm/webllm.js', () => ({ WebLLMEngine: WebLLMEngineMock }));
+
 import type { LoadProgress, ModelProgress } from '@/types/index.js';
 import { Template } from '@huggingface/jinja';
 import { parseToolCalls } from '@/core/agent/parser.js';
@@ -78,6 +104,8 @@ import {
   recommendModel,
   resolveModelDtype,
   resolveModelRepo,
+  resolveWebLLMModelId,
+  WEBLLM_TARGETS,
 } from '@/core/llm/models.js';
 
 interface StreamerLike {
@@ -855,7 +883,10 @@ describe('TransformersEngine', () => {
 });
 
 describe('createEngine', () => {
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    WebLLMEngineMock.instances.length = 0;
+  });
 
   it('creates a transformers engine on the detected backend', () => {
     vi.stubGlobal('navigator', {});
@@ -870,10 +901,32 @@ describe('createEngine', () => {
     expect(engine.kind).toBe('wasm');
   });
 
-  it('creates a webllm engine', () => {
+  it('creates a webllm engine with default options', () => {
     const engine = createEngine('webllm');
     expect(engine.id).toBe('webllm');
     expect(engine.kind).toBe('webgpu');
+    expect(WebLLMEngineMock.instances[0]!.options).toEqual({});
+  });
+
+  it('passes cache and integrity through to the webllm engine', () => {
+    const integrity = { config: 'sha256-abc' };
+    createEngine('webllm', { cache: 'indexeddb', integrity });
+    expect(WebLLMEngineMock.instances.at(-1)!.options).toEqual({ cache: 'indexeddb', integrity });
+  });
+
+  it("maps the transformers 'browser' cache onto WebLLM's 'cache'", () => {
+    createEngine('webllm', { cache: 'browser' });
+    expect(WebLLMEngineMock.instances.at(-1)!.options).toEqual({ cache: 'cache' });
+  });
+
+  it('ignores wasm-only options for the webgpu engine', () => {
+    createEngine('webllm', {
+      spec: getModel('qwen2.5-1.5b'),
+      device: 'wasm',
+      dtype: 'q8',
+      revision: 'main',
+    });
+    expect(WebLLMEngineMock.instances.at(-1)!.options).toEqual({});
   });
 });
 
@@ -917,6 +970,28 @@ describe('models', () => {
       expect(resolveModelRepo(spec, 'transformers')).toBe(target!.repo);
       expect(resolveModelDtype(spec)).toBe(target!.dtype);
     }
+  });
+
+  it('maps every registry model to a verified WebLLM target', () => {
+    // Verified against `@mlc-ai/web-llm@0.2.88`'s prebuiltAppConfig on
+    // 2026-11-13; the engine re-checks the id at load time.
+    expect(WEBLLM_TARGETS['qwen2.5-1.5b']).toEqual({
+      modelId: 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC',
+    });
+    expect(WEBLLM_TARGETS['qwen2.5-3b']).toEqual({
+      modelId: 'Qwen2.5-3B-Instruct-q4f16_1-MLC',
+    });
+
+    for (const spec of listModels()) {
+      const target = WEBLLM_TARGETS[spec.id];
+      expect(target, `missing WebLLM target for ${spec.id}`).toBeDefined();
+      expect(resolveWebLLMModelId(spec)).toBe(target!.modelId);
+    }
+  });
+
+  it('throws a clear error for a model with no WebLLM conversion', () => {
+    const spec = { ...getModel('qwen2.5-1.5b'), id: 'not-in-registry' };
+    expect(() => resolveWebLLMModelId(spec)).toThrow(/No WebLLM conversion/);
   });
 
   it('resolves the recommended 3B model to a loadable ONNX repo', () => {

@@ -1,3 +1,4 @@
+import type { ModelIntegrity } from '@mlc-ai/web-llm';
 import type { BackendKind, LLMEngine, ModelSpec } from '@/types/index.js';
 import { TransformersEngine, type TransformersEngineOptions } from './transformers.js';
 import { supportsBackend } from './models.js';
@@ -28,6 +29,11 @@ export interface CreateEngineOptions extends TransformersEngineOptions {
    * does not support the requested backend.
    */
   spec?: ModelSpec;
+  /**
+   * SRI hashes for the WebLLM model artifacts. Ignored by
+   * `TransformersEngine`, which verifies weights itself.
+   */
+  integrity?: ModelIntegrity;
 }
 
 export function createEngine(kind: EngineKind, options: CreateEngineOptions = {}): LLMEngine {
@@ -39,9 +45,21 @@ export function createEngine(kind: EngineKind, options: CreateEngineOptions = {}
         device: options.device ?? detectBackendFor(spec),
       });
     }
-    case 'webllm':
-      // WebLLM is a v1.0 fast path; the class exists but is not implemented yet.
-      return new WebLLMEngine();
+    case 'webllm': {
+      // The engines share option names but not vocabulary: `browser` is
+      // Transformers.js' name for the Cache API, which WebLLM calls `cache`.
+      // `device`/`dtype`/`revision`/`spec` describe the WASM runtime and do
+      // not apply to a WebGPU engine.
+      const { cache, integrity } = options;
+      return new WebLLMEngine({
+        ...(cache === 'browser'
+          ? { cache: 'cache' as const }
+          : cache !== undefined
+            ? { cache }
+            : {}),
+        ...(integrity !== undefined ? { integrity } : {}),
+      });
+    }
   }
 }
 
