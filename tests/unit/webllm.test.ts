@@ -77,6 +77,7 @@ import { getModel } from '@/core/llm/models.js';
 import {
   WebLLMEngine,
   toChatMessages,
+  toXGrammar,
   verifyArtifact,
 } from '@/core/llm/webllm.js';
 
@@ -695,6 +696,110 @@ describe('WebLLMEngine', () => {
     expect(engine.isLoaded()).toBe(false);
   });
 
+  it('rejects an aborted load even when it was also superseded', async () => {
+    const engine = new WebLLMEngine();
+    await engine.load(getModel('qwen2.5-1.5b'), () => {});
+    const initial = lastEngine();
+
+    let releaseUnload: (() => void) | undefined;
+    const unloadGate = new Promise<void>((resolve) => {
+      releaseUnload = resolve;
+    });
+    initial.unload.mockImplementation(() => unloadGate);
+
+    const controller = new AbortController();
+    const stale = engine.load(
+      getModel('qwen2.5-3b'),
+      () => {},
+      controller.signal,
+    );
+    await vi.waitFor(() => expect(initial.unload).toHaveBeenCalledTimes(1));
+
+    const winner = engine.load(getModel('qwen2.5-3b'), () => {});
+    await vi.waitFor(() => expect(initial.unload).toHaveBeenCalledTimes(2));
+
+    controller.abort();
+    releaseUnload?.();
+    // Abortion takes precedence over replacement.
+    await expect(stale).rejects.toMatchObject({ name: 'AbortError' });
+    await winner;
+
+    expect(engine.isLoaded()).toBe(true);
+    expect(lastEngine()).toBe(MLCEngineMock.instances[2]);
+    expect(MLCEngineMock.instances[1]!.unload).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects generate while the previous engine is being disposed', async () => {
+    const engine = new WebLLMEngine();
+    await engine.load(getModel('qwen2.5-1.5b'), () => {});
+    const initial = lastEngine();
+
+    let releaseUnload: (() => void) | undefined;
+    const unloadGate = new Promise<void>((resolve) => {
+      releaseUnload = resolve;
+    });
+    initial.unload.mockImplementation(() => unloadGate);
+
+    const replacing = engine.load(getModel('qwen2.5-3b'), () => {});
+    await vi.waitFor(() => expect(initial.unload).toHaveBeenCalled());
+
+    // The old engine is mid-disposal: generating on it would race teardown.
+    await expect(
+      engine.generate(
+        { messages: [userMessage()], maxTokens: 4 },
+        () => {},
+        new AbortController().signal,
+      ),
+    ).rejects.toThrow('being replaced');
+
+    releaseUnload?.();
+    await replacing;
+    expect(engine.isLoaded()).toBe(true);
+  });
+
+  it('does not clear a winner that installs while the aborted load disposes', async () => {
+    const engine = new WebLLMEngine();
+    await engine.load(getModel('qwen2.5-1.5b'), () => {});
+    const initial = lastEngine();
+
+    let releasePredecessor: (() => void) | undefined;
+    const predecessorGate = new Promise<void>((resolve) => {
+      releasePredecessor = resolve;
+    });
+    initial.unload.mockImplementation(() => predecessorGate);
+
+    const controller = new AbortController();
+    const aborted = engine.load(
+      getModel('qwen2.5-3b'),
+      () => {},
+      controller.signal,
+    );
+    await vi.waitFor(() => expect(initial.unload).toHaveBeenCalled());
+
+    // Park the aborted load on its own candidate disposal.
+    let releaseCandidate: (() => void) | undefined;
+    lastEngine().unload.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseCandidate = resolve;
+        }),
+    );
+    controller.abort();
+    releasePredecessor?.();
+    await vi.waitFor(() => expect(lastEngine().unload).toHaveBeenCalled());
+
+    // While the aborted load is parked, a newer load installs itself.
+    const winner = engine.load(getModel('qwen2.5-3b'), () => {});
+    await winner;
+    expect(engine.isLoaded()).toBe(true);
+
+    // Resuming the aborted load must not wipe the winner.
+    releaseCandidate?.();
+    await expect(aborted).rejects.toMatchObject({ name: 'AbortError' });
+    expect(engine.isLoaded()).toBe(true);
+    expect(lastEngine().unload).not.toHaveBeenCalled();
+  });
+
   it('aborts an in-flight load when unload runs', async () => {
     MLCEngineMock.reloadHook = () => new Promise<void>(() => {});
 
@@ -980,6 +1085,17 @@ describe('WebLLMEngine', () => {
       // optional group so the constraint survives the round trip.
       grammar: 'space ::=(" ")?\nroot ::= "x"',
     });
+  });
+
+  it('translates a leading empty alternative continued on the next line', () => {
+    expect(toXGrammar('space ::= |\n  " " | "\\n"\nroot ::= space\n')).toBe(
+      'space ::=(" " | "\\n")?\nroot ::= space\n',
+    );
+  });
+
+  it('leaves rules without a leading empty alternative alone', () => {
+    const grammar = 'root ::= "x" | "y"\nspace ::= " "\n';
+    expect(toXGrammar(grammar)).toBe(grammar);
   });
 
   it('omits the response format when no usable grammar is supplied', async () => {

@@ -185,7 +185,7 @@ export async function verifyArtifact(
  * `buildToolCallGrammar` emits for its whitespace rule. Rewriting it as an
  * optional group keeps the same language: `rule ::= (a | b)?`.
  */
-function toXGrammar(grammar: string): string {
+export function toXGrammar(grammar: string): string {
   return grammar.replace(
     /^(\s*[A-Za-z0-9_-]+\s*::=)\s*\|\s*(.+?)\s*$/gm,
     '$1($2)?',
@@ -334,6 +334,8 @@ export class WebLLMEngine implements LLMEngine {
   private loadGeneration = 0;
   /** Aborts the in-flight download when a newer load or `unload` starts. */
   private loadController: AbortController | null = null;
+  /** True while the active engine is being disposed for a replacement. */
+  private swapping = false;
 
   constructor(options: WebLLMEngineOptions = {}) {
     this.cache = options.cache ?? 'opfs';
@@ -449,37 +451,36 @@ export class WebLLMEngine implements LLMEngine {
     // reload leaves the old model loaded instead of leaking it.
     const previous = this.active?.engine;
     if (previous) {
+      // `generate()` must not run on an engine that is being disposed.
+      this.swapping = true;
       try {
         await previous.unload();
       } catch {
         // Disposing the old engine is best-effort; the new one is ready.
+      } finally {
+        this.swapping = false;
       }
     }
-    // A newer load (or an unload) can start while the old engine is being
-    // disposed. If that happened, drop this candidate instead of clobbering
-    // the winner's `active` state — the winner may have installed itself
-    // before our disposal settled. The newer owner is responsible for the
-    // state from here on.
-    if (generation !== this.loadGeneration) {
+    // This load no longer owns the swap when a newer load (or an unload)
+    // started while the old engine was being disposed, or when the caller's
+    // signal aborted. Either way: stop claiming the disposed predecessor if
+    // nobody has replaced it yet, release this candidate, and leave the
+    // winner in place — never touch `active`/`loaded` after awaiting the
+    // candidate below, because a winner can install itself in that window.
+    if (generation !== this.loadGeneration || signal?.aborted) {
+      if (this.active?.engine === previous) {
+        this.active = null;
+        this.loaded = false;
+      }
       try {
         await engine.unload();
       } catch {
         // Disposing a superseded engine is best-effort.
       }
+      // Aborting takes precedence over being replaced: the caller asked for
+      // cancellation and the `LLMEngine` contract promises an AbortError.
+      if (signal?.aborted) throw abortError();
       return;
-    }
-    // The caller may also abort while the old engine is being disposed; the
-    // `LLMEngine` contract promises an `AbortError` in that case. The
-    // predecessor is already gone, so stop claiming it is loaded.
-    if (signal?.aborted) {
-      try {
-        await engine.unload();
-      } catch {
-        // Disposing the cancelled engine is best-effort.
-      }
-      this.active = null;
-      this.loaded = false;
-      throw abortError();
     }
     this.active = { engine, modelId };
     this.loaded = true;
@@ -518,6 +519,11 @@ export class WebLLMEngine implements LLMEngine {
     const active = this.active;
     if (!active || !this.loaded) {
       throw new Error('WebLLMEngine: model is not loaded');
+    }
+    // The captured engine may be mid-disposal for a replacement; generating
+    // on it would race WebLLM's own teardown.
+    if (this.swapping) {
+      throw new Error('WebLLMEngine: model is being replaced');
     }
     if (signal.aborted) {
       return { text: '', tokens: 0, finishReason: 'aborted' };
