@@ -622,6 +622,79 @@ describe('WebLLMEngine', () => {
     expect(lastEngine().unload).toHaveBeenCalledTimes(1);
   });
 
+  it('does not clobber a winner whose teardown settles first', async () => {
+    const engine = new WebLLMEngine();
+    await engine.load(getModel('qwen2.5-1.5b'), () => {});
+    const initial = lastEngine();
+
+    let releaseStale: (() => void) | undefined;
+    let releaseWinner: (() => void) | undefined;
+    initial.unload
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            releaseStale = resolve;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            releaseWinner = resolve;
+          }),
+      );
+
+    const stale = engine.load(getModel('qwen2.5-3b'), () => {});
+    await vi.waitFor(() => expect(initial.unload).toHaveBeenCalledTimes(1));
+    const winner = engine.load(getModel('qwen2.5-3b'), () => {});
+    await vi.waitFor(() => expect(initial.unload).toHaveBeenCalledTimes(2));
+
+    // The winner's disposal settles first and it installs itself...
+    releaseWinner?.();
+    await winner;
+    expect(engine.isLoaded()).toBe(true);
+
+    // ...then the stale load resumes: it must leave the winner alone.
+    releaseStale?.();
+    await stale;
+    expect(engine.isLoaded()).toBe(true);
+    expect(lastEngine().unload).not.toHaveBeenCalled();
+    expect(MLCEngineMock.instances[1]!.unload).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves nothing loaded when the newest load aborts during teardown', async () => {
+    const engine = new WebLLMEngine();
+    await engine.load(getModel('qwen2.5-1.5b'), () => {});
+    const initial = lastEngine();
+
+    let releaseUnload: (() => void) | undefined;
+    const unloadGate = new Promise<void>((resolve) => {
+      releaseUnload = resolve;
+    });
+    initial.unload.mockImplementation(() => unloadGate);
+
+    const stale = engine.load(getModel('qwen2.5-3b'), () => {});
+    await vi.waitFor(() => expect(initial.unload).toHaveBeenCalledTimes(1));
+
+    const controller = new AbortController();
+    const aborted = engine.load(
+      getModel('qwen2.5-3b'),
+      () => {},
+      controller.signal,
+    );
+    await vi.waitFor(() => expect(initial.unload).toHaveBeenCalledTimes(2));
+
+    controller.abort();
+    releaseUnload?.();
+    await stale;
+    await expect(aborted).rejects.toMatchObject({ name: 'AbortError' });
+
+    // Both candidates are disposed and the disposed predecessor is not
+    // claimed as loaded.
+    expect(MLCEngineMock.instances[1]!.unload).toHaveBeenCalledTimes(1);
+    expect(MLCEngineMock.instances[2]!.unload).toHaveBeenCalledTimes(1);
+    expect(engine.isLoaded()).toBe(false);
+  });
+
   it('aborts an in-flight load when unload runs', async () => {
     MLCEngineMock.reloadHook = () => new Promise<void>(() => {});
 
