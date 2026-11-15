@@ -1,7 +1,7 @@
 import type { ModelIntegrity } from '@mlc-ai/web-llm';
 import type { BackendKind, LLMEngine, ModelSpec } from '@/types/index.js';
 import { TransformersEngine, type TransformersEngineOptions } from './transformers.js';
-import { supportsBackend } from './models.js';
+import { hasWebLLMConversion, supportsBackend } from './models.js';
 import { WebLLMEngine } from './webllm.js';
 
 /**
@@ -74,6 +74,18 @@ export function detectBackend(): BackendKind {
     return 'webgpu';
   }
   return 'wasm';
+}
+
+/**
+ * Pick the engine kind for a model.
+ *
+ * WebLLM is the fast path only when the host exposes WebGPU and the model has
+ * a verified MLC conversion; every other case runs Transformers.js, which is
+ * the universal WASM fallback.
+ */
+export function selectEngineKind(spec: ModelSpec | undefined): EngineKind {
+  if (!spec || !hasWebLLMConversion(spec)) return 'transformers';
+  return detectBackend() === 'webgpu' ? 'webllm' : 'transformers';
 }
 
 /** Pick the default device for a model, falling back to WASM when unsupported. */
