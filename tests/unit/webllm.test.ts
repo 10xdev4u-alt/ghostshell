@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
  * The real `@mlc-ai/web-llm` package is never loaded: WebGPU initialization
@@ -176,6 +176,16 @@ function userMessage(content = 'hi'): Message {
   return { id: 'm1', role: 'user', content, timestamp: 0 };
 }
 
+function toolCallBlock(name: string, args: unknown): string {
+  return `<tool_call>\n${JSON.stringify({ name, arguments: args })}\n</tool_call>`;
+}
+
+function toolResponseTurn(...contents: string[]): string {
+  return contents
+    .map((content) => `<tool_response>\n${content}\n</tool_response>`)
+    .join('\n');
+}
+
 async function loadedEngine(
   options?: ConstructorParameters<typeof WebLLMEngine>[0],
 ) {
@@ -189,6 +199,12 @@ beforeEach(() => {
   MLCEngineMock.reloadHook = null;
   isValidSRIMock.mockClear();
   verifyIntegrityMock.mockClear();
+  // OPFS is treated as present unless a test overrides this stub.
+  vi.stubGlobal('navigator', { storage: { getDirectory: vi.fn() } });
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
 });
 
 describe('WebLLMEngine', () => {
@@ -259,6 +275,22 @@ describe('WebLLMEngine', () => {
       'Qwen2.5-3B-Instruct-q4f16_1-MLC',
     );
     expect(appConfig().model_list[0]!.integrity).toBeUndefined();
+  });
+
+  it('falls back to the Cache API when OPFS is unavailable', async () => {
+    vi.stubGlobal('navigator', {});
+    const engine = new WebLLMEngine();
+    await engine.load(getModel('qwen2.5-1.5b'), () => {});
+
+    expect(appConfig().cacheBackend).toBe('cache');
+  });
+
+  it('keeps an explicitly requested backend even without OPFS', async () => {
+    vi.stubGlobal('navigator', {});
+    const engine = new WebLLMEngine({ cache: 'indexeddb' });
+    await engine.load(getModel('qwen2.5-1.5b'), () => {});
+
+    expect(appConfig().cacheBackend).toBe('indexeddb');
   });
 
   it('reports an indeterminate percent when the spec has no size', async () => {
@@ -388,6 +420,52 @@ describe('WebLLMEngine', () => {
       engine.load(getModel('qwen2.5-3b'), () => {}),
     ).resolves.toBeUndefined();
     expect(engine.isLoaded()).toBe(true);
+  });
+
+  it('releases a superseded load instead of swapping it in', async () => {
+    let releaseFirst: (() => void) | undefined;
+    MLCEngineMock.reloadHook = (instance) => {
+      if (MLCEngineMock.instances.length === 1) {
+        return new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        });
+      }
+      return Promise.resolve();
+    };
+
+    const engine = new WebLLMEngine();
+    const first = engine.load(getModel('qwen2.5-1.5b'), () => {});
+    await vi.waitFor(() => expect(MLCEngineMock.instances).toHaveLength(1));
+    const second = engine.load(getModel('qwen2.5-3b'), () => {});
+    await second;
+
+    // The newer load owns the engine now.
+    expect(engine.isLoaded()).toBe(true);
+    expect(lastEngine().reload).toHaveBeenCalledWith(
+      'Qwen2.5-3B-Instruct-q4f16_1-MLC',
+    );
+
+    // Let the stale load finish: it must dispose itself and leave state alone.
+    releaseFirst?.();
+    await expect(first).resolves.toBeUndefined();
+    expect(MLCEngineMock.instances[0]!.unload).toHaveBeenCalledTimes(1);
+    expect(lastEngine().unload).not.toHaveBeenCalled();
+    expect(engine.isLoaded()).toBe(true);
+  });
+
+  it('aborts an in-flight load when unload runs', async () => {
+    MLCEngineMock.reloadHook = () => new Promise<void>(() => {});
+
+    const engine = new WebLLMEngine();
+    const pending = engine.load(getModel('qwen2.5-1.5b'), () => {});
+    await vi.waitFor(() => expect(MLCEngineMock.instances).toHaveLength(1));
+    const instance = lastEngine();
+
+    await engine.unload();
+
+    await expect(pending).resolves.toBeUndefined();
+    expect(instance.unload).toHaveBeenCalledTimes(1);
+    expect(engine.isLoaded()).toBe(false);
   });
 
   it('fails clearly when the pinned catalog lacks the resolved id', async () => {
@@ -593,46 +671,96 @@ describe('WebLLMEngine', () => {
     expect(result.finishReason).toBe('length');
   });
 
-  it('passes stop sequences to WebLLM and strips them from the result', async () => {
+  it('strips at the earliest stop sequence and drops empty ones', async () => {
     const engine = await loadedEngine();
     const instance = lastEngine();
     instance.chat.completions.create.mockResolvedValue(
       streamOf([
-        completionChunk('Hello'),
-        completionChunk(' world'),
+        completionChunk('Hi'),
+        completionChunk('\nThere END'),
         completionChunk(null, 'stop'),
       ]),
     );
 
     const result = await engine.generate(
-      { messages: [userMessage()], stop: [' world'] },
+      { messages: [userMessage()], stop: ['END', '\n', ''] },
+      () => {},
+      new AbortController().signal,
+    );
+
+    // '\n' occurs before 'END'; array order must not decide the cut.
+    expect(result.text).toBe('Hi');
+    expect(result.finishReason).toBe('stop');
+    const request = instance.chat.completions.create.mock
+      .calls[0]![0] as Record<string, unknown>;
+    expect(request['stop']).toEqual(['END', '\n']);
+  });
+
+  it('keeps text intact when only an empty stop string is supplied', async () => {
+    const engine = await loadedEngine();
+    const instance = lastEngine();
+    instance.chat.completions.create.mockResolvedValue(
+      streamOf([completionChunk('Hello'), usageChunk(1)]),
+    );
+
+    const result = await engine.generate(
+      { messages: [userMessage()], stop: [''] },
       () => {},
       new AbortController().signal,
     );
 
     expect(result.text).toBe('Hello');
-    expect(result.finishReason).toBe('stop');
     const request = instance.chat.completions.create.mock
       .calls[0]![0] as Record<string, unknown>;
-    expect(request['stop']).toEqual([' world']);
+    expect(request['stop']).toBeUndefined();
   });
 
-  it('accepts a grammar without forwarding it as a constraint', async () => {
+  it('forwards a grammar as a grammar response-format constraint', async () => {
     const engine = await loadedEngine();
     const instance = lastEngine();
     instance.chat.completions.create.mockResolvedValue(
-      streamOf([completionChunk('x'), usageChunk(1)]),
+      streamOf([completionChunk('{"a":1}'), usageChunk(1)]),
     );
 
+    const gbnf = 'space ::= | " "\nroot ::= "x"';
     await engine.generate(
-      { messages: [userMessage()], grammar: 'root ::= "x"' },
+      { messages: [userMessage()], grammar: gbnf },
       () => {},
       new AbortController().signal,
     );
 
     const request = instance.chat.completions.create.mock
       .calls[0]![0] as Record<string, unknown>;
-    expect(request['response_format']).toBeUndefined();
+    expect(request['response_format']).toEqual({
+      type: 'grammar',
+      // A leading empty alternative is llama.cpp syntax that XGrammar (the
+      // library WebLLM compiles grammars with) rejects; rewrite it as an
+      // optional group so the constraint survives the round trip.
+      grammar: 'space ::=(" ")?\nroot ::= "x"',
+    });
+  });
+
+  it('omits the response format when no usable grammar is supplied', async () => {
+    const engine = await loadedEngine();
+    const instance = lastEngine();
+
+    for (const generateRequest of [
+      { messages: [userMessage()] },
+      { messages: [userMessage()], grammar: '' },
+    ]) {
+      instance.chat.completions.create.mockClear();
+      instance.chat.completions.create.mockResolvedValue(
+        streamOf([completionChunk('x'), usageChunk(1)]),
+      );
+      await engine.generate(
+        generateRequest,
+        () => {},
+        new AbortController().signal,
+      );
+      const request = instance.chat.completions.create.mock
+        .calls[0]![0] as Record<string, unknown>;
+      expect(request['response_format']).toBeUndefined();
+    }
   });
 
   it('interrupts the engine and reports aborted when the signal fires mid-stream', async () => {
@@ -644,13 +772,17 @@ describe('WebLLMEngine', () => {
     instance.interruptGenerate.mockImplementation(async () => {
       endStream?.();
     });
-    instance.chat.completions.create.mockImplementation(async function* () {
-      yield completionChunk('Hello');
-      await new Promise<void>((resolve) => {
-        endStream = resolve;
-      });
-      yield completionChunk(' world');
-    });
+    instance.chat.completions.create.mockImplementation(() =>
+      Promise.resolve(
+        (async function* paused(): AsyncIterable<ChatCompletionChunk> {
+          yield completionChunk('Hello');
+          await new Promise<void>((resolve) => {
+            endStream = resolve;
+          });
+          yield completionChunk(' world');
+        })(),
+      ),
+    );
 
     const tokens: string[] = [];
     const pending = engine.generate(
@@ -672,10 +804,14 @@ describe('WebLLMEngine', () => {
   it('propagates stream errors instead of reporting an error finish reason', async () => {
     const engine = await loadedEngine();
     const instance = lastEngine();
-    instance.chat.completions.create.mockImplementation(async function* () {
-      yield completionChunk('Hello');
-      throw new Error('shader exploded');
-    });
+    instance.chat.completions.create.mockImplementation(() =>
+      Promise.resolve(
+        (async function* failing(): AsyncIterable<ChatCompletionChunk> {
+          yield completionChunk('Hello');
+          throw new Error('shader exploded');
+        })(),
+      ),
+    );
 
     await expect(
       engine.generate(
@@ -701,6 +837,53 @@ describe('WebLLMEngine', () => {
       ),
     ).rejects.toThrow('webgpu unavailable');
   });
+
+  it('settles promptly when aborted while the request is pending', async () => {
+    const engine = await loadedEngine();
+    const instance = lastEngine();
+    // A request that never settles: only the abort race can resolve generate.
+    instance.chat.completions.create.mockReturnValue(new Promise(() => {}));
+    const controller = new AbortController();
+
+    const pending = engine.generate(
+      { messages: [userMessage()] },
+      () => {},
+      controller.signal,
+    );
+    controller.abort();
+
+    const result = await pending;
+    expect(result).toEqual({ text: '', tokens: 0, finishReason: 'aborted' });
+    expect(instance.interruptGenerate).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects an empty conversation before touching WebLLM', async () => {
+    const engine = await loadedEngine();
+    const instance = lastEngine();
+
+    await expect(
+      engine.generate({ messages: [] }, () => {}, new AbortController().signal),
+    ).rejects.toThrow(/at least one message/);
+    expect(instance.chat.completions.create).not.toHaveBeenCalled();
+  });
+
+  it('rejects a trailing assistant turn before touching WebLLM', async () => {
+    const engine = await loadedEngine();
+    const instance = lastEngine();
+
+    await expect(
+      engine.generate(
+        {
+          messages: [
+            { id: '1', role: 'assistant', content: 'hi', timestamp: 0 },
+          ],
+        },
+        () => {},
+        new AbortController().signal,
+      ),
+    ).rejects.toThrow(/last message must be a user or tool turn/);
+    expect(instance.chat.completions.create).not.toHaveBeenCalled();
+  });
 });
 
 describe('toChatMessages', () => {
@@ -715,12 +898,12 @@ describe('toChatMessages', () => {
     ]);
   });
 
-  it('converts assistant tool calls with JSON-stringified arguments', () => {
+  it('renders assistant tool calls as content blocks Qwen parses back', () => {
     const messages: Message[] = [
       {
         id: '1',
         role: 'assistant',
-        content: '',
+        content: 'Checking.',
         timestamp: 0,
         toolCalls: [
           { id: 'call-1', name: 'list_dir', arguments: { path: '/' }, raw: '' },
@@ -730,56 +913,68 @@ describe('toChatMessages', () => {
     expect(toChatMessages(messages)).toEqual([
       {
         role: 'assistant',
-        content: '',
-        tool_calls: [
-          {
-            id: 'call-1',
-            type: 'function',
-            function: { name: 'list_dir', arguments: '{"path":"/"}' },
-          },
-        ],
+        content: `Checking.\n${toolCallBlock('list_dir', { path: '/' })}`,
       },
     ]);
   });
 
-  it('pairs assistant tool results with their call ids by position', () => {
+  it('merges consecutive tool results into one user turn', () => {
     const messages: Message[] = [
+      userMessage('hi'),
       {
-        id: '1',
+        id: '2',
         role: 'assistant',
         content: '',
         timestamp: 0,
         toolCalls: [{ id: 'call-1', name: 'list_dir', arguments: {}, raw: '' }],
-        toolResults: [
-          { ok: true, content: 'a.txt' },
-          { ok: true, content: 'b.txt' },
-        ],
       },
+      { id: '3', role: 'tool', content: 'a.txt', timestamp: 0 },
+      { id: '4', role: 'tool', content: 'b.txt', timestamp: 0 },
     ];
     expect(toChatMessages(messages)).toEqual([
-      {
-        role: 'assistant',
-        content: '',
-        tool_calls: [
-          {
-            id: 'call-1',
-            type: 'function',
-            function: { name: 'list_dir', arguments: '{}' },
-          },
-        ],
-      },
-      { role: 'tool', content: 'a.txt', tool_call_id: 'call-1' },
-      { role: 'tool', content: 'b.txt', tool_call_id: 'ghostshell-tool-1' },
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: toolCallBlock('list_dir', {}) },
+      { role: 'user', content: toolResponseTurn('a.txt', 'b.txt') },
     ]);
   });
 
-  it('gives standalone tool messages a synthetic id', () => {
+  it('starts a fresh user turn for tool results after another turn', () => {
     const messages: Message[] = [
-      { id: '1', role: 'tool', content: 'output', timestamp: 0 },
+      { id: '1', role: 'tool', content: 'first', timestamp: 0 },
+      { id: '2', role: 'user', content: 'next question', timestamp: 0 },
+      { id: '3', role: 'tool', content: 'second', timestamp: 0 },
     ];
     expect(toChatMessages(messages)).toEqual([
-      { role: 'tool', content: 'output', tool_call_id: 'ghostshell-tool-1' },
+      { role: 'user', content: toolResponseTurn('first') },
+      { role: 'user', content: 'next question' },
+      { role: 'user', content: toolResponseTurn('second') },
     ]);
+  });
+
+  it('never emits a tool-role message, which qwen2 templates reject', () => {
+    const rendered = toChatMessages([
+      userMessage('hi'),
+      {
+        id: '2',
+        role: 'assistant',
+        content: '',
+        timestamp: 0,
+        toolCalls: [{ id: 'c', name: 'ping', arguments: {}, raw: '' }],
+      },
+      { id: '3', role: 'tool', content: 'pong', timestamp: 0 },
+    ]);
+
+    expect(rendered.map((message) => message.role)).toEqual([
+      'user',
+      'assistant',
+      'user',
+    ]);
+    // WebLLM's conversation builder supports exactly these roles.
+    expect(
+      rendered.every((message) =>
+        ['system', 'user', 'assistant'].includes(message.role),
+      ),
+    ).toBe(true);
   });
 
   it('serializes missing arguments as an empty object', () => {
@@ -801,14 +996,7 @@ describe('toChatMessages', () => {
     expect(toChatMessages(messages)).toEqual([
       {
         role: 'assistant',
-        content: '',
-        tool_calls: [
-          {
-            id: 'c',
-            type: 'function',
-            function: { name: 'ping', arguments: '{}' },
-          },
-        ],
+        content: toolCallBlock('ping', {}),
       },
     ]);
   });

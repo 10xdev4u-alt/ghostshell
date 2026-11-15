@@ -1,6 +1,5 @@
 import type {
   AppConfig,
-  ChatCompletionAssistantMessageParam,
   ChatCompletionChunk,
   ChatCompletionFinishReason,
   ChatCompletionMessageParam,
@@ -15,6 +14,7 @@ import type {
   Message,
   ModelProgress,
   ModelSpec,
+  ToolCall,
 } from '@/types/index.js';
 import { resolveWebLLMModelId } from './models.js';
 
@@ -36,8 +36,9 @@ type WebLLMCacheBackend = 'opfs' | 'cache' | 'indexeddb';
 export interface WebLLMEngineOptions {
   /**
    * Persistent model cache. Defaults to `'opfs'`, which is larger and more
-   * durable than the Cache API; WebLLM falls back internally when a backend
-   * is unavailable.
+   * durable than the Cache API. When OPFS is unavailable (older browsers,
+   * non-secure contexts) the engine falls back to the Cache API itself —
+   * WebLLM only does that for its `cross-origin` backend.
    */
   cache?: WebLLMCacheBackend;
   /**
@@ -55,8 +56,23 @@ function abortError(): DOMException {
   return new DOMException('The operation was aborted.', 'AbortError');
 }
 
-function throwIfAborted(signal: AbortSignal): void {
-  if (signal.aborted) throw abortError();
+/**
+ * True when the Origin Private File System is usable in this context.
+ *
+ * WebLLM's OPFS store throws on construction when `navigator.storage` is
+ * missing, and it does not fall back to the Cache API on its own, so the
+ * engine performs the same feature check Transformers.js uses.
+ */
+function hasOPFS(): boolean {
+  if (typeof navigator === 'undefined' || !('storage' in navigator))
+    return false;
+  const storage = navigator.storage as unknown as { getDirectory?: unknown };
+  return typeof storage.getDirectory === 'function';
+}
+
+/** Pick a usable cache backend, downgrading OPFS when the platform lacks it. */
+function resolveCacheBackend(cache: WebLLMCacheBackend): WebLLMCacheBackend {
+  return cache === 'opfs' && !hasOPFS() ? 'cache' : cache;
 }
 
 /**
@@ -162,63 +178,95 @@ export async function verifyArtifact(
 }
 
 /**
+ * Translate GhostShell's llama.cpp-style GBNF into the EBNF dialect XGrammar
+ * (WebLLM's grammar backend) accepts.
+ *
+ * XGrammar rejects a leading empty alternative (`rule ::= | a | b`), which
+ * `buildToolCallGrammar` emits for its whitespace rule. Rewriting it as an
+ * optional group keeps the same language: `rule ::= (a | b)?`.
+ */
+function toXGrammar(grammar: string): string {
+  return grammar.replace(
+    /^(\s*[A-Za-z0-9_-]+\s*::=)\s*\|\s*(.+?)\s*$/gm,
+    '$1($2)?',
+  );
+}
+
+/** Render one tool call in the Hermes syntax Qwen's template emits. */
+function formatToolCall(call: ToolCall): string {
+  return `<tool_call>\n${JSON.stringify({
+    name: call.name,
+    arguments: call.arguments ?? {},
+  })}\n</tool_call>`;
+}
+
+/**
  * Convert GhostShell messages to OpenAI chat messages.
  *
- * WebLLM implements the OpenAI protocol, including tool calling: assistant
- * `toolCalls` become `tool_calls` with JSON-stringified arguments, and the
- * tool results attached to an assistant turn become `tool` messages paired
- * with their call by position. Standalone `tool` messages have no id to pair
- * with, so they get a synthetic one — WebLLM only requires a non-empty
- * string.
+ * The shipped MLC models use the `qwen2` conversation template, whose role
+ * table defines only `user` and `assistant`: a literal `{role:'tool'}` message
+ * makes WebLLM throw "Role is not supported: tool". Qwen's own chat template
+ * renders tool turns itself, so this mirrors that:
+ *   - an assistant tool call is the assistant content plus
+ *     `<tool_call>{…}</tool_call>` blocks — the same syntax the parser strips
+ *     back out of generated text (`src/core/agent/parser.ts`);
+ *   - a tool result becomes a `user` turn wrapping the output in
+ *     `<tool_response>…</tool_response>`, and consecutive results share one
+ *     turn exactly as the Jinja template groups them.
+ * WebLLM ignores `tool_calls` on its own, so the blocks must ride in content.
  */
 export function toChatMessages(
   messages: Message[],
 ): ChatCompletionMessageParam[] {
   const chat: ChatCompletionMessageParam[] = [];
-  let syntheticId = 0;
+  let lastWasToolResult = false;
+
+  const appendToolResults = (contents: string[]): void => {
+    if (contents.length === 0) {
+      lastWasToolResult = false;
+      return;
+    }
+    const block = contents.map(
+      (content) => `<tool_response>\n${content}\n</tool_response>`,
+    );
+    const previous = chat.at(-1);
+    if (previous?.role === 'user' && lastWasToolResult) {
+      // A run of tool results shares one user turn, matching Qwen's Jinja
+      // template.
+      chat[chat.length - 1] = {
+        ...previous,
+        content: `${String(previous.content)}\n${block.join('\n')}`,
+      };
+    } else {
+      chat.push({ role: 'user', content: block.join('\n') });
+    }
+    lastWasToolResult = true;
+  };
 
   for (const message of messages) {
-    if (message.role === 'system' || message.role === 'user') {
-      chat.push({ role: message.role, content: message.content });
-      continue;
-    }
-
-    if (message.role === 'tool') {
-      syntheticId += 1;
-      chat.push({
-        role: 'tool',
-        content: message.content,
-        tool_call_id: `ghostshell-tool-${syntheticId}`,
-      });
-      continue;
-    }
-
-    const toolCalls = message.toolCalls ?? [];
-    const assistant: ChatCompletionAssistantMessageParam = {
-      role: 'assistant',
-      content: message.content,
-    };
-    if (toolCalls.length > 0) {
-      assistant.tool_calls = toolCalls.map((call) => ({
-        id: call.id,
-        type: 'function',
-        function: {
-          name: call.name,
-          // A missing argument object still has to round-trip as valid JSON.
-          arguments: JSON.stringify(call.arguments) ?? '{}',
-        },
-      }));
-    }
-    chat.push(assistant);
-
-    const results = message.toolResults ?? [];
-    for (let index = 0; index < results.length; index += 1) {
-      const call = toolCalls[index];
-      chat.push({
-        role: 'tool',
-        content: results[index]?.content ?? '',
-        tool_call_id: call ? call.id : `ghostshell-tool-${(syntheticId += 1)}`,
-      });
+    switch (message.role) {
+      case 'system':
+      case 'user': {
+        chat.push({ role: message.role, content: message.content });
+        lastWasToolResult = false;
+        break;
+      }
+      case 'assistant': {
+        const blocks = (message.toolCalls ?? []).map(formatToolCall);
+        const content = [message.content, ...blocks]
+          .filter((part) => part.length > 0)
+          .join('\n');
+        chat.push({ role: 'assistant', content });
+        lastWasToolResult = false;
+        appendToolResults(
+          (message.toolResults ?? []).map((result) => result.content),
+        );
+        break;
+      }
+      case 'tool': {
+        appendToolResults([message.content]);
+        break;
+      }
     }
   }
 
@@ -250,6 +298,22 @@ function toFinishReason(
   }
 }
 
+/**
+ * Cut `text` at whichever stop sequence occurs first.
+ *
+ * WebLLM honors `stop` itself, so this only cleans up output that ignored it.
+ * Picking the earliest match matters when several stops are configured:
+ * array order alone would leave an earlier stop word visible in the text.
+ */
+function stripAtEarliestStop(text: string, stop: string[]): string {
+  let cut = -1;
+  for (const candidate of stop) {
+    const index = text.indexOf(candidate);
+    if (index !== -1 && (cut === -1 || index < cut)) cut = index;
+  }
+  return cut === -1 ? text : text.slice(0, cut);
+}
+
 interface ActiveEngine {
   engine: MLCEngine;
   modelId: string;
@@ -263,6 +327,13 @@ export class WebLLMEngine implements LLMEngine {
   private readonly integrity: ModelIntegrity | undefined;
   private active: ActiveEngine | null = null;
   private loaded = false;
+  /**
+   * Incremented by every `load`/`unload` so an in-flight load that has been
+   * superseded releases its engine instead of swapping it in afterwards.
+   */
+  private loadGeneration = 0;
+  /** Aborts the in-flight download when a newer load or `unload` starts. */
+  private loadController: AbortController | null = null;
 
   constructor(options: WebLLMEngineOptions = {}) {
     this.cache = options.cache ?? 'opfs';
@@ -278,8 +349,16 @@ export class WebLLMEngine implements LLMEngine {
     onProgress: (p: ModelProgress) => void,
     signal?: AbortSignal,
   ): Promise<void> {
-    const abortSignal = signal ?? new AbortController().signal;
-    throwIfAborted(abortSignal);
+    if (signal?.aborted) throw abortError();
+    // Supersede any in-flight load: downloading a model nobody is waiting for
+    // wastes bandwidth and leaves a half-initialized engine behind.
+    this.loadController?.abort();
+    const controller = new AbortController();
+    this.loadController = controller;
+    const generation = ++this.loadGeneration;
+    const abortSignal = signal
+      ? AbortSignal.any([signal, controller.signal])
+      : controller.signal;
 
     // Resolve before importing the GPU runtime: an unmapped model should fail
     // with a clear registry error rather than a WebLLM lookup error.
@@ -306,7 +385,7 @@ export class WebLLMEngine implements LLMEngine {
       model_list: [
         this.integrity ? { ...record, integrity: this.integrity } : record,
       ],
-      cacheBackend: this.cache,
+      cacheBackend: resolveCacheBackend(this.cache),
     };
 
     // Progress after a cancel is meaningless; drop it so the UI does not flash
@@ -339,8 +418,22 @@ export class WebLLMEngine implements LLMEngine {
       } catch {
         // Unloading a partially-loaded engine is best-effort.
       }
-      if (abortSignal.aborted) throw abortError();
+      if (signal?.aborted) throw abortError();
+      // Superseded by a newer load or by `unload()`: the caller's request was
+      // replaced, not failed, so return without surfacing an error.
+      if (generation !== this.loadGeneration) return;
       throw err;
+    }
+
+    // A newer load (or an unload) started while this one was downloading:
+    // release the engine this call built and leave the current state alone.
+    if (generation !== this.loadGeneration) {
+      try {
+        await engine.unload();
+      } catch {
+        // Disposing a superseded engine is best-effort.
+      }
+      return;
     }
 
     // Dispose the engine being replaced before swapping it out, so a failed
@@ -355,6 +448,7 @@ export class WebLLMEngine implements LLMEngine {
     }
     this.active = { engine, modelId };
     this.loaded = true;
+    this.loadController = null;
 
     emit({
       phase: 'loading',
@@ -366,6 +460,9 @@ export class WebLLMEngine implements LLMEngine {
   }
 
   async unload(): Promise<void> {
+    this.loadGeneration += 1;
+    this.loadController?.abort();
+    this.loadController = null;
     const active = this.active;
     this.active = null;
     this.loaded = false;
@@ -391,9 +488,25 @@ export class WebLLMEngine implements LLMEngine {
       return { text: '', tokens: 0, finishReason: 'aborted' };
     }
 
+    // WebLLM reads `messages.at(-1).role` and then requires that role to be
+    // `user` or `tool`; fail here instead of leaking its TypeError or
+    // MessageOrderError. `tool` results are rendered as user turns above, so
+    // both are accepted.
+    if (req.messages.length === 0) {
+      throw new Error('WebLLMEngine: at least one message is required');
+    }
+    const lastRole = req.messages[req.messages.length - 1]?.role;
+    if (lastRole !== 'user' && lastRole !== 'tool') {
+      throw new Error(
+        `WebLLMEngine: the last message must be a user or tool turn, got ${String(lastRole)}`,
+      );
+    }
+
     const maxTokens = req.maxTokens ?? DEFAULT_MAX_NEW_TOKENS;
     const temperature = req.temperature ?? DEFAULT_TEMPERATURE;
-    const stop = req.stop ?? [];
+    // An empty string matches at index 0 and would truncate every response,
+    // so drop it before the value reaches WebLLM.
+    const stop = (req.stop ?? []).filter((candidate) => candidate.length > 0);
 
     // Generation has no byte stream to measure; tokens against the turn cap
     // are the honest analogue. `total` is the cap, not a predicted length.
@@ -409,11 +522,17 @@ export class WebLLMEngine implements LLMEngine {
     };
     report(0);
 
-    // `req.grammar` carries a GBNF string. WebLLM's constrained decoding
-    // takes `response_format` with a JSON Schema, not a GBNF grammar, and
-    // translating between the two would silently change the constraint. The
-    // option is accepted so callers can treat engines uniformly, but it is
-    // not forwarded.
+    // `req.grammar` carries the GBNF/EBNF string from the agent loop. WebLLM
+    // supports grammar-constrained decoding natively through
+    // `response_format: { type: 'grammar' }`, so forward it rather than drop
+    // the constraint; an empty string is not a usable grammar.
+    const responseFormat =
+      req.grammar !== undefined && req.grammar.length > 0
+        ? {
+            type: 'grammar' as const,
+            grammar: toXGrammar(req.grammar),
+          }
+        : undefined;
 
     const onAbort = (): void => {
       // Cancelling the underlying stream lets `for await` settle promptly.
@@ -430,15 +549,23 @@ export class WebLLMEngine implements LLMEngine {
     try {
       // `include_usage` makes WebLLM report exact completion token counts in
       // a trailing chunk; the content-delta count is only the fallback.
-      const stream = await active.engine.chat.completions.create({
-        model: active.modelId,
-        messages: toChatMessages(req.messages),
-        stream: true,
-        temperature,
-        max_tokens: maxTokens,
-        ...(stop.length > 0 ? { stop } : {}),
-        stream_options: { include_usage: true },
-      });
+      //
+      // Racing the request against the signal matters: if WebLLM queues the
+      // call behind a lock and never settles, `interruptGenerate()` alone
+      // would leave this promise pending forever.
+      const stream = await raceWithAbort(
+        active.engine.chat.completions.create({
+          model: active.modelId,
+          messages: toChatMessages(req.messages),
+          stream: true,
+          temperature,
+          max_tokens: maxTokens,
+          ...(stop.length > 0 ? { stop } : {}),
+          ...(responseFormat ? { response_format: responseFormat } : {}),
+          stream_options: { include_usage: true },
+        }),
+        signal,
+      );
 
       for await (const chunk of stream) {
         if (signal.aborted) break;
@@ -475,14 +602,7 @@ export class WebLLMEngine implements LLMEngine {
 
     if (signal.aborted) rawFinishReason = 'abort';
 
-    let text = chunks.join('');
-    if (stop.length > 0) {
-      const hit = stop.find((candidate) => text.includes(candidate));
-      if (hit !== undefined) {
-        const index = text.indexOf(hit);
-        text = index === -1 ? text : text.slice(0, index);
-      }
-    }
+    const text = stripAtEarliestStop(chunks.join(''), stop);
 
     return {
       text,
