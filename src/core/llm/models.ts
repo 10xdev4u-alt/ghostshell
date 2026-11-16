@@ -56,7 +56,10 @@ export interface ONNXModelTarget {
  */
 export const ONNX_TARGETS: Readonly<Record<string, ONNXModelTarget>> = {
   'qwen2.5-1.5b': { repo: 'onnx-community/Qwen2.5-1.5B-Instruct', dtype: 'q8' },
-  'qwen2.5-3b': { repo: 'opalitestudios/Qwen2.5-3B-Instruct-ONNX', dtype: 'q4f16' },
+  'qwen2.5-3b': {
+    repo: 'opalitestudios/Qwen2.5-3B-Instruct-ONNX',
+    dtype: 'q4f16',
+  },
 };
 
 /**
@@ -100,6 +103,16 @@ export function resolveWebLLMModelId(spec: ModelSpec): string {
     );
   }
   return target.modelId;
+}
+
+/**
+ * True when the model has a verified WebLLM conversion.
+ *
+ * Engine selection uses this instead of `resolveWebLLMModelId`, which throws,
+ * so choosing a kind can never fail for an unmapped model.
+ */
+export function hasWebLLMConversion(spec: ModelSpec): boolean {
+  return Object.hasOwn(WEBLLM_TARGETS, spec.id);
 }
 
 /**

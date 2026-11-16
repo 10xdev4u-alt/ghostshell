@@ -53,6 +53,9 @@ export const BOOT_EGRESS_ALLOWLIST: EgressAllowlist = [
   { host: 'hf.co' },
   // ONNX runtime artifacts fetched by @huggingface/transformers.
   { host: 'cdn.jsdelivr.net' },
+  // WebLLM's prebuilt MLC wasm runtime libraries. Path-scoped to mlc-ai's
+  // binary-mlc-llm-libs: other GitHub raw content stays blocked in lockdown.
+  { urlPrefix: 'https://raw.githubusercontent.com/mlc-ai/binary-mlc-llm-libs/' },
   // The single-file build loads the inlined v86 WASM from a data: URL.
   { urlPrefix: 'data:' },
 ];

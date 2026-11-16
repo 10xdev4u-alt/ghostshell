@@ -79,6 +79,8 @@ space ::= | " " | "\n" [ \t]{0,20}
  * The generated grammar:
  *   - enumerates every tool name, so the model cannot invent one;
  *   - emits `arguments` as a JSON object;
+ *   - quotes every key, tool name, and enum value with its JSON double quotes,
+ *     because GBNF string delimiters are syntax rather than output;
  *   - types each known property (string / number / boolean / array / object)
  *     and inlines `enum` values as literals;
  *   - requires the schema's `required` properties (in order) while still
@@ -134,14 +136,14 @@ export function buildToolCallGrammar(tools: GrammarTool[]): string {
     lines.push(`args-${toolRule} ::= "{" space ${objectBody} "}" space`);
 
     lines.push(
-      `call-${toolRule} ::= "{" space "name" space ":" space ${gbnfLiteral(tool.name)} space "," space "arguments" space ":" space args-${toolRule} space "}" space`,
+      `call-${toolRule} ::= "{" space ${gbnfLiteral('name')} space ":" space ${gbnfLiteral(tool.name)} space "," space ${gbnfLiteral('arguments')} space ":" space args-${toolRule} space "}" space`,
     );
     callAlternatives.push(`call-${toolRule}`);
   }
 
   lines.push(`call ::= ${callAlternatives.join(' | ')}`);
   lines.push(
-    'tool-calls ::= "{" space "tool_calls" space ":" space "[" space call ("," space call)* "]" space "}" space',
+    `tool-calls ::= "{" space ${gbnfLiteral('tool_calls')} space ":" space "[" space call ("," space call)* "]" space "}" space`,
   );
   // A final answer is plain text between <answer> tags. `answer-char` excludes
   // `<` so the closing tag is never consumed as content, and excludes `</` so
@@ -319,46 +321,28 @@ class SlugAllocator {
 }
 
 /**
- * Quote a string as a GBNF terminal.
+ * Quote a string as a GBNF terminal whose matched text is valid JSON.
  *
- * The `char` rule in `COMMON_RULES` excludes `"` and `\` (which must be
- * escaped) plus `\x00-\x1F` and `\x7F`. The named escapes cover the common
- * whitespace controls; every other control character uses `\uXXXX`.
+ * Two layers of escaping are applied, in order:
+ *   1. `JSON.stringify` produces the JSON text: it adds the surrounding
+ *      quotes and escapes quotes, backslashes, and control characters as
+ *      JSON escapes (a newline becomes the two characters `\` and `n`).
+ *   2. That JSON text is escaped for GBNF, whose terminals consume backslash
+ *      escapes: every `\` and `"` in the JSON text becomes `\\` and `\"`, so
+ *      the matched text is the JSON text verbatim.
+ *
+ * Skipping either layer corrupts the output. Applying only the GBNF escape
+ * made a value like `a"b` match `"a"b"`, which is not valid JSON; applying
+ * only the JSON escape leaves GBNF's `\n` as a raw newline inside the matched
+ * string.
  */
 function gbnfLiteral(value: string): string {
+  const json = JSON.stringify(value);
   let escaped = '';
-  for (const char of value) {
-    switch (char) {
-      case '\\':
-        escaped += '\\\\';
-        break;
-      case '"':
-        escaped += '\\"';
-        break;
-      case '\b':
-        escaped += '\\b';
-        break;
-      case '\f':
-        escaped += '\\f';
-        break;
-      case '\n':
-        escaped += '\\n';
-        break;
-      case '\r':
-        escaped += '\\r';
-        break;
-      case '\t':
-        escaped += '\\t';
-        break;
-      default: {
-        const code = char.charCodeAt(0);
-        if (code < 0x20 || code === 0x7f) {
-          escaped += `\\u${code.toString(16).padStart(4, '0')}`;
-        } else {
-          escaped += char;
-        }
-      }
-    }
+  for (const char of json) {
+    if (char === '\\') escaped += '\\\\';
+    else if (char === '"') escaped += '\\"';
+    else escaped += char;
   }
   return `"${escaped}"`;
 }

@@ -32,9 +32,26 @@ function referencedRules(grammar: string): string[] {
 }
 
 function ruleBody(grammar: string, rule: string): string | undefined {
-  const prefix = `${rule} ::=`;
+  const prefix = `${rule} ::=`
   const line = grammar.split('\n').find((candidate) => candidate.trim().startsWith(prefix));
   return line?.trim().slice(prefix.length).trim();
+}
+
+/**
+ * The GBNF terminal whose matched text is the JSON encoding of `value`.
+ *
+ * Two layers are required, in order: `JSON.stringify` produces the JSON text
+ * (surrounding quotes plus JSON escapes), then that text is escaped for GBNF
+ * so its backslash escapes survive into the matched output rather than being
+ * consumed by the grammar parser.
+ */
+function jsonQuotedTerminal(value: string): string {
+  let out = '"';
+  for (const char of JSON.stringify(value)) {
+    if (char === '\\' || char === '"') out += '\\';
+    out += char;
+  }
+  return `${out}"`;
 }
 
 describe('buildToolCallGrammar', () => {
@@ -45,18 +62,18 @@ describe('buildToolCallGrammar', () => {
     expect(grammar).toContain('call ::=');
   });
 
-  it('includes every tool name and property key', () => {
+  it('includes every tool name and property key as a JSON-quoted terminal', () => {
     const grammar = buildToolCallGrammar(tools);
     for (const tool of tools) {
-      expect(grammar).toContain(`"${tool.name}"`);
+      expect(grammar).toContain(jsonQuotedTerminal(tool.name));
     }
-    expect(grammar).toContain('"command"');
-    expect(grammar).toContain('"timeout_ms"');
-    expect(grammar).toContain('"path"');
-    expect(grammar).toContain('"pattern"');
+    expect(grammar).toContain(jsonQuotedTerminal('command'));
+    expect(grammar).toContain(jsonQuotedTerminal('timeout_ms'));
+    expect(grammar).toContain(jsonQuotedTerminal('path'));
+    expect(grammar).toContain(jsonQuotedTerminal('pattern'));
   });
 
-  it('inlines enum values as literals', () => {
+  it('inlines enum values as JSON-quoted literals', () => {
     const grammar = buildToolCallGrammar([
       {
         name: 'pick',
@@ -67,9 +84,70 @@ describe('buildToolCallGrammar', () => {
         },
       },
     ]);
-    expect(grammar).toContain('"red"');
-    expect(grammar).toContain('"blue"');
+    expect(grammar).toContain(jsonQuotedTerminal('red'));
+    expect(grammar).toContain(jsonQuotedTerminal('blue'));
     expect(grammar).toContain('args-pick-color-kv');
+  });
+
+  it('emits JSON-quoted keys, tool names, and envelope tokens', () => {
+    const grammar = buildToolCallGrammar([
+      {
+        name: 'bash',
+        parameters: {
+          type: 'object',
+          properties: { command: { type: 'string' } },
+          required: ['command'],
+        },
+      },
+    ]);
+
+    // GBNF string delimiters are syntax, not content: a bare `"name"` terminal
+    // matches the characters name, which is invalid JSON. The emitted text has
+    // to be `{"tool_calls":[{"name":"bash","arguments":{"command":"ls"}}]}`.
+    expect(ruleBody(grammar, 'tool-calls')).toBe(
+      '"{" space "\\"tool_calls\\"" space ":" space "[" space call ("," space call)* "]" space "}" space',
+    );
+    expect(ruleBody(grammar, 'call-bash')).toBe(
+      '"{" space "\\"name\\"" space ":" space "\\"bash\\"" space "," space "\\"arguments\\"" space ":" space args-bash space "}" space',
+    );
+    expect(ruleBody(grammar, 'args-bash-command-kv')).toBe(
+      '"\\"command\\"" space ":" space string',
+    );
+  });
+
+  it('emits no unquoted JSON token in the tool-call rules', () => {
+    const grammar = buildToolCallGrammar(tools);
+    const jsonRules = grammar
+      .split('\n')
+      .filter((line) => /^(tool-calls|call-|args-)[a-z0-9-]* ::=/.test(line.trim()));
+    const punctuation = new Set(['"{"', '"}"', '"["', '"]"', '":"', '","']);
+    const literals = jsonRules.join('\n').match(/"(?:[^"\\]|\\.)*"/g) ?? [];
+    expect(literals.length).toBeGreaterThan(0);
+    for (const literal of literals) {
+      if (punctuation.has(literal)) continue;
+      expect(
+        literal.startsWith('"\\"') && literal.endsWith('\\""'),
+        `unquoted JSON token: ${literal}`,
+      ).toBe(true);
+    }
+  });
+
+  it('serializes values to JSON before escaping the GBNF terminal', () => {
+    // `JSON.stringify('a"b')` is `"a\"b"`. The terminal has to carry that
+    // backslash through GBNF's own escapes, so the matched text stays valid
+    // JSON instead of collapsing to `"a"b"`.
+    const quoted = buildToolCallGrammar([
+      { name: 'a"b', parameters: { type: 'object', properties: {} } },
+    ]);
+    expect(quoted).toContain('"\\"a\\\\\\"b\\""');
+
+    // A newline is serialized as the two characters `\` + `n`; doubling the
+    // backslash keeps it as JSON escape text instead of a raw newline inside
+    // the matched string.
+    const newline = buildToolCallGrammar([
+      { name: 'line\nbreak', parameters: { type: 'object', properties: {} } },
+    ]);
+    expect(newline).toContain('"\\"line\\\\nbreak\\""');
   });
 
   it('escapes control characters in GBNF literals', () => {
@@ -95,14 +173,14 @@ describe('buildToolCallGrammar', () => {
       },
     ]);
 
-    expect(grammar).toContain('"line\\nbreak"');
-    expect(grammar).toContain('"tab\\tkey"');
-    expect(grammar).toContain('"carriage\\rreturn"');
-    expect(grammar).toContain('"back\\bspace"');
-    expect(grammar).toContain('"form\\ffeed"');
-    expect(grammar).toContain('"bell\\u0007"');
-    expect(grammar).toContain('"nul\\u0000"');
-    expect(grammar).toContain('"unit\\u001fsep"');
+    expect(grammar).toContain(jsonQuotedTerminal('line\nbreak'));
+    expect(grammar).toContain(jsonQuotedTerminal('tab\tkey'));
+    expect(grammar).toContain(jsonQuotedTerminal('carriage\rreturn'));
+    expect(grammar).toContain(jsonQuotedTerminal('back\bspace'));
+    expect(grammar).toContain(jsonQuotedTerminal('form\ffeed'));
+    expect(grammar).toContain(jsonQuotedTerminal('bell\u0007'));
+    expect(grammar).toContain(jsonQuotedTerminal('nul\u0000'));
+    expect(grammar).toContain(jsonQuotedTerminal('unit\u001fsep'));
 
     // No raw control characters survive inside an emitted string literal.
     const literals = grammar.match(/"(?:[^"\\\n]|\\.)*"/g) ?? [];
@@ -145,7 +223,7 @@ describe('buildToolCallGrammar', () => {
     const grammar = buildToolCallGrammar(tools);
 
     expect(ruleBody(grammar, 'root')).toBe('tool-calls | answer');
-    expect(ruleBody(grammar, 'tool-calls')).toContain('"tool_calls"');
+    expect(ruleBody(grammar, 'tool-calls')).toContain(jsonQuotedTerminal('tool_calls'));
     expect(ruleBody(grammar, 'answer')).toBe('"<answer>" answer-char* "</answer>" space');
     expect(ruleBody(grammar, 'answer-char')).toBe('[^<] | "<" [^/]');
 
@@ -168,8 +246,8 @@ describe('buildToolCallGrammar', () => {
     for (const ref of referencedRules(grammar)) {
       expect(defined.has(ref), `undefined rule: ${ref}`).toBe(true);
     }
-    expect(grammar).toContain('"read-file"');
-    expect(grammar).toContain('"read_file"');
+    expect(grammar).toContain(jsonQuotedTerminal('read-file'));
+    expect(grammar).toContain(jsonQuotedTerminal('read_file'));
   });
 
   it('disambiguates property names that slug to the same rule name', () => {

@@ -96,9 +96,15 @@ import { parseToolCalls } from '@/core/agent/parser.js';
 import { TransformersEngine, clearTransformersCache } from '@/core/llm/transformers.js';
 import { createModelProgress } from '@/ui/progress.js';
 import { FakeElement, findByClass, installFakeDocument } from './helpers/dom.js';
-import { createEngine, detectBackend, supportsBackend } from '@/core/llm/engine.js';
+import {
+  createEngine,
+  detectBackend,
+  selectEngineKind,
+  supportsBackend,
+} from '@/core/llm/engine.js';
 import {
   getModel,
+  hasWebLLMConversion,
   listModels,
   ONNX_TARGETS,
   recommendModel,
@@ -204,13 +210,12 @@ const QWEN25_CHAT_TEMPLATE = String.raw`{%- if tools %}
 function makeQwenTokenizer() {
   const template = new Template(QWEN25_CHAT_TEMPLATE);
   return {
-    apply_chat_template: vi.fn(
-      (chat: ChatMessageLike[], options?: ChatTemplateOptions) =>
-        template.render({
-          messages: chat,
-          tools: options?.tools ?? null,
-          add_generation_prompt: options?.add_generation_prompt ?? false,
-        }),
+    apply_chat_template: vi.fn((chat: ChatMessageLike[], options?: ChatTemplateOptions) =>
+      template.render({
+        messages: chat,
+        tools: options?.tools ?? null,
+        add_generation_prompt: options?.add_generation_prompt ?? false,
+      }),
     ),
     encode: vi.fn(() => [1, 2, 3]),
   };
@@ -325,7 +330,10 @@ describe('TransformersEngine', () => {
 
   it('downgrades a WASM-only model to wasm instead of building a webgpu pipeline', async () => {
     pipelineMock.mockResolvedValue(makeGenerator());
-    const engine = new TransformersEngine({ device: 'webgpu', cache: 'browser' });
+    const engine = new TransformersEngine({
+      device: 'webgpu',
+      cache: 'browser',
+    });
     await engine.load(getModel('qwen2.5-1.5b'), () => {});
 
     expect(engine.kind).toBe('wasm');
@@ -334,7 +342,10 @@ describe('TransformersEngine', () => {
 
   it('keeps webgpu when the model declares it', async () => {
     pipelineMock.mockResolvedValue(makeGenerator());
-    const engine = new TransformersEngine({ device: 'webgpu', cache: 'browser' });
+    const engine = new TransformersEngine({
+      device: 'webgpu',
+      cache: 'browser',
+    });
     await engine.load({ ...getModel('qwen2.5-1.5b'), backend: 'webgpu' }, () => {});
 
     expect(engine.kind).toBe('webgpu');
@@ -441,7 +452,9 @@ describe('TransformersEngine', () => {
   });
 
   it('uses an OPFS-backed custom cache when OPFS is available', async () => {
-    vi.stubGlobal('navigator', { storage: { getDirectory: vi.fn(async () => makeOPFSRoot()) } });
+    vi.stubGlobal('navigator', {
+      storage: { getDirectory: vi.fn(async () => makeOPFSRoot()) },
+    });
     pipelineMock.mockResolvedValue(makeGenerator());
     const engine = new TransformersEngine({ device: 'wasm', cache: 'opfs' });
     await engine.load(getModel('qwen2.5-1.5b'), () => {});
@@ -454,7 +467,9 @@ describe('TransformersEngine', () => {
   });
 
   it('stores and retrieves weight responses through the OPFS cache', async () => {
-    vi.stubGlobal('navigator', { storage: { getDirectory: vi.fn(async () => makeOPFSRoot()) } });
+    vi.stubGlobal('navigator', {
+      storage: { getDirectory: vi.fn(async () => makeOPFSRoot()) },
+    });
     pipelineMock.mockResolvedValue(makeGenerator());
     const engine = new TransformersEngine({ device: 'wasm', cache: 'opfs' });
     await engine.load(getModel('qwen2.5-1.5b'), () => {});
@@ -473,7 +488,9 @@ describe('TransformersEngine', () => {
 
   it('clears the OPFS cache directory (#71)', async () => {
     const root = makeOPFSRoot();
-    vi.stubGlobal('navigator', { storage: { getDirectory: vi.fn(async () => root) } });
+    vi.stubGlobal('navigator', {
+      storage: { getDirectory: vi.fn(async () => root) },
+    });
     pipelineMock.mockResolvedValue(makeGenerator());
     const engine = new TransformersEngine({ device: 'wasm', cache: 'opfs' });
     await engine.load(getModel('qwen2.5-1.5b'), () => {});
@@ -501,7 +518,9 @@ describe('TransformersEngine', () => {
   it('still clears the OPFS cache when the IndexedDB deletion is blocked (#63)', async () => {
     stubIndexedDBDelete('blocked');
     const root = makeOPFSRoot();
-    vi.stubGlobal('navigator', { storage: { getDirectory: vi.fn(async () => root) } });
+    vi.stubGlobal('navigator', {
+      storage: { getDirectory: vi.fn(async () => root) },
+    });
     pipelineMock.mockResolvedValue(makeGenerator());
     const engine = new TransformersEngine({ device: 'wasm', cache: 'opfs' });
     await engine.load(getModel('qwen2.5-1.5b'), () => {});
@@ -687,7 +706,11 @@ describe('TransformersEngine', () => {
     };
     progress.length = 0;
 
-    options.progress_callback({ status: 'initiate', name: 'model', file: 'model.onnx' });
+    options.progress_callback({
+      status: 'initiate',
+      name: 'model',
+      file: 'model.onnx',
+    });
     expect(progress.at(-1)).toMatchObject({
       phase: 'downloading',
       loaded: 0,
@@ -711,7 +734,11 @@ describe('TransformersEngine', () => {
     });
 
     // `done` carries no bytes, so the last `progress` sample is reported.
-    options.progress_callback({ status: 'done', name: 'model', file: 'model.onnx' });
+    options.progress_callback({
+      status: 'done',
+      name: 'model',
+      file: 'model.onnx',
+    });
     expect(progress.at(-1)).toMatchObject({
       phase: 'downloading',
       loaded: 420,
@@ -719,7 +746,11 @@ describe('TransformersEngine', () => {
       percent: 100,
     });
 
-    options.progress_callback({ status: 'ready', task: 'text-generation', model: 'model' });
+    options.progress_callback({
+      status: 'ready',
+      task: 'text-generation',
+      model: 'model',
+    });
     expect(progress.at(-1)).toMatchObject({ phase: 'loading', percent: 100 });
   });
 
@@ -734,7 +765,11 @@ describe('TransformersEngine', () => {
     };
     progress.length = 0;
 
-    options.progress_callback({ status: 'done', name: 'model', file: 'uncounted.onnx' });
+    options.progress_callback({
+      status: 'done',
+      name: 'model',
+      file: 'uncounted.onnx',
+    });
     expect(progress.at(-1)).toMatchObject({
       phase: 'downloading',
       loaded: 0,
@@ -782,7 +817,9 @@ describe('TransformersEngine', () => {
     const controller = new AbortController();
     const load = engine.load(getModel('qwen2.5-1.5b'), () => {}, controller.signal);
 
-    const assertion = expect(load).rejects.toMatchObject({ name: 'AbortError' });
+    const assertion = expect(load).rejects.toMatchObject({
+      name: 'AbortError',
+    });
     controller.abort();
     await assertion;
     expect(engine.isLoaded()).toBe(false);
@@ -879,7 +916,6 @@ describe('TransformersEngine', () => {
     const result = await generate;
     expect(result.finishReason).toBe('aborted');
   });
-
 });
 
 describe('createEngine', () => {
@@ -897,7 +933,9 @@ describe('createEngine', () => {
 
   it('defaults to wasm for a WASM-only model on a webgpu host', () => {
     vi.stubGlobal('navigator', { gpu: {} });
-    const engine = createEngine('transformers', { spec: getModel('qwen2.5-1.5b') });
+    const engine = createEngine('transformers', {
+      spec: getModel('qwen2.5-1.5b'),
+    });
     expect(engine.kind).toBe('wasm');
   });
 
@@ -911,12 +949,17 @@ describe('createEngine', () => {
   it('passes cache and integrity through to the webllm engine', () => {
     const integrity = { config: 'sha256-abc' };
     createEngine('webllm', { cache: 'indexeddb', integrity });
-    expect(WebLLMEngineMock.instances.at(-1)!.options).toEqual({ cache: 'indexeddb', integrity });
+    expect(WebLLMEngineMock.instances.at(-1)!.options).toEqual({
+      cache: 'indexeddb',
+      integrity,
+    });
   });
 
   it("maps the transformers 'browser' cache onto WebLLM's 'cache'", () => {
     createEngine('webllm', { cache: 'browser' });
-    expect(WebLLMEngineMock.instances.at(-1)!.options).toEqual({ cache: 'cache' });
+    expect(WebLLMEngineMock.instances.at(-1)!.options).toEqual({
+      cache: 'cache',
+    });
   });
 
   it('ignores wasm-only options for the webgpu engine', () => {
@@ -941,6 +984,38 @@ describe('detectBackend', () => {
   it('falls back to wasm without webgpu', () => {
     vi.stubGlobal('navigator', {});
     expect(detectBackend()).toBe('wasm');
+  });
+});
+
+describe('selectEngineKind', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('selects webllm for a converted model when navigator.gpu exists', () => {
+    vi.stubGlobal('navigator', { gpu: {} });
+    expect(selectEngineKind(getModel('qwen2.5-1.5b'))).toBe('webllm');
+  });
+
+  it('selects transformers for a converted model when navigator.gpu is missing', () => {
+    vi.stubGlobal('navigator', {});
+    expect(selectEngineKind(getModel('qwen2.5-1.5b'))).toBe('transformers');
+  });
+
+  it('selects transformers for a model with no WebLLM conversion', () => {
+    vi.stubGlobal('navigator', { gpu: {} });
+    const spec = { ...getModel('qwen2.5-1.5b'), id: 'not-in-registry' };
+    expect(selectEngineKind(spec)).toBe('transformers');
+  });
+
+  it('selects transformers for an undefined spec', () => {
+    vi.stubGlobal('navigator', { gpu: {} });
+    expect(selectEngineKind(undefined)).toBe('transformers');
+  });
+
+  it('offers webllm for every registry model on a webgpu host', () => {
+    vi.stubGlobal('navigator', { gpu: {} });
+    for (const spec of listModels()) {
+      expect(selectEngineKind(spec), `expected ${spec.id} to use webllm`).toBe('webllm');
+    }
   });
 });
 
@@ -992,6 +1067,20 @@ describe('models', () => {
   it('throws a clear error for a model with no WebLLM conversion', () => {
     const spec = { ...getModel('qwen2.5-1.5b'), id: 'not-in-registry' };
     expect(() => resolveWebLLMModelId(spec)).toThrow(/No WebLLM conversion/);
+  });
+
+  it('reports whether a model has a verified WebLLM conversion without throwing', () => {
+    expect(hasWebLLMConversion(getModel('qwen2.5-1.5b'))).toBe(true);
+    const unmapped = { ...getModel('qwen2.5-1.5b'), id: 'not-in-registry' };
+    expect(hasWebLLMConversion(unmapped)).toBe(false);
+  });
+
+  it('does not treat inherited object keys as WebLLM conversions', () => {
+    // `in` would consult the prototype chain; only own registry entries count.
+    for (const id of ['toString', 'constructor', '__proto__']) {
+      const spec = { ...getModel('qwen2.5-1.5b'), id };
+      expect(hasWebLLMConversion(spec)).toBe(false);
+    }
   });
 
   it('resolves the recommended 3B model to a loadable ONNX repo', () => {

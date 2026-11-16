@@ -137,6 +137,9 @@ describe('index.html Content-Security-Policy', () => {
       'https://*.hf.co',
       'https://cdn.jsdelivr.net',
       'https://copy.sh',
+      // WebLLM fetches its prebuilt MLC wasm runtime from here; the source is
+      // path-scoped to mlc-ai's binary libraries (see src/core/security/egress.ts).
+      'https://raw.githubusercontent.com/mlc-ai/binary-mlc-llm-libs/',
     ]) {
       expect(connectSrc).toContain(host);
     }
@@ -195,6 +198,8 @@ describe('connect-src source matching', () => {
     'https://us.aws.cdn.hf.co/resolve/main/onnx/model.onnx',
     // ONNX runtime artifacts fetched by @huggingface/transformers.
     'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.0/dist/transformers.min.js',
+    // WebLLM's prebuilt MLC wasm runtime (@mlc-ai/web-llm model_lib URLs).
+    'https://raw.githubusercontent.com/mlc-ai/binary-mlc-llm-libs/main/web-llm-models/v0.2.88/Llama-3.2-1B-Instruct-q4f32_1_cs1k-webgpu.wasm',
     // Same-origin module/script loads.
     'https://ghostshell.local/src/main.ts',
   ];

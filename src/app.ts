@@ -7,7 +7,7 @@ import { V86VMHandle } from '@/core/vm/v86.js';
 import { createToolRegistry, AgentLoop, type AgentStep } from '@/core/agent/loop.js';
 import { builtinTools } from '@/core/agent/tools.js';
 import { buildSystemPrompt } from '@/core/agent/prompts.js';
-import { createEngine } from '@/core/llm/engine.js';
+import { createEngine, selectEngineKind, type EngineKind } from '@/core/llm/engine.js';
 import { ProgressReportingEngine } from '@/core/llm/reporting.js';
 import { ATTESTATION_CONFIG, DEFAULT_AGENT_CONFIG, FLAGS } from '@/config.js';
 import { ALPINE_BOOT, getImage } from '@/core/vm/image.js';
@@ -44,6 +44,7 @@ import type {
   DirEntry,
   LLMEngine,
   Message,
+  ModelSpec,
   ToolContext,
   VMHandle,
   VMImage,
@@ -234,7 +235,12 @@ export class App {
     }
 
     const config = this.settings?.get() ?? DEFAULT_AGENT_CONFIG;
-    const userMessage: Message = { id: uuid(), role: 'user', content: text, timestamp: Date.now() };
+    const userMessage: Message = {
+      id: uuid(),
+      role: 'user',
+      content: text,
+      timestamp: Date.now(),
+    };
     this.chat?.append(userMessage);
     this.bus.emit('agent:message', userMessage);
     this.chat?.setWorking(true);
@@ -379,6 +385,9 @@ export class App {
   /**
    * Load the configured model on first use. The engine is created once per
    * model and reused; concurrent callers share the same in-flight load.
+   *
+   * The kind comes from `selectEngineKind`, so a WebGPU host with a converted
+   * model tries WebLLM first and retries WASM if that load fails.
    */
   private ensureEngine(): Promise<LLMEngine> {
     const config = this.settings?.get() ?? DEFAULT_AGENT_CONFIG;
@@ -396,18 +405,31 @@ export class App {
     }
 
     const spec = getModel(config.modelId);
-    const engine = new ProgressReportingEngine(
-      createEngine('transformers', { spec }),
-      (progress) => {
-        this.bus.emit('llm:progress', progress);
-      },
-    );
+    return this.startLoad(spec, selectEngineKind(spec));
+  }
+
+  /**
+   * Create an engine for `spec` and start loading it.
+   *
+   * A WebLLM load that fails while still current and not canceled retries once
+   * on Transformers.js/WASM, reusing `controller` so cancellation still aborts
+   * the retry. A transformers load never retries. A superseded load leaves
+   * shared state alone.
+   */
+  private startLoad(
+    spec: ModelSpec,
+    kind: EngineKind,
+    controller?: AbortController,
+  ): Promise<LLMEngine> {
+    const engine = new ProgressReportingEngine(createEngine(kind, { spec }), (progress) => {
+      this.bus.emit('llm:progress', progress);
+    });
     this.engine = engine;
     this.loadedModelId = spec.id;
     this.updateModelBadge();
 
-    const controller = new AbortController();
-    this.engineLoadController = controller;
+    const loadController = controller ?? new AbortController();
+    this.engineLoadController = loadController;
     // `load` emits its own initial progress event synchronously.
     this.modelProgress?.show();
 
@@ -418,7 +440,7 @@ export class App {
           this.bus.emit('llm:progress', progress);
           this.updateModelBadge();
         },
-        controller.signal,
+        loadController.signal,
       )
       .then(
         () => {
@@ -432,14 +454,23 @@ export class App {
           return engine;
         },
         (err: unknown) => {
+          // `navigator.gpu` can exist without a usable adapter, and a WebLLM
+          // download can fail after selection. Retry once on WASM unless the
+          // caller canceled or a newer load already took over.
+          if (kind === 'webllm' && this.engine === engine && !loadController.signal.aborted) {
+            void engine.unload().catch(() => undefined);
+            console.warn('[ghostshell] WebLLM unavailable, falling back to WASM', err);
+            return this.startLoad(spec, 'transformers', loadController);
+          }
+
           if (this.engine === engine) {
             this.engine = null;
             this.loadedModelId = null;
             this.engineLoad = null;
             this.updateModelBadge();
+            this.modelProgress?.hide();
           }
-          if (this.engineLoadController === controller) this.engineLoadController = null;
-          this.modelProgress?.hide();
+          if (this.engineLoadController === loadController) this.engineLoadController = null;
           throw err;
         },
       );

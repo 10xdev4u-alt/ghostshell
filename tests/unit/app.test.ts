@@ -136,34 +136,54 @@ const h = vi.hoisted(() => {
     netDevices: [] as unknown[],
     egressInstalls: [] as Array<{ blockAll: boolean; allowlist: unknown }>,
     egressRestores: 0,
-    computeDiffResult: [] as Array<{ path: string; kind: 'added' | 'modified' | 'deleted' }>,
+    computeDiffResult: [] as Array<{
+      path: string;
+      kind: 'added' | 'modified' | 'deleted';
+    }>,
     loadError: null as Error | null,
-    agentRunImpl: null as null | ((
-      conversation: Conversation,
-      ctx: unknown,
-      onStep: (step: AgentStep) => void,
-      signal: AbortSignal,
-    ) => Promise<AgentRunResult>),
+    /** Restrict `loadError` to one engine kind; null applies to every kind. */
+    loadErrorKind: null as string | null,
+    /** Per-load hook so tests can defer a load or reject it on abort. */
+    loadImpl: null as null | ((engine: FakeEngine, signal?: AbortSignal) => void | Promise<void>),
+    engineKind: 'transformers' as 'transformers' | 'webllm',
+    agentRunImpl: null as
+      | null
+      | ((
+          conversation: Conversation,
+          ctx: unknown,
+          onStep: (step: AgentStep) => void,
+          signal: AbortSignal,
+        ) => Promise<AgentRunResult>),
   };
+
+  const abortError = (): DOMException =>
+    new DOMException('The operation was aborted.', 'AbortError');
 
   class FakeEngine {
     readonly id = 'fake-engine';
-    readonly kind = 'wasm' as const;
+    readonly kind: string;
     loaded = false;
     loadCalls = 0;
     unloadCalls = 0;
     generateCalls = 0;
 
-    constructor() {
+    constructor(kind = 'transformers') {
+      this.kind = kind;
       state.engines.push(this);
     }
 
     async load(
       _spec: unknown,
       onProgress?: (progress: ModelProgress) => void,
+      signal?: AbortSignal,
     ): Promise<void> {
       this.loadCalls += 1;
-      if (state.loadError) throw state.loadError;
+      if (state.loadError && (state.loadErrorKind === null || state.loadErrorKind === this.kind)) {
+        throw state.loadError;
+      }
+      if (signal?.aborted) throw abortError();
+      await (state.loadImpl?.(this, signal) ?? Promise.resolve());
+      if (signal?.aborted) throw abortError();
       onProgress?.({ phase: 'loading', loaded: 1, total: 2, percent: 50 });
       this.loaded = true;
     }
@@ -494,7 +514,14 @@ const h = vi.hoisted(() => {
 
     async create(title: string, modelId: string): Promise<Conversation> {
       this.created.push({ title, modelId });
-      return { id: 'c1', title, messages: [], createdAt: 1, updatedAt: 1, modelId };
+      return {
+        id: 'c1',
+        title,
+        messages: [],
+        createdAt: 1,
+        updatedAt: 1,
+        modelId,
+      };
     }
   }
 
@@ -512,7 +539,12 @@ const h = vi.hoisted(() => {
       this.running = true;
     };
 
-    listImpl: () => Array<{ name: string; kind: 'file' | 'dir' | 'symlink'; size: number; mtime: number }> = () => [];
+    listImpl: () => Array<{
+      name: string;
+      kind: 'file' | 'dir' | 'symlink';
+      size: number;
+      mtime: number;
+    }> = () => [];
     readImpl: () => string = () => '';
 
     constructor() {
@@ -552,7 +584,13 @@ const h = vi.hoisted(() => {
       durationMs: number;
       timedOut: boolean;
     }> {
-      return { stdout: '', stderr: '', exitCode: 0, durationMs: 1, timedOut: false };
+      return {
+        stdout: '',
+        stderr: '',
+        exitCode: 0,
+        durationMs: 1,
+        timedOut: false,
+      };
     }
 
     sendSerial(): void {}
@@ -563,7 +601,14 @@ const h = vi.hoisted(() => {
       return this.readImpl();
     }
 
-    async list(): Promise<Array<{ name: string; kind: 'file' | 'dir' | 'symlink'; size: number; mtime: number }>> {
+    async list(): Promise<
+      Array<{
+        name: string;
+        kind: 'file' | 'dir' | 'symlink';
+        size: number;
+        mtime: number;
+      }>
+    > {
       return this.listImpl();
     }
   }
@@ -585,12 +630,14 @@ const h = vi.hoisted(() => {
       signal: AbortSignal,
     ): Promise<AgentRunResult> {
       this.calls.push({ conversation, signal });
-      const impl = state.agentRunImpl ?? (async (c: Conversation) => ({
-        messages: [...c.messages],
-        steps: [],
-        iterations: 0,
-        finishReason: 'stop' as const,
-      }));
+      const impl =
+        state.agentRunImpl ??
+        (async (c: Conversation) => ({
+          messages: [...c.messages],
+          steps: [],
+          iterations: 0,
+          finishReason: 'stop' as const,
+        }));
       return impl(conversation, _ctx, onStep, signal);
     }
   }
@@ -645,7 +692,9 @@ const h = vi.hoisted(() => {
 
   const createPrivacyReportSection = vi.fn(() => new FakeElement('div'));
 
-  const createEngine = vi.fn(() => new FakeEngine());
+  const createEngine = vi.fn((kind: string) => new FakeEngine(kind));
+
+  const selectEngineKind = vi.fn((_spec: unknown) => state.engineKind);
 
   const builtinTools = vi.fn((): ToolDefinition[] => [
     {
@@ -662,7 +711,9 @@ const h = vi.hoisted(() => {
     },
   ]);
 
-  const createToolRegistry = vi.fn((defs: ToolDefinition[]) => new Map(defs.map((d) => [d.name, d])));
+  const createToolRegistry = vi.fn(
+    (defs: ToolDefinition[]) => new Map(defs.map((d) => [d.name, d])),
+  );
 
   const buildNetDevice = vi.fn((config: { mode: string }) => {
     state.netDevices.push(config);
@@ -710,12 +761,16 @@ const h = vi.hoisted(() => {
     state.egressRestores = 0;
     state.computeDiffResult = [];
     state.loadError = null;
+    state.loadErrorKind = null;
+    state.loadImpl = null;
+    state.engineKind = 'transformers';
     state.agentRunImpl = null;
   };
 
   return {
     state,
     reset,
+    abortError,
     FakeElement,
     FakeClassList,
     IdbDatabase: FakeDb,
@@ -725,13 +780,18 @@ const h = vi.hoisted(() => {
     createV86Filesystem: vi.fn(() => ({})),
     DEFAULT_FS_PREFIX: 'fs9p',
     buildNetDevice,
-    ALPINE_BOOT: { biosUrl: 'bios.bin', vgaBiosUrl: 'vga.bin', cmdline: 'console=ttyS0' },
+    ALPINE_BOOT: {
+      biosUrl: 'bios.bin',
+      vgaBiosUrl: 'vga.bin',
+      cmdline: 'console=ttyS0',
+    },
     getImage,
     V86_WASM_URL: 'data:application/wasm;base64,AAAA',
     createToolRegistry,
     AgentLoop: FakeAgentLoop,
     builtinTools,
     createEngine,
+    selectEngineKind,
     installEgressInterceptor,
     InMemoryEgressLog: class {
       record(): void {}
@@ -759,21 +819,29 @@ vi.mock('@/core/persistence/db.js', () => ({ IdbDatabase: h.IdbDatabase }));
 vi.mock('@/core/persistence/conversations.js', () => ({
   ConversationRepository: h.ConversationRepository,
 }));
-vi.mock('@/core/persistence/snapshots.js', () => ({ SnapshotManager: h.SnapshotManager }));
+vi.mock('@/core/persistence/snapshots.js', () => ({
+  SnapshotManager: h.SnapshotManager,
+}));
 vi.mock('@/core/vm/v86.js', () => ({ V86VMHandle: h.V86VMHandle }));
 vi.mock('@/core/vm/fs9p.js', () => ({
   createV86Filesystem: h.createV86Filesystem,
   DEFAULT_FS_PREFIX: h.DEFAULT_FS_PREFIX,
 }));
 vi.mock('@/core/vm/network.js', () => ({ buildNetDevice: h.buildNetDevice }));
-vi.mock('@/core/vm/image.js', () => ({ ALPINE_BOOT: h.ALPINE_BOOT, getImage: h.getImage }));
+vi.mock('@/core/vm/image.js', () => ({
+  ALPINE_BOOT: h.ALPINE_BOOT,
+  getImage: h.getImage,
+}));
 vi.mock('@/core/vm/wasm.js', () => ({ V86_WASM_URL: h.V86_WASM_URL }));
 vi.mock('@/core/agent/loop.js', () => ({
   createToolRegistry: h.createToolRegistry,
   AgentLoop: h.AgentLoop,
 }));
 vi.mock('@/core/agent/tools.js', () => ({ builtinTools: h.builtinTools }));
-vi.mock('@/core/llm/engine.js', () => ({ createEngine: h.createEngine }));
+vi.mock('@/core/llm/engine.js', () => ({
+  createEngine: h.createEngine,
+  selectEngineKind: h.selectEngineKind,
+}));
 vi.mock('@/core/security/egress.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/core/security/egress.js')>();
   return {
@@ -786,9 +854,16 @@ vi.mock('@/ui/chat.js', () => ({ createChat: h.createChat }));
 vi.mock('@/ui/terminal.js', () => ({ createTerminal: h.createTerminal }));
 vi.mock('@/ui/twinview.js', () => ({ createTwinView: h.createTwinView }));
 vi.mock('@/ui/filetree.js', () => ({ createFileTree: h.createFileTree }));
-vi.mock('@/ui/diff.js', () => ({ computeDiff: h.computeDiff, createDiffView: h.createDiffView }));
-vi.mock('@/ui/artifact.js', () => ({ createArtifactPanel: h.createArtifactPanel }));
-vi.mock('@/ui/progress.js', () => ({ createModelProgress: h.createModelProgress }));
+vi.mock('@/ui/diff.js', () => ({
+  computeDiff: h.computeDiff,
+  createDiffView: h.createDiffView,
+}));
+vi.mock('@/ui/artifact.js', () => ({
+  createArtifactPanel: h.createArtifactPanel,
+}));
+vi.mock('@/ui/progress.js', () => ({
+  createModelProgress: h.createModelProgress,
+}));
 vi.mock('@/ui/settings.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/ui/settings.js')>();
   return {
@@ -1019,7 +1094,12 @@ describe('App', () => {
       const db = h.state.dbs[0]!;
 
       twin.ranges.push({ start: 0, end: 2 });
-      const toolCall = { id: 't1', name: 'bash', arguments: { command: 'ls' }, raw: '{"name":"bash"}' };
+      const toolCall = {
+        id: 't1',
+        name: 'bash',
+        arguments: { command: 'ls' },
+        raw: '{"name":"bash"}',
+      };
       const stepMessage: Message = {
         id: 'm-step',
         role: 'assistant',
@@ -1036,7 +1116,13 @@ describe('App', () => {
             ok: true,
             content: 'ok',
             artifacts: [
-              { id: 'a1', kind: 'markdown', content: '# hi', mime: 'text/markdown', createdAt: 1 },
+              {
+                id: 'a1',
+                kind: 'markdown',
+                content: '# hi',
+                mime: 'text/markdown',
+                createdAt: 1,
+              },
             ],
           },
         ],
@@ -1056,7 +1142,10 @@ describe('App', () => {
       await vi.waitFor(() => expect(db.conversations).toHaveLength(2));
 
       expect(chat.messages.map((m) => m.role)).toEqual(['user', 'assistant', 'tool']);
-      expect(chat.messages[0]).toMatchObject({ role: 'user', content: 'hello' });
+      expect(chat.messages[0]).toMatchObject({
+        role: 'user',
+        content: 'hello',
+      });
       expect(chat.working).toBe(false);
       expect(progress.hidden).toBeGreaterThan(0);
       expect(progress.updates.length).toBeGreaterThan(0);
@@ -1101,7 +1190,9 @@ describe('App', () => {
       const chat = h.state.chats[0]!;
       chat.submit('hello');
       await vi.waitFor(() =>
-        expect(chat.messages.some((m) => m.content.includes('Something went wrong: boom'))).toBe(true),
+        expect(chat.messages.some((m) => m.content.includes('Something went wrong: boom'))).toBe(
+          true,
+        ),
       );
       expect(chat.working).toBe(false);
     });
@@ -1124,7 +1215,9 @@ describe('App', () => {
       const chat = h.state.chats[0]!;
       chat.submit('hello');
       await vi.waitFor(() =>
-        expect(chat.messages.some((m) => m.content.includes('Something went wrong: load failed'))).toBe(true),
+        expect(
+          chat.messages.some((m) => m.content.includes('Something went wrong: load failed')),
+        ).toBe(true),
       );
       expect(env.byId.get('gs-model')!.textContent).toBe('🧠 unloaded');
     });
@@ -1161,10 +1254,25 @@ describe('App', () => {
       const twin = h.state.twinViews[0]!;
       twin.ranges.push({ start: 0, end: 2 });
       const toolCall = { id: 't1', name: 'bash', arguments: {}, raw: '' };
-      const stepMessage: Message = { id: 'm-step', role: 'assistant', content: '', timestamp: 1 };
+      const stepMessage: Message = {
+        id: 'm-step',
+        role: 'assistant',
+        content: '',
+        timestamp: 1,
+      };
       h.state.agentRunImpl = async (conversation, _ctx, onStep) => {
-        onStep({ iteration: 1, message: stepMessage, toolCalls: [toolCall], results: [] });
-        return { messages: [...conversation.messages], steps: [], iterations: 1, finishReason: 'stop' };
+        onStep({
+          iteration: 1,
+          message: stepMessage,
+          toolCalls: [toolCall],
+          results: [],
+        });
+        return {
+          messages: [...conversation.messages],
+          steps: [],
+          iterations: 1,
+          finishReason: 'stop',
+        };
       };
 
       chat.submit('hello');
@@ -1173,7 +1281,9 @@ describe('App', () => {
 
       expect(twin.scrolls).toContain(0);
       expect(h.state.terminals[0]!.fits).toBeGreaterThan(0);
-      expect(env.panels.find((p) => p.id === 'gs-panel-terminal')!.classList.contains('is-active')).toBe(true);
+      expect(
+        env.panels.find((p) => p.id === 'gs-panel-terminal')!.classList.contains('is-active'),
+      ).toBe(true);
     });
 
     it('enriches diff entries with before/after content and reports no changes', async () => {
@@ -1234,6 +1344,246 @@ describe('App', () => {
     });
   });
 
+  describe('engine selection and fallback', () => {
+    it('creates the engine kind returned by selectEngineKind with the spec', async () => {
+      await app.init();
+      h.state.vms[0]!.running = true;
+      h.state.engineKind = 'webllm';
+      const chat = h.state.chats[0]!;
+
+      chat.submit('hello');
+      await vi.waitFor(() => expect(h.state.engines[0]!.isLoaded()).toBe(true));
+
+      expect(h.selectEngineKind).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'qwen2.5-1.5b' }),
+      );
+      expect(h.createEngine).toHaveBeenCalledTimes(1);
+      expect(h.createEngine).toHaveBeenCalledWith('webllm', {
+        spec: expect.objectContaining({ id: 'qwen2.5-1.5b' }),
+      });
+    });
+
+    it('defaults to transformers when selectEngineKind returns it', async () => {
+      await app.init();
+      h.state.vms[0]!.running = true;
+      const chat = h.state.chats[0]!;
+
+      chat.submit('hello');
+      await vi.waitFor(() => expect(h.state.engines[0]!.isLoaded()).toBe(true));
+
+      expect(h.createEngine).toHaveBeenCalledWith('transformers', {
+        spec: expect.objectContaining({ id: 'qwen2.5-1.5b' }),
+      });
+    });
+
+    it('falls back to transformers exactly once when a webllm load fails', async () => {
+      await app.init();
+      h.state.vms[0]!.running = true;
+      h.state.engineKind = 'webllm';
+      h.state.loadError = new Error('WebGPU unavailable');
+      h.state.loadErrorKind = 'webllm';
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const chat = h.state.chats[0]!;
+
+      chat.submit('hello');
+      await vi.waitFor(() => expect(h.state.engines).toHaveLength(2));
+      await vi.waitFor(() => expect(h.state.engines[1]!.isLoaded()).toBe(true));
+
+      expect(h.createEngine.mock.calls).toEqual([
+        ['webllm', { spec: expect.objectContaining({ id: 'qwen2.5-1.5b' }) }],
+        ['transformers', { spec: expect.objectContaining({ id: 'qwen2.5-1.5b' }) }],
+      ]);
+      expect(h.state.engines[0]!.loadCalls).toBe(1);
+      expect(h.state.engines[1]!.loadCalls).toBe(1);
+      // The failed WebLLM engine is released before the WASM retry.
+      expect(h.state.engines[0]!.unloadCalls).toBe(1);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(
+        '[ghostshell] WebLLM unavailable, falling back to WASM',
+        expect.any(Error),
+      );
+      expect(env.byId.get('gs-model')!.textContent).toBe('🧠 loaded');
+      warn.mockRestore();
+    });
+
+    it('lets a cancel abort the WASM retry started by the fallback', async () => {
+      await app.init();
+      h.state.vms[0]!.running = true;
+      h.state.engineKind = 'webllm';
+      let rejectWebllm!: (err: unknown) => void;
+      h.state.loadImpl = (engine, signal) =>
+        engine.kind === 'webllm'
+          ? new Promise<void>((_resolve, reject) => {
+              rejectWebllm = reject;
+            })
+          : new Promise<void>((_resolve, reject) => {
+              if (signal?.aborted) {
+                reject(h.abortError());
+                return;
+              }
+              signal?.addEventListener('abort', () => reject(h.abortError()), {
+                once: true,
+              });
+            });
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const chat = h.state.chats[0]!;
+      const controllerOf = (): AbortController | null =>
+        (app as unknown as { engineLoadController: AbortController | null }).engineLoadController;
+
+      chat.submit('hello');
+      await vi.waitFor(() => expect(h.state.engines).toHaveLength(1));
+      await vi.waitFor(() => expect(h.state.engines[0]!.loadCalls).toBe(1));
+
+      // The retry must reuse this exact controller, not create a new one.
+      const controller = controllerOf();
+      expect(controller).not.toBeNull();
+
+      rejectWebllm(new Error('gpu boom'));
+      await vi.waitFor(() => expect(h.state.engines).toHaveLength(2));
+      expect(controllerOf()).toBe(controller);
+
+      controller!.abort();
+
+      await vi.waitFor(() =>
+        expect(chat.messages.some((m) => m.content === 'Canceled.')).toBe(true),
+      );
+      expect(h.createEngine).toHaveBeenCalledTimes(2);
+      expect(h.state.engines).toHaveLength(2);
+      expect(warn).toHaveBeenCalledTimes(1);
+      warn.mockRestore();
+    });
+
+    it('does not fall back when the webllm load is aborted', async () => {
+      await app.init();
+      h.state.vms[0]!.running = true;
+      h.state.engineKind = 'webllm';
+      h.state.loadImpl = (_engine, signal) =>
+        new Promise<void>((_resolve, reject) => {
+          if (signal?.aborted) {
+            reject(h.abortError());
+            return;
+          }
+          signal?.addEventListener('abort', () => reject(h.abortError()), {
+            once: true,
+          });
+        });
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const chat = h.state.chats[0]!;
+
+      chat.submit('hello');
+      await vi.waitFor(() => expect(h.state.engines).toHaveLength(1));
+
+      const controller = (app as unknown as { engineLoadController: AbortController | null })
+        .engineLoadController;
+      expect(controller).not.toBeNull();
+      controller!.abort();
+
+      await vi.waitFor(() =>
+        expect(chat.messages.some((m) => m.content === 'Canceled.')).toBe(true),
+      );
+      expect(h.createEngine).toHaveBeenCalledTimes(1);
+      expect(h.state.engines).toHaveLength(1);
+      expect(warn).not.toHaveBeenCalled();
+      warn.mockRestore();
+    });
+
+    it('propagates a transformers load failure without a second engine', async () => {
+      await app.init();
+      h.state.vms[0]!.running = true;
+      h.state.loadError = new Error('wasm failed');
+      const chat = h.state.chats[0]!;
+
+      chat.submit('hello');
+      await vi.waitFor(() =>
+        expect(
+          chat.messages.some((m) => m.content.includes('Something went wrong: wasm failed')),
+        ).toBe(true),
+      );
+
+      expect(h.createEngine).toHaveBeenCalledTimes(1);
+      expect(h.state.engines).toHaveLength(1);
+      expect(env.byId.get('gs-model')!.textContent).toBe('🧠 unloaded');
+    });
+
+    it('does not fall back when a superseded webllm load fails', async () => {
+      await app.init();
+      h.state.vms[0]!.running = true;
+      h.state.engineKind = 'webllm';
+
+      let rejectFirst!: (err: unknown) => void;
+      h.state.loadImpl = (engine) =>
+        engine === h.state.engines[0]
+          ? new Promise<void>((_resolve, reject) => {
+              rejectFirst = reject;
+            })
+          : undefined;
+      const chat = h.state.chats[0]!;
+
+      chat.submit('one');
+      await vi.waitFor(() => expect(h.state.engines).toHaveLength(1));
+
+      // Switching models unloads the pending engine; the next submit starts a
+      // fresh ensureEngine that replaces this.engine before the old load fails.
+      const settings = h.state.settings[0]!;
+      settings.emit({ ...settings.get(), modelId: 'qwen2.5-3b' });
+      chat.submit('two');
+      await vi.waitFor(() => expect(h.state.engines).toHaveLength(2));
+      await vi.waitFor(() => expect(h.state.engines[1]!.isLoaded()).toBe(true));
+
+      rejectFirst(new Error('gpu boom'));
+      await vi.waitFor(() =>
+        expect(
+          chat.messages.some((m) => m.content.includes('Something went wrong: gpu boom')),
+        ).toBe(true),
+      );
+
+      expect(h.createEngine).toHaveBeenCalledTimes(2);
+      expect(h.state.engines).toHaveLength(2);
+      expect(h.state.engines[1]!.isLoaded()).toBe(true);
+      expect(env.byId.get('gs-model')!.textContent).toBe('🧠 loaded');
+    });
+
+    it('keeps the newer load cancellable when a superseded load succeeds', async () => {
+      await app.init();
+      h.state.vms[0]!.running = true;
+      const resolvers: Array<() => void> = [];
+      h.state.loadImpl = (_engine, signal) =>
+        new Promise<void>((resolve, reject) => {
+          resolvers.push(resolve);
+          signal?.addEventListener('abort', () => reject(h.abortError()), {
+            once: true,
+          });
+        });
+      const chat = h.state.chats[0]!;
+      const loadInFlight = (): boolean =>
+        (app as unknown as { engineLoad: Promise<unknown> | null }).engineLoad !== null;
+      const controllerOf = (): AbortController | null =>
+        (app as unknown as { engineLoadController: AbortController | null }).engineLoadController;
+
+      chat.submit('one');
+      await vi.waitFor(() => expect(h.state.engines).toHaveLength(1));
+      const settings = h.state.settings[0]!;
+      settings.emit({ ...settings.get(), modelId: 'qwen2.5-3b' });
+      chat.submit('two');
+      await vi.waitFor(() => expect(h.state.engines).toHaveLength(2));
+
+      // The replaced load settles first: it must leave the newer load's
+      // bookkeeping alone so cancel still reaches the in-flight retry.
+      resolvers[0]!();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(loadInFlight()).toBe(true);
+      const controller = controllerOf();
+      expect(controller).not.toBeNull();
+
+      controller!.abort();
+      await vi.waitFor(() =>
+        expect(chat.messages.some((m) => m.content === 'Canceled.')).toBe(true),
+      );
+      expect(h.state.engines).toHaveLength(2);
+    });
+  });
+
   describe('settings changes', () => {
     it('rebuilds the network device and reinstalls egress', async () => {
       await app.init();
@@ -1279,7 +1629,9 @@ describe('App', () => {
       await app.init();
       const filesTab = env.tabs.find((t) => t.dataset['tab'] === 'files')!;
       filesTab.click();
-      expect(env.panels.find((p) => p.id === 'gs-panel-files')!.classList.contains('is-active')).toBe(true);
+      expect(
+        env.panels.find((p) => p.id === 'gs-panel-files')!.classList.contains('is-active'),
+      ).toBe(true);
       expect(h.state.fileTrees[0]!.refreshes).toBe(1);
 
       const terminalTab = env.tabs.find((t) => t.dataset['tab'] === 'terminal')!;
@@ -1294,7 +1646,11 @@ describe('App', () => {
       const filtered = (app as unknown as { filteredVM: VMHandle }).filteredVM;
       const serialFilter = (
         app as unknown as {
-          serialFilter: { beginCommand: (command: string) => void; endCommand: () => void; reset: () => void };
+          serialFilter: {
+            beginCommand: (command: string) => void;
+            endCommand: () => void;
+            reset: () => void;
+          };
         }
       ).serialFilter;
       const begin = vi.spyOn(serialFilter, 'beginCommand');
