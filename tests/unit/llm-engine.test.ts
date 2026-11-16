@@ -1020,10 +1020,10 @@ describe('selectEngineKind', () => {
 });
 
 describe('models', () => {
-  it('resolves GGUF repos to ONNX for transformers only', () => {
+  it('resolves GGUF repos to the verified per-engine artifacts', () => {
     const spec = getModel('qwen2.5-1.5b');
     expect(resolveModelRepo(spec, 'transformers')).toBe('onnx-community/Qwen2.5-1.5B-Instruct');
-    expect(resolveModelRepo(spec, 'webllm')).toBe(spec.repo);
+    expect(resolveModelRepo(spec, 'webllm')).toBe('mlc-ai/Qwen2.5-1.5B-Instruct-q4f16_1-MLC');
   });
 
   it('maps every registry model to a verified ONNX target', () => {
@@ -1048,12 +1048,14 @@ describe('models', () => {
   });
 
   it('maps every registry model to a verified WebLLM target', () => {
-    // Verified against `@mlc-ai/web-llm@0.2.88`'s prebuiltAppConfig on
-    // 2026-11-13; the engine re-checks the id at load time.
+    // Verified against `@mlc-ai/web-llm@0.2.88`'s prebuiltAppConfig and the
+    // live HF API on 2026-11-16; the engine re-checks the id at load time.
     expect(WEBLLM_TARGETS['qwen2.5-1.5b']).toEqual({
+      repo: 'mlc-ai/Qwen2.5-1.5B-Instruct-q4f16_1-MLC',
       modelId: 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC',
     });
     expect(WEBLLM_TARGETS['qwen2.5-3b']).toEqual({
+      repo: 'mlc-ai/Qwen2.5-3B-Instruct-q4f16_1-MLC',
       modelId: 'Qwen2.5-3B-Instruct-q4f16_1-MLC',
     });
 
@@ -1061,12 +1063,14 @@ describe('models', () => {
       const target = WEBLLM_TARGETS[spec.id];
       expect(target, `missing WebLLM target for ${spec.id}`).toBeDefined();
       expect(resolveWebLLMModelId(spec)).toBe(target!.modelId);
+      expect(resolveModelRepo(spec, 'webllm')).toBe(target!.repo);
     }
   });
 
   it('throws a clear error for a model with no WebLLM conversion', () => {
     const spec = { ...getModel('qwen2.5-1.5b'), id: 'not-in-registry' };
     expect(() => resolveWebLLMModelId(spec)).toThrow(/No WebLLM conversion/);
+    expect(() => resolveModelRepo(spec, 'webllm')).toThrow(/No WebLLM conversion/);
   });
 
   it('reports whether a model has a verified WebLLM conversion without throwing', () => {
