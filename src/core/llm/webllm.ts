@@ -160,24 +160,6 @@ function validateIntegrityOptions(
 }
 
 /**
- * Verify one already-downloaded artifact against an SRI hash.
- *
- * Exported for callers that cache artifacts themselves; `load()` relies on
- * WebLLM's built-in per-artifact verification instead.
- */
-export async function verifyArtifact(
-  data: ArrayBuffer,
-  sri: string,
-  url: string,
-): Promise<void> {
-  const { isValidSRI, verifyIntegrity } = await import('@mlc-ai/web-llm');
-  if (!isValidSRI(sri)) {
-    throw new Error(`Invalid SRI hash for ${url}: ${JSON.stringify(sri)}`);
-  }
-  await verifyIntegrity(data, sri, url, 'error');
-}
-
-/**
  * Translate GhostShell's llama.cpp-style GBNF into the EBNF dialect XGrammar
  * (WebLLM's grammar backend) accepts.
  *
