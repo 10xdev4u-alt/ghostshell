@@ -10,7 +10,6 @@ const {
   MLCEngineMock,
   prebuiltAppConfigMock,
   isValidSRIMock,
-  verifyIntegrityMock,
 } = vi.hoisted(() => {
   class MLCEngineMock {
     static readonly instances: MLCEngineMock[] = [];
@@ -55,14 +54,12 @@ const {
     isValidSRIMock: vi.fn((sri: string) =>
       /^sha(256|384|512)-[A-Za-z0-9+/=_-]+$/.test(sri),
     ),
-    verifyIntegrityMock: vi.fn(() => Promise.resolve()),
   };
 });
 
 vi.mock('@mlc-ai/web-llm', () => ({
   MLCEngine: MLCEngineMock,
   isValidSRI: isValidSRIMock,
-  verifyIntegrity: verifyIntegrityMock,
   prebuiltAppConfig: prebuiltAppConfigMock,
 }));
 
@@ -78,7 +75,6 @@ import {
   WebLLMEngine,
   toChatMessages,
   toXGrammar,
-  verifyArtifact,
 } from '@/core/llm/webllm.js';
 
 const MODEL_ID = 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC';
@@ -199,7 +195,6 @@ beforeEach(() => {
   MLCEngineMock.instances.length = 0;
   MLCEngineMock.reloadHook = null;
   isValidSRIMock.mockClear();
-  verifyIntegrityMock.mockClear();
   // OPFS is treated as present unless a test overrides this stub.
   vi.stubGlobal('navigator', { storage: { getDirectory: vi.fn() } });
 });
@@ -1473,25 +1468,5 @@ describe('toChatMessages', () => {
         content: toolCallBlock('ping', {}),
       },
     ]);
-  });
-});
-
-describe('verifyArtifact', () => {
-  it('delegates to WebLLM verification for a valid SRI', async () => {
-    const data = new ArrayBuffer(8);
-    await verifyArtifact(data, 'sha256-abc', 'https://example.test/model.bin');
-    expect(verifyIntegrityMock).toHaveBeenCalledWith(
-      data,
-      'sha256-abc',
-      'https://example.test/model.bin',
-      'error',
-    );
-  });
-
-  it('rejects a malformed SRI before verifying', async () => {
-    await expect(
-      verifyArtifact(new ArrayBuffer(0), 'md5-nope', 'u'),
-    ).rejects.toThrow(/Invalid SRI hash/);
-    expect(verifyIntegrityMock).not.toHaveBeenCalled();
   });
 });
