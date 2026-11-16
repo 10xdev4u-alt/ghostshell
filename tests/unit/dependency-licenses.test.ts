@@ -35,6 +35,12 @@ describe('DEPENDENCY_LICENSES', () => {
     );
     expect(devOnly).toEqual([]);
   });
+
+  // Issue #132: the WebLLM engine depends on 0.2.88 catalog ids and
+  // reload/unload semantics, so the spec must stay an exact version.
+  it('pins @mlc-ai/web-llm to an exact version (issue #132)', () => {
+    expect(pkg.dependencies['@mlc-ai/web-llm']).toMatch(/^\d+\.\d+\.\d+$/);
+  });
 });
 
 describe('ATTESTATION_CONFIG dependencies', () => {
