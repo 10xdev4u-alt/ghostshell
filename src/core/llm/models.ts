@@ -9,9 +9,9 @@ import type { EngineKind } from './engine.js';
  * v0.1 ships two Qwen2.5 models. The registry is the single source of truth
  * for the model picker, the download URL, and the eval leaderboard.
  *
- * The registry stores GGUF repos because that is the format shared by the
- * llama.cpp / WebLLM ecosystem. Transformers.js needs ONNX weights, so
- * `resolveModelRepo` maps between the two.
+ * The registry stores GGUF repos because llama.cpp consumes that format.
+ * Transformers.js needs ONNX weights and WebLLM loads MLC artifacts, so
+ * `resolveModelRepo` maps each engine to its own verified repo.
  */
 
 export function listModels(): ModelSpec[] {
@@ -71,6 +71,8 @@ export const ONNX_TARGETS: Readonly<Record<string, ONNXModelTarget>> = {
  * engine re-checks at load time and fails clearly when it does not.
  */
 export interface WebLLMModelTarget {
+  /** HF repo holding the MLC build WebLLM downloads. */
+  repo: string;
   /** MLC `model_id` of the quantized conversation build. */
   modelId: string;
 }
@@ -78,14 +80,22 @@ export interface WebLLMModelTarget {
 /**
  * Verified WebLLM targets for the registry models.
  *
- * Both ids were confirmed present in `@mlc-ai/web-llm@0.2.88`'s
- * `prebuiltAppConfig.model_list` on 2026-11-13. The engine looks the full
- * record up by id at load time, so URLs and the model library stay owned by
- * the pinned package version instead of being reconstructed here.
+ * Each entry was verified two ways on 2026-11-16: the pinned
+ * `@mlc-ai/web-llm@0.2.88` `prebuiltAppConfig.model_list` record `model`
+ * URLs are exactly `https://huggingface.co/<repo>`, and the live HF API
+ * returned HTTP 200 for each repo. The engine looks the full record up by id
+ * at load time, so URLs and the model library stay owned by the pinned
+ * package version instead of being reconstructed here.
  */
 export const WEBLLM_TARGETS: Readonly<Record<string, WebLLMModelTarget>> = {
-  'qwen2.5-1.5b': { modelId: 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC' },
-  'qwen2.5-3b': { modelId: 'Qwen2.5-3B-Instruct-q4f16_1-MLC' },
+  'qwen2.5-1.5b': {
+    repo: 'mlc-ai/Qwen2.5-1.5B-Instruct-q4f16_1-MLC',
+    modelId: 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC',
+  },
+  'qwen2.5-3b': {
+    repo: 'mlc-ai/Qwen2.5-3B-Instruct-q4f16_1-MLC',
+    modelId: 'Qwen2.5-3B-Instruct-q4f16_1-MLC',
+  },
 };
 
 /**
@@ -120,13 +130,14 @@ export function hasWebLLMConversion(spec: ModelSpec): boolean {
  *
  * The registry entries are GGUF (`…-Instruct-GGUF`). Transformers.js cannot
  * load GGUF, so map to the verified ONNX conversion in `ONNX_TARGETS`. WebLLM
- * uses MLC's own artifacts and keeps the registry repo.
+ * also cannot load GGUF, so map to the verified MLC artifact in
+ * `WEBLLM_TARGETS`.
  *
- * Throws when a registry model has no verified ONNX conversion, so `load()`
- * fails with a clear message instead of a hub 404.
+ * Throws when a registry model has no verified conversion for the engine, so
+ * `load()` fails with a clear message instead of a hub 404.
  */
 export function resolveModelRepo(spec: ModelSpec, engine: EngineKind): string {
-  if (engine === 'webllm') return spec.repo;
+  if (engine === 'webllm') return webLLMTarget(spec).repo;
   return onnxTarget(spec).repo;
 }
 
@@ -146,6 +157,17 @@ function onnxTarget(spec: ModelSpec): ONNXModelTarget {
     throw new Error(
       `No ONNX conversion for model "${spec.id}" (${spec.repo}). ` +
         'Add a verified target to ONNX_TARGETS in src/core/llm/models.ts.',
+    );
+  }
+  return target;
+}
+
+function webLLMTarget(spec: ModelSpec): WebLLMModelTarget {
+  const target = WEBLLM_TARGETS[spec.id];
+  if (!target) {
+    throw new Error(
+      `No WebLLM conversion for model "${spec.id}" (${spec.repo}). ` +
+        'Add a verified target to WEBLLM_TARGETS in src/core/llm/models.ts.',
     );
   }
   return target;
