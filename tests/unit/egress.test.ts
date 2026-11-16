@@ -463,14 +463,27 @@ describe('BOOT_EGRESS_ALLOWLIST', () => {
         BOOT_EGRESS_ALLOWLIST,
       ),
     ).toBe(true);
+    expect(
+      isEgressAllowed(
+        'https://raw.githubusercontent.com/mlc-ai/binary-mlc-llm-libs/main/web-llm-models/v0.2.88/Llama-3.2-1B-Instruct-q4f32_1_cs1k-webgpu.wasm',
+        BOOT_EGRESS_ALLOWLIST,
+      ),
+    ).toBe(true);
     expect(isEgressAllowed('data:application/wasm;base64,AGFzbQ==', BOOT_EGRESS_ALLOWLIST)).toBe(
       true,
     );
   });
 
-  it('leaves arbitrary hosts blocked', () => {
+  it('leaves arbitrary hosts and unrelated GitHub raw paths blocked', () => {
     expect(isEgressAllowed('https://example.com/secret', BOOT_EGRESS_ALLOWLIST)).toBe(false);
     expect(isEgressAllowed('https://evil.test/collect', BOOT_EGRESS_ALLOWLIST)).toBe(false);
+    // The WebLLM allowlist is path-scoped to mlc-ai's binary libraries.
+    expect(
+      isEgressAllowed(
+        'https://raw.githubusercontent.com/evil-org/not-mlc-libs/main/web-llm-models/x.wasm',
+        BOOT_EGRESS_ALLOWLIST,
+      ),
+    ).toBe(false);
   });
 });
 
