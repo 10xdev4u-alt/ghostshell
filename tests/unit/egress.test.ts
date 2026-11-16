@@ -477,10 +477,16 @@ describe('BOOT_EGRESS_ALLOWLIST', () => {
   it('leaves arbitrary hosts and unrelated GitHub raw paths blocked', () => {
     expect(isEgressAllowed('https://example.com/secret', BOOT_EGRESS_ALLOWLIST)).toBe(false);
     expect(isEgressAllowed('https://evil.test/collect', BOOT_EGRESS_ALLOWLIST)).toBe(false);
-    // The WebLLM allowlist is path-scoped to mlc-ai's binary libraries.
+    // The WebLLM allowlist is path-scoped to mlc-ai's prebuilt libraries.
     expect(
       isEgressAllowed(
-        'https://raw.githubusercontent.com/evil-org/not-mlc-libs/main/web-llm-models/x.wasm',
+        'https://raw.githubusercontent.com/mlc-ai/not-binary-mlc-libs/main/x.wasm',
+        BOOT_EGRESS_ALLOWLIST,
+      ),
+    ).toBe(false);
+    expect(
+      isEgressAllowed(
+        'https://raw.githubusercontent.com/evil-org/binary-mlc-llm-libs/main/x.wasm',
         BOOT_EGRESS_ALLOWLIST,
       ),
     ).toBe(false);

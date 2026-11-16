@@ -139,7 +139,7 @@ describe('index.html Content-Security-Policy', () => {
       'https://copy.sh',
       // WebLLM fetches its prebuilt MLC wasm runtime from here; the source is
       // path-scoped to mlc-ai's binary libraries (see src/core/security/egress.ts).
-      'https://raw.githubusercontent.com/mlc-ai/',
+      'https://raw.githubusercontent.com/mlc-ai/binary-mlc-llm-libs/',
     ]) {
       expect(connectSrc).toContain(host);
     }

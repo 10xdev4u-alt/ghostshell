@@ -30,11 +30,12 @@
         with DOMPurify.
       - connect-src must allow the model download (huggingface.co and the
         jsDelivr ONNX runtime), the v86 BIOS fetch (copy.sh), and WebLLM's
-        prebuilt MLC wasm runtime (raw.githubusercontent.com/mlc-ai/). The
-        WebLLM source is path-scoped: only mlc-ai's binary libraries are
-        reachable, not arbitrary GitHub raw content. Hugging Face resolve
-        URLs 302 to HF's Xet CDN (https://us.aws.cdn.hf.co/...), so the
-        wildcard *.hf.co covers the regional CDN hosts that vary by request.
+        prebuilt MLC wasm runtime
+        (raw.githubusercontent.com/mlc-ai/binary-mlc-llm-libs/). The WebLLM
+        source is path-scoped: only mlc-ai's prebuilt libraries are reachable,
+        not arbitrary GitHub raw content. Hugging Face resolve URLs 302 to
+        HF's Xet CDN (https://us.aws.cdn.hf.co/...), so the wildcard *.hf.co
+        covers the regional CDN hosts that vary by request.
       - connect-src also allows data: and blob:. Both are non-network,
         same-agent origins — the bytes are already local, so they cannot
         exfiltrate. The single-file build inlines v86's WASM as a data:
@@ -52,7 +53,7 @@
     -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' https://huggingface.co https://*.hf.co https://cdn.jsdelivr.net https://copy.sh https://raw.githubusercontent.com/mlc-ai/ data: blob:; frame-src 'none'; worker-src 'self' blob:; object-src 'none'; form-action 'none'; base-uri 'none'"
+      content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' https://huggingface.co https://*.hf.co https://cdn.jsdelivr.net https://copy.sh https://raw.githubusercontent.com/mlc-ai/binary-mlc-llm-libs/ data: blob:; frame-src 'none'; worker-src 'self' blob:; object-src 'none'; form-action 'none'; base-uri 'none'"
     />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
