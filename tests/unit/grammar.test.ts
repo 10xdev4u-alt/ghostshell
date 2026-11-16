@@ -38,13 +38,20 @@ function ruleBody(grammar: string, rule: string): string | undefined {
 }
 
 /**
- * A GBNF terminal whose matched text is `value` including its JSON quotes.
+ * The GBNF terminal whose matched text is the JSON encoding of `value`.
  *
- * GBNF double quotes delimit a terminal; they are not part of the matched
- * text, so the JSON quotes have to be escaped into the terminal.
+ * Two layers are required, in order: `JSON.stringify` produces the JSON text
+ * (surrounding quotes plus JSON escapes), then that text is escaped for GBNF
+ * so its backslash escapes survive into the matched output rather than being
+ * consumed by the grammar parser.
  */
 function jsonQuotedTerminal(value: string): string {
-  return `"\\"${value}\\""`;
+  let out = '"';
+  for (const char of JSON.stringify(value)) {
+    if (char === '\\' || char === '"') out += '\\';
+    out += char;
+  }
+  return `${out}"`;
 }
 
 describe('buildToolCallGrammar', () => {
@@ -125,6 +132,24 @@ describe('buildToolCallGrammar', () => {
     }
   });
 
+  it('serializes values to JSON before escaping the GBNF terminal', () => {
+    // `JSON.stringify('a"b')` is `"a\"b"`. The terminal has to carry that
+    // backslash through GBNF's own escapes, so the matched text stays valid
+    // JSON instead of collapsing to `"a"b"`.
+    const quoted = buildToolCallGrammar([
+      { name: 'a"b', parameters: { type: 'object', properties: {} } },
+    ]);
+    expect(quoted).toContain('"\\"a\\\\\\"b\\""');
+
+    // A newline is serialized as the two characters `\` + `n`; doubling the
+    // backslash keeps it as JSON escape text instead of a raw newline inside
+    // the matched string.
+    const newline = buildToolCallGrammar([
+      { name: 'line\nbreak', parameters: { type: 'object', properties: {} } },
+    ]);
+    expect(newline).toContain('"\\"line\\\\nbreak\\""');
+  });
+
   it('escapes control characters in GBNF literals', () => {
     const grammar = buildToolCallGrammar([
       {
@@ -148,14 +173,14 @@ describe('buildToolCallGrammar', () => {
       },
     ]);
 
-    expect(grammar).toContain('"\\"line\\nbreak\\""');
-    expect(grammar).toContain('"\\"tab\\tkey\\""');
-    expect(grammar).toContain('"\\"carriage\\rreturn\\""');
-    expect(grammar).toContain('"\\"back\\bspace\\""');
-    expect(grammar).toContain('"\\"form\\ffeed\\""');
-    expect(grammar).toContain('"\\"bell\\u0007\\""');
-    expect(grammar).toContain('"\\"nul\\u0000\\""');
-    expect(grammar).toContain('"\\"unit\\u001fsep\\""');
+    expect(grammar).toContain(jsonQuotedTerminal('line\nbreak'));
+    expect(grammar).toContain(jsonQuotedTerminal('tab\tkey'));
+    expect(grammar).toContain(jsonQuotedTerminal('carriage\rreturn'));
+    expect(grammar).toContain(jsonQuotedTerminal('back\bspace'));
+    expect(grammar).toContain(jsonQuotedTerminal('form\ffeed'));
+    expect(grammar).toContain(jsonQuotedTerminal('bell\u0007'));
+    expect(grammar).toContain(jsonQuotedTerminal('nul\u0000'));
+    expect(grammar).toContain(jsonQuotedTerminal('unit\u001fsep'));
 
     // No raw control characters survive inside an emitted string literal.
     const literals = grammar.match(/"(?:[^"\\\n]|\\.)*"/g) ?? [];

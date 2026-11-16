@@ -321,51 +321,28 @@ class SlugAllocator {
 }
 
 /**
- * Quote a string as a GBNF terminal whose matched text includes the quotes.
+ * Quote a string as a GBNF terminal whose matched text is valid JSON.
  *
- * In GBNF the surrounding double quotes are syntax, not content: the rule
- * `root ::= "abc"` matches the three characters abc. Every value this builder
- * emits must appear inside a JSON document, where the surrounding quotes are
- * content, so they are escaped into the terminal: `"abc"` becomes `"\"abc\""`.
+ * Two layers of escaping are applied, in order:
+ *   1. `JSON.stringify` produces the JSON text: it adds the surrounding
+ *      quotes and escapes quotes, backslashes, and control characters as
+ *      JSON escapes (a newline becomes the two characters `\` and `n`).
+ *   2. That JSON text is escaped for GBNF, whose terminals consume backslash
+ *      escapes: every `\` and `"` in the JSON text becomes `\\` and `\"`, so
+ *      the matched text is the JSON text verbatim.
  *
- * The `char` rule in `COMMON_RULES` excludes `"` and `\` (which must be
- * escaped) plus `\x00-\x1F` and `\x7F`. The named escapes cover the common
- * whitespace controls; every other control character uses `\uXXXX`.
+ * Skipping either layer corrupts the output. Applying only the GBNF escape
+ * made a value like `a"b` match `"a"b"`, which is not valid JSON; applying
+ * only the JSON escape leaves GBNF's `\n` as a raw newline inside the matched
+ * string.
  */
 function gbnfLiteral(value: string): string {
+  const json = JSON.stringify(value);
   let escaped = '';
-  for (const char of value) {
-    switch (char) {
-      case '\\':
-        escaped += '\\\\';
-        break;
-      case '"':
-        escaped += '\\"';
-        break;
-      case '\b':
-        escaped += '\\b';
-        break;
-      case '\f':
-        escaped += '\\f';
-        break;
-      case '\n':
-        escaped += '\\n';
-        break;
-      case '\r':
-        escaped += '\\r';
-        break;
-      case '\t':
-        escaped += '\\t';
-        break;
-      default: {
-        const code = char.charCodeAt(0);
-        if (code < 0x20 || code === 0x7f) {
-          escaped += `\\u${code.toString(16).padStart(4, '0')}`;
-        } else {
-          escaped += char;
-        }
-      }
-    }
+  for (const char of json) {
+    if (char === '\\') escaped += '\\\\';
+    else if (char === '"') escaped += '\\"';
+    else escaped += char;
   }
-  return `"\\"${escaped}\\""`;
+  return `"${escaped}"`;
 }
