@@ -79,6 +79,8 @@ space ::= | " " | "\n" [ \t]{0,20}
  * The generated grammar:
  *   - enumerates every tool name, so the model cannot invent one;
  *   - emits `arguments` as a JSON object;
+ *   - quotes every key, tool name, and enum value with its JSON double quotes,
+ *     because GBNF string delimiters are syntax rather than output;
  *   - types each known property (string / number / boolean / array / object)
  *     and inlines `enum` values as literals;
  *   - requires the schema's `required` properties (in order) while still
@@ -134,14 +136,14 @@ export function buildToolCallGrammar(tools: GrammarTool[]): string {
     lines.push(`args-${toolRule} ::= "{" space ${objectBody} "}" space`);
 
     lines.push(
-      `call-${toolRule} ::= "{" space "name" space ":" space ${gbnfLiteral(tool.name)} space "," space "arguments" space ":" space args-${toolRule} space "}" space`,
+      `call-${toolRule} ::= "{" space ${gbnfLiteral('name')} space ":" space ${gbnfLiteral(tool.name)} space "," space ${gbnfLiteral('arguments')} space ":" space args-${toolRule} space "}" space`,
     );
     callAlternatives.push(`call-${toolRule}`);
   }
 
   lines.push(`call ::= ${callAlternatives.join(' | ')}`);
   lines.push(
-    'tool-calls ::= "{" space "tool_calls" space ":" space "[" space call ("," space call)* "]" space "}" space',
+    `tool-calls ::= "{" space ${gbnfLiteral('tool_calls')} space ":" space "[" space call ("," space call)* "]" space "}" space`,
   );
   // A final answer is plain text between <answer> tags. `answer-char` excludes
   // `<` so the closing tag is never consumed as content, and excludes `</` so
@@ -319,7 +321,12 @@ class SlugAllocator {
 }
 
 /**
- * Quote a string as a GBNF terminal.
+ * Quote a string as a GBNF terminal whose matched text includes the quotes.
+ *
+ * In GBNF the surrounding double quotes are syntax, not content: the rule
+ * `root ::= "abc"` matches the three characters abc. Every value this builder
+ * emits must appear inside a JSON document, where the surrounding quotes are
+ * content, so they are escaped into the terminal: `"abc"` becomes `"\"abc\""`.
  *
  * The `char` rule in `COMMON_RULES` excludes `"` and `\` (which must be
  * escaped) plus `\x00-\x1F` and `\x7F`. The named escapes cover the common
@@ -360,5 +367,5 @@ function gbnfLiteral(value: string): string {
       }
     }
   }
-  return `"${escaped}"`;
+  return `"\\"${escaped}\\""`;
 }
